@@ -1,333 +1,320 @@
 """
 newpkg_hooks.py
 
-Gerenciamento de hooks para newpkg.
-- Descobre hooks locais (dentro de package/hooks) e globais (/etc/newpkg/hooks.d, /usr/share/newpkg/hooks)
-- Valida (permissões, hash) e executa hooks dentro do sandbox (opcional)
-- Gera e mantém cache em .newpkg/hooks_cache.json
-- Fornece API para executar hooks por estágio (pre/post configure/build/install/remove), on_error e cleanup
-
-Uso:
-    hooks = NewpkgHooks(cfg, logger=logger, sandbox=sandbox)
-    hooks.discover(Path('package'))
-    hooks.run('pre_build', pkg_name='mypkg', build_dir=Path('...'))
+Hook discovery and execution for newpkg
+- Discover hooks in project and global hook directories
+- Execute hooks with optional sandboxing (integrates with sandbox.wrap or bubblewrap fallback)
+- Cache hook metadata (sha256 + mtime) in .newpkg/hooks_cache.json
+- Log via provided logger (NewpkgLogger) and record results in newpkg_db via record_hook
+- Public API:
+    - HooksManager(cfg=None, logger=None, db=None, sandbox=None)
+    - discover(hook_dirs: Optional[List[str]] = None)
+    - list_hooks(hook_type: Optional[str] = None)
+    - run(hook_type, pkg_dir=None, env=None, abort_on_failure=True)
+    - execute_safe(...)
+    - summary(results)
+    - export_cache(path=None)
 
 """
 from __future__ import annotations
 
-import os
-import stat
-import subprocess
 import hashlib
 import json
+import os
+import shutil
+import stat
+import subprocess
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
 
 
-HOOK_TYPES = [
-    'pre_configure', 'post_configure',
-    'pre_build', 'post_build',
-    'pre_install', 'post_install',
-    'pre_remove', 'post_remove',
-    'on_error', 'cleanup',
-]
-
-GLOBAL_HOOK_DIRS = [Path('/etc/newpkg/hooks.d'), Path('/usr/share/newpkg/hooks')]
-CACHE_PATH = Path('.newpkg') / 'hooks_cache.json'
-
-
-class HookError(Exception):
+class HooksError(Exception):
     pass
 
 
-class NewpkgHooks:
-    def __init__(self, cfg: Any = None, logger: Any = None, sandbox: Any = None):
+class HooksManager:
+    CACHE_DIR = '.newpkg'
+    CACHE_FILE = 'hooks_cache.json'
+
+    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, sandbox: Any = None):
         self.cfg = cfg
         self.logger = logger
+        self.db = db
         self.sandbox = sandbox
-        self.hooks: Dict[str, List[Path]] = {t: [] for t in HOOK_TYPES}
-        self.allow_global = True
-        try:
-            self.allow_global = bool(self.cfg.get('hooks.allow_global'))
-        except Exception:
-            self.allow_global = True
-        self.abort_on_failure = True
-        try:
-            self.abort_on_failure = bool(self.cfg.get('hooks.abort_on_failure'))
-        except Exception:
-            self.abort_on_failure = True
-        self.default_sandbox = True
-        try:
-            self.default_sandbox = bool(self.cfg.get('hooks.default_sandbox'))
-        except Exception:
-            self.default_sandbox = True
-
-        # ensure cache dir
-        try:
-            CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-        self._cache: Dict[str, Dict[str, Any]] = {}
+        # discovered hooks mapping: {hook_type: [Path, ...]}
+        self.hooks: Dict[str, List[Path]] = {}
+        # cache structure: {str(path): {sha256, mtime}}
+        self.cache: Dict[str, Dict[str, Any]] = {}
         self._load_cache()
-        # load global hooks
-        if self.allow_global:
-            self.load_global_hooks()
 
-    # ---------------- cache ----------------
-    def _load_cache(self) -> None:
-        if CACHE_PATH.exists():
-            try:
-                self._cache = json.loads(CACHE_PATH.read_text(encoding='utf-8'))
-            except Exception:
-                self._cache = {}
-        else:
-            self._cache = {}
-
-    def _save_cache(self) -> None:
+    # ---------------- config helpers ----------------
+    def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
-            CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CACHE_PATH.write_text(json.dumps(self._cache, indent=2, ensure_ascii=False), encoding='utf-8')
+            if self.cfg and hasattr(self.cfg, 'get'):
+                v = self.cfg.get(key)
+                if v is not None:
+                    return v
         except Exception:
             pass
+        # env fallback
+        ev = key.upper().replace('.', '_')
+        if ev in os.environ:
+            return os.environ.get(ev)
+        return default
 
-    # ---------------- discovery ----------------
-    def discover(self, pkg_dir: Path) -> Dict[str, List[str]]:
-        """Discover hooks inside a package directory. Returns mapping hook_type -> list of path strings."""
-        pkg_dir = Path(pkg_dir)
-        found: Dict[str, List[str]] = {t: [] for t in HOOK_TYPES}
-        hooks_dir = pkg_dir / 'hooks'
-        if not hooks_dir.exists() or not hooks_dir.is_dir():
-            return found
-        for t in HOOK_TYPES:
-            candidate = hooks_dir / f"{t}.sh"
-            if candidate.exists() and candidate.is_file():
-                # register localized hook with highest priority
-                self.register(t, candidate)
-                found[t].append(str(candidate))
-        # update cache metadata for pkg
-        self._cache[str(pkg_dir)] = {'discovered_at': datetime.utcnow().isoformat() + 'Z', 'hooks': found}
-        self._save_cache()
-        return found
-
-    def load_global_hooks(self) -> None:
-        """Load hooks from global directories."""
-        for d in GLOBAL_HOOK_DIRS:
+    def _log_info(self, event: str, message: str, **meta):
+        if self.logger and hasattr(self.logger, 'info'):
             try:
-                if not d.exists():
-                    continue
-                for p in sorted(d.iterdir()):
-                    if not p.is_file():
-                        continue
-                    name = p.name
-                    # global hooks can be named like pre_build.sh or prefixed with stage
-                    for t in HOOK_TYPES:
-                        if name.startswith(t):
-                            self.register(t, p)
-            except Exception:
-                continue
-
-    # ---------------- register / list ----------------
-    def register(self, hook_type: str, path: Path) -> None:
-        if hook_type not in HOOK_TYPES:
-            raise HookError(f'Unknown hook type: {hook_type}')
-        p = Path(path)
-        if p not in self.hooks[hook_type]:
-            self.hooks[hook_type].append(p)
-            # update cache
-            self._cache.setdefault('registered', {}).setdefault(hook_type, [])
-            rp = str(p)
-            if rp not in self._cache['registered'].get(hook_type, []):
-                self._cache['registered'].setdefault(hook_type, []).append(rp)
-            self._save_cache()
-
-    def list_hooks(self) -> Dict[str, List[str]]:
-        return {t: [str(p) for p in self.hooks.get(t, [])] for t in HOOK_TYPES}
-
-    # ---------------- validation ----------------
-    def validate_hook(self, path: Path, check_hash: bool = False) -> Tuple[bool, Optional[str]]:
-        """Validate that hook is executable and optionally return its sha256 hash.
-
-        Returns (valid, hash_hex) where hash_hex may be None if not computed.
-        """
-        p = Path(path)
-        if not p.exists() or not p.is_file():
-            return False, None
-        mode = p.stat().st_mode
-        if not (mode & stat.S_IXUSR):
-            # try to set executable bit for user
-            try:
-                p.chmod(mode | stat.S_IXUSR)
-            except Exception:
-                return False, None
-        h = None
-        if check_hash:
-            try:
-                h = hashlib.sha256(p.read_bytes()).hexdigest()
-            except Exception:
-                h = None
-        return True, h
-
-    # ---------------- run hook ----------------
-    def _build_env(self, pkg_name: Optional[str], stage: Optional[str], build_dir: Optional[Path], destdir: Optional[Path], profile: Optional[str]) -> Dict[str, str]:
-        env = os.environ.copy()
-        if pkg_name:
-            env['NEWPKG_PKGNAME'] = str(pkg_name)
-        if stage:
-            env['NEWPKG_STAGE'] = stage
-        if profile:
-            env['NEWPKG_PROFILE'] = profile
-        if build_dir:
-            env['NEWPKG_BUILDDIR'] = str(build_dir)
-        if destdir:
-            env['NEWPKG_DESTDIR'] = str(destdir)
-        # include config-provided env overrides
-        try:
-            extra = self.cfg.get('hooks.env') or {}
-            if isinstance(extra, dict):
-                for k, v in extra.items():
-                    env[str(k)] = str(v)
-        except Exception:
-            pass
-        return env
-
-    def _exec_local(self, path: Path, cwd: Optional[Path], env: Dict[str, str], timeout: Optional[int] = None) -> Tuple[int, str, str]:
-        # run locally (not sandboxed)
-        try:
-            cp = subprocess.run([str(path)], cwd=str(cwd) if cwd else None, env=env, capture_output=True, text=True, timeout=timeout)
-            return cp.returncode, cp.stdout, cp.stderr
-        except subprocess.TimeoutExpired as e:
-            return -1, e.stdout or '', f'Timeout after {timeout}s'
-        except Exception as e:
-            return -1, '', str(e)
-
-    def run(self, hook_type: str, pkg_name: Optional[str] = None, build_dir: Optional[Path] = None, destdir: Optional[Path] = None, profile: Optional[str] = None, use_sandbox: Optional[bool] = None, timeout: Optional[int] = None, abort_on_fail: Optional[bool] = None) -> List[Dict[str, Any]]:
-        """Run all hooks of type `hook_type` (registered and discovered).
-
-        Returns list of result dicts with keys: path, rc, stdout, stderr, duration, started_at, finished_at, hash
-        """
-        if hook_type not in HOOK_TYPES:
-            raise HookError(f'Unknown hook type: {hook_type}')
-        if use_sandbox is None:
-            use_sandbox = self.default_sandbox
-        if abort_on_fail is None:
-            abort_on_fail = self.abort_on_failure
-
-        results = []
-        env = self._build_env(pkg_name, hook_type, build_dir, destdir, profile)
-        hooks = list(self.hooks.get(hook_type, []))
-
-        for h in hooks:
-            started = datetime.utcnow()
-            started_at = started.isoformat() + 'Z'
-            valid, hsh = self.validate_hook(h, check_hash=True)
-            if not valid:
-                msg = f'Hook {h} not valid or not executable'
-                self._log_event(h, 'ERROR', msg, {'pkg': pkg_name, 'hook': str(h)})
-                if abort_on_fail:
-                    raise HookError(msg)
-                else:
-                    results.append({'path': str(h), 'rc': -1, 'stdout': '', 'stderr': msg, 'hash': hsh, 'started_at': started_at, 'finished_at': None, 'duration': 0.0})
-                    continue
-
-            # execute
-            try:
-                if use_sandbox and self.sandbox:
-                    # execute inside sandbox; sandbox.run expects a list command
-                    cmd = ['/bin/sh', str(h)]
-                    res = self.sandbox.run(cmd, cwd=build_dir, env=env, timeout=timeout)
-                    rc = res.returncode
-                    out = res.stdout
-                    err = res.stderr
-                else:
-                    rc, out, err = self._exec_local(h, cwd=build_dir, env=env, timeout=timeout)
-            except Exception as e:
-                rc = -1
-                out = ''
-                err = str(e)
-
-            finished = datetime.utcnow()
-            finished_at = finished.isoformat() + 'Z'
-            duration = (finished - started).total_seconds()
-
-            resdict = {
-                'path': str(h),
-                'rc': rc,
-                'stdout': out,
-                'stderr': err,
-                'hash': hsh,
-                'started_at': started_at,
-                'finished_at': finished_at,
-                'duration': duration,
-            }
-            results.append(resdict)
-
-            # logging
-            level = 'INFO' if rc == 0 else 'ERROR'
-            self._log_event(h, level, f'Hook {hook_type} executed', {'pkg': pkg_name, 'hook': str(h), 'rc': rc})
-
-            if rc != 0:
-                # run on_error hooks
-                try:
-                    self.execute_safe('on_error', pkg_name=pkg_name, build_dir=build_dir, destdir=destdir, profile=profile)
-                except Exception:
-                    pass
-                if abort_on_fail:
-                    raise HookError(f'Hook {h} failed with rc={rc}: {err}')
-
-        return results
-
-    def execute_safe(self, hook_type: str, **kwargs) -> List[Dict[str, Any]]:
-        try:
-            return self.run(hook_type, **kwargs)
-        except Exception as e:
-            # log and swallow
-            self._log_event(None, 'ERROR', f'Hook {hook_type} execution raised: {e}', {})
-            return []
-
-    # ---------------- utilities ----------------
-    def _log_event(self, hook_path: Optional[Path], level: str, message: str, metadata: Dict[str, Any]) -> None:
-        if self.logger:
-            meta = dict(metadata)
-            if hook_path:
-                meta['hook'] = str(hook_path)
-            self.logger.log_event('hook_event', level=level, message=message, metadata=meta)
-
-    def export_cache(self, output: Optional[Path] = None) -> Dict[str, Any]:
-        data = self._cache
-        if output:
-            try:
-                Path(output).parent.mkdir(parents=True, exist_ok=True)
-                Path(output).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
+                self.logger.info(f'hook:{event}', message, **meta)
+                return
             except Exception:
                 pass
-        return data
+        print(f"[INFO] hook:{event} - {message}")
+
+    def _log_error(self, event: str, message: str, **meta):
+        if self.logger and hasattr(self.logger, 'error'):
+            try:
+                self.logger.error(f'hook:{event}', message, **meta)
+                return
+            except Exception:
+                pass
+        print(f"[ERROR] hook:{event} - {message}")
+
+    # ---------------- cache ----------------
+    def _cache_path(self, base: Optional[Path] = None) -> Path:
+        base = base or Path('.').resolve()
+        d = base / self.CACHE_DIR
+        d.mkdir(parents=True, exist_ok=True)
+        return d / self.CACHE_FILE
+
+    def _load_cache(self, base: Optional[Path] = None) -> None:
+        try:
+            p = self._cache_path(base=base)
+            if p.exists():
+                self.cache = json.loads(p.read_text(encoding='utf-8'))
+            else:
+                self.cache = {}
+        except Exception:
+            self.cache = {}
+
+    def export_cache(self, path: Optional[str] = None, base: Optional[Path] = None) -> Optional[str]:
+        try:
+            if path:
+                out = Path(path)
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(json.dumps(self.cache, indent=2), encoding='utf-8')
+                return str(out)
+            p = self._cache_path(base=base)
+            p.write_text(json.dumps(self.cache, indent=2), encoding='utf-8')
+            return str(p)
+        except Exception:
+            return None
+
+    # ---------------- utilities ----------------
+    def _sha256(self, p: Path) -> str:
+        h = hashlib.sha256()
+        with p.open('rb') as fh:
+            for chunk in iter(lambda: fh.read(65536), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _is_executable(self, p: Path) -> bool:
+        try:
+            st = p.stat()
+            return bool(st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+        except Exception:
+            return False
+
+    # ---------------- discovery ----------------
+    def discover(self, hook_dirs: Optional[List[str]] = None) -> Dict[str, List[str]]:
+        """Discover hooks in configured directories.
+
+        hook_dirs default order:
+          - project hooks: ./hooks
+          - global hooks from config: cfg.get('hooks.dir') or /etc/newpkg/hooks
+        Hooks should be executable files or scripts named <hook_type>.<ext> or placed in a subdir by type.
+        """
+        discovered: Dict[str, List[str]] = {}
+        # default project hooks
+        candidates: List[Path] = []
+        if hook_dirs:
+            for hd in hook_dirs:
+                hp = Path(hd)
+                if hp.exists():
+                    candidates.append(hp)
+        else:
+            proj = Path('.') / 'hooks'
+            if proj.exists():
+                candidates.append(proj)
+            cfg_dir = self._cfg_get('hooks.dir', None) or '/etc/newpkg/hooks'
+            if cfg_dir:
+                cfgp = Path(cfg_dir)
+                if cfgp.exists():
+                    candidates.append(cfgp)
+        # scan candidates
+        for base in candidates:
+            # if base is a directory of types: hooks/<type>/*
+            if base.is_dir():
+                for child in base.iterdir():
+                    if child.is_dir():
+                        htype = child.name
+                        for f in child.iterdir():
+                            if f.is_file() and (self._is_executable(f) or f.suffix in ('.sh', '.py')):
+                                discovered.setdefault(htype, []).append(str(f))
+                    else:
+                        # file maybe named hooktype.name.ext or <type>.<ext>
+                        name = child.name
+                        parts = name.split('.')
+                        if len(parts) >= 2:
+                            htype = parts[0]
+                        else:
+                            htype = 'generic'
+                        if child.is_file() and (self._is_executable(child) or child.suffix in ('.sh', '.py')):
+                            discovered.setdefault(htype, []).append(str(child))
+        # update internal structure
+        self.hooks = {k: [Path(x) for x in v] for k, v in discovered.items()}
+        # update cache for discovered files
+        for k, lst in self.hooks.items():
+            for p in lst:
+                try:
+                    sha = self._sha256(p)
+                    mtime = p.stat().st_mtime
+                    key = str(p.resolve())
+                    self.cache[key] = {'sha256': sha, 'mtime': mtime, 'type': k}
+                except Exception:
+                    continue
+        # persist cache
+        self.export_cache()
+        # log summary
+        total = sum(len(v) for v in discovered.values())
+        self._log_info('discover', f'Discovered {total} hooks across {len(discovered)} types')
+        return discovered
+
+    def list_hooks(self, hook_type: Optional[str] = None) -> Dict[str, List[str]]:
+        if hook_type:
+            lst = self.hooks.get(hook_type, [])
+            return {hook_type: [str(x) for x in lst]}
+        return {k: [str(x) for x in v] for k, v in self.hooks.items()}
+
+    # ---------------- sandbox helper ----------------
+    def _prepare_sandbox_cmd(self, cmd: List[str], cwd: Path, extra_binds: Optional[List[str]] = None) -> List[str]:
+        # use sandbox.wrap if available
+        if self.sandbox and hasattr(self.sandbox, 'wrap'):
+            try:
+                return self.sandbox.wrap(cmd, binds=extra_binds or [], cwd=str(cwd))
+            except Exception:
+                pass
+        # fallback to bubblewrap
+        bwrap = shutil.which('bwrap')
+        if not bwrap:
+            return cmd
+        args = [bwrap, '--unshare-all', '--share-net', '--proc', '/proc', '--dev', '/dev']
+        args += ['--bind', str(cwd), str(cwd), '--chdir', str(cwd)]
+        for b in (extra_binds or []):
+            try:
+                args += ['--ro-bind', str(b), str(b)]
+            except Exception:
+                continue
+        args += ['--'] + cmd
+        return args
+
+    # ---------------- run hooks ----------------
+    def _exec_single(self, hook_path: Path, cwd: Path, env: Optional[Dict[str, str]] = None, timeout: Optional[int] = None, use_sandbox: bool = True) -> Dict[str, Any]:
+        cmd = [str(hook_path)]
+        # if python script without executable bit, run with python
+        if hook_path.suffix in ('.py',) and not self._is_executable(hook_path):
+            cmd = [shutil.which('python3') or 'python3', str(hook_path)]
+        if use_sandbox:
+            extra_binds = self._cfg_get('sandbox.extra_binds', []) or []
+            full_cmd = self._prepare_sandbox_cmd(cmd, cwd, extra_binds)
+        else:
+            full_cmd = cmd
+        start = time.time()
+        try:
+            proc = subprocess.run(full_cmd, cwd=str(cwd), env=(env or os.environ), capture_output=True, text=True, timeout=timeout)
+            dur = time.time() - start
+            return {'path': str(hook_path), 'rc': proc.returncode, 'out': proc.stdout, 'err': proc.stderr, 'duration': dur}
+        except subprocess.TimeoutExpired as e:
+            dur = time.time() - start
+            return {'path': str(hook_path), 'rc': 124, 'out': '', 'err': f'timeout: {e}', 'duration': dur}
+        except Exception as e:
+            dur = time.time() - start
+            return {'path': str(hook_path), 'rc': 1, 'out': '', 'err': str(e), 'duration': dur}
+
+    def run(self, hook_type: str, pkg_dir: Optional[str] = None, env: Optional[Dict[str, str]] = None, abort_on_failure: bool = True, timeout: Optional[int] = None) -> Dict[str, Any]:
+        """Run all hooks of a given type. Returns list of results per hook and summary."""
+        cwd = Path(pkg_dir) if pkg_dir else Path('.')
+        hooks = self.hooks.get(hook_type, [])
+        if not hooks:
+            self._log_info('run.empty', f'No hooks for type {hook_type}', type=hook_type, pkg=str(cwd))
+            return {'total': 0, 'ok': 0, 'failed': 0, 'results': []}
+        results = []
+        ok = 0
+        failed = 0
+        use_sandbox = bool(self._cfg_get('hooks.sandbox', True))
+        for h in hooks:
+            res = self._exec_single(h, cwd, env=env, timeout=timeout, use_sandbox=use_sandbox)
+            results.append(res)
+            if res.get('rc', 1) == 0:
+                ok += 1
+                self._log_info(f'{hook_type}.ok', f'Hook {h.name} succeeded', hook=str(h), pkg=str(cwd), duration=res.get('duration'))
+                # record to DB
+                try:
+                    if self.db and hasattr(self.db, 'record_hook'):
+                        self.db.record_hook(cwd.name, hook_type, 'ok')
+                except Exception:
+                    pass
+            else:
+                failed += 1
+                self._log_error(f'{hook_type}.fail', f'Hook {h.name} failed rc={res.get("rc")}', hook=str(h), pkg=str(cwd), stderr=res.get('err'))
+                try:
+                    if self.db and hasattr(self.db, 'record_hook'):
+                        self.db.record_hook(cwd.name, hook_type, 'error')
+                except Exception:
+                    pass
+                if abort_on_failure:
+                    break
+        summary = {'total': len(hooks), 'ok': ok, 'failed': failed, 'results': results}
+        # emit summary log
+        self._log_info(f'{hook_type}.summary', f'{ok}/{len(hooks)} hooks succeeded for {hook_type}', type=hook_type, pkg=str(cwd), ok=ok, failed=failed)
+        return summary
+
+    def execute_safe(self, hook_type: str, pkg_dir: Optional[str] = None, env: Optional[Dict[str, str]] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
+        """Run hooks but do not raise; always return summary."""
+        try:
+            # if hooks.silent_continue true, we won't abort on failure
+            abort = bool(self._cfg_get('hooks.abort_on_failure', True))
+            summary = self.run(hook_type, pkg_dir=pkg_dir, env=env, abort_on_failure=abort, timeout=timeout)
+            return summary
+        except Exception as e:
+            self._log_error('execute_safe.exception', f'Exception running hooks: {e}', hook_type=hook_type, pkg=pkg_dir)
+            return {'total': 0, 'ok': 0, 'failed': 0, 'results': [], 'error': str(e)}
+
+    def summary(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        return {'total': results.get('total', 0), 'ok': results.get('ok', 0), 'failed': results.get('failed', 0)}
 
 
-# ---------------- CLI demo ----------------
+# ---------------- CLI for testing ----------------
 if __name__ == '__main__':
     import argparse
     ap = argparse.ArgumentParser(prog='newpkg-hooks')
-    ap.add_argument('--discover', help='package dir to discover hooks in')
-    ap.add_argument('--run', help='hook type to run', choices=HOOK_TYPES)
-    ap.add_argument('--pkg', help='package name', default=None)
-    ap.add_argument('--build-dir', help='build dir for hooks', default=None)
+    ap.add_argument('cmd', choices=['discover', 'list', 'run'])
+    ap.add_argument('--type', help='hook type to run/list')
+    ap.add_argument('--dir', help='package dir or hooks dir')
+    ap.add_argument('--no-cache', action='store_true')
     args = ap.parse_args()
 
-    cfg = None
-    try:
-        class CfgShim:
-            def get(self, k):
-                return None
-        cfg = CfgShim()
-    except Exception:
-        cfg = None
-
-    hooks = NewpkgHooks(cfg)
-    if args.discover:
-        found = hooks.discover(Path(args.discover))
-        print(json.dumps(found, indent=2))
-    if args.run:
-        bd = Path(args.build_dir) if args.build_dir else None
-        res = hooks.execute_safe(args.run, pkg_name=args.pkg, build_dir=bd)
-        print(json.dumps(res, indent=2))
+    mgr = HooksManager()
+    if args.cmd == 'discover':
+        out = mgr.discover(hook_dirs=[args.dir] if args.dir else None)
+        print(json.dumps(out, indent=2))
+    elif args.cmd == 'list':
+        print(json.dumps(mgr.list_hooks(args.type), indent=2))
+    elif args.cmd == 'run':
+        if not args.type:
+            print('please pass --type')
+        else:
+            res = mgr.execute_safe(args.type, pkg_dir=args.dir)
+            print(json.dumps(res, indent=2))
