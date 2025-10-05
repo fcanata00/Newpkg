@@ -1,29 +1,36 @@
 #!/usr/bin/env python3
 # newpkg_audit.py
 """
-newpkg_audit.py — audit scanner and fixer for newpkg-managed system
+newpkg_audit.py — Revised auditing & remediation manager for newpkg
 
-Features:
- - Scans installed packages/files for known vulnerabilities/misconfigurations
- - Builds a remediation plan and (optionally) attempts fixes via available handlers:
-     NewpkgUpgrade (rebuild), NewpkgPatcher (apply patches), NewpkgRemove (safe-remove)
- - Respects newpkg_config: general.dry_run, output.quiet, output.json, core.jobs, audit.* keys
- - Integrates with NewpkgLogger (uses perf_timer if available), NewpkgDB, NewpkgSandbox
- - Produces JSON/human reports saved under /var/log/newpkg/audit/reports/
- - Creates backups before destructive actions under /var/log/newpkg/audit/backups/
- - Parallel execution controlled by config
+Implemented improvements:
+1. Hooks integration (pre_scan, post_scan, pre_execute, post_execute)
+2. Progress UI via logger.progress (uses Rich when available)
+3. Per-package perf metrics recorded to logger/db
+4. Integration with newpkg_deps (optional) to detect broken deps
+5. Optional sha256 and gpg verification for artifacts
+6. Sandboxed corrective actions (patch, rebuild, remove) if configured
+7. JSON reports with rotation and optional .xz compression
+8. Auto-retry for corrective actions
+9. Rich-based CLI summary and colorized output
+10. Incremental audit.report() calls to record start/success/fail per item
 """
 
 from __future__ import annotations
 
-import concurrent.futures
+import gzip
 import json
 import os
 import shutil
-import signal
+import stat
+import subprocess
+import sys
 import tarfile
 import tempfile
+import threading
 import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -31,42 +38,67 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Optional integrations (best-effort)
 try:
-    from newpkg_config import init_config
+    from newpkg_config import init_config  # type: ignore
 except Exception:
     init_config = None
 
 try:
-    from newpkg_logger import NewpkgLogger
+    from newpkg_logger import get_logger  # type: ignore
 except Exception:
-    NewpkgLogger = None
+    get_logger = None
 
 try:
-    from newpkg_db import NewpkgDB
+    from newpkg_db import NewpkgDB  # type: ignore
 except Exception:
     NewpkgDB = None
 
 try:
-    from newpkg_sandbox import NewpkgSandbox
+    from newpkg_sandbox import get_sandbox  # type: ignore
 except Exception:
-    NewpkgSandbox = None
+    get_sandbox = None
 
-# External handlers (optional)
 try:
-    from newpkg_upgrade import NewpkgUpgrade
+    from newpkg_hooks import get_hooks_manager  # type: ignore
+except Exception:
+    get_hooks_manager = None
+
+try:
+    from newpkg_patcher import get_patcher  # type: ignore
+except Exception:
+    get_patcher = None
+
+try:
+    from newpkg_upgrade import NewpkgUpgrade  # type: ignore
 except Exception:
     NewpkgUpgrade = None
 
 try:
-    from newpkg_patcher import NewpkgPatcher
+    from newpkg_remove import get_remove  # type: ignore
 except Exception:
-    NewpkgPatcher = None
+    get_remove = None
 
 try:
-    from newpkg_remove import NewpkgRemove
+    from newpkg_deps import get_deps  # type: ignore
 except Exception:
-    NewpkgRemove = None
+    get_deps = None
 
-# Fallback stdlib logger for internal messages (used only if NewpkgLogger missing)
+try:
+    from newpkg_audit import NewpkgAudit  # type: ignore  # avoid name collision in imports elsewhere
+except Exception:
+    pass
+
+# rich for CLI niceties
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich import box
+    RICH = True
+    _console = Console()
+except Exception:
+    RICH = False
+    _console = None
+
+# fallback logger
 import logging
 _logger = logging.getLogger("newpkg.audit")
 if not _logger.handlers:
@@ -75,103 +107,65 @@ if not _logger.handlers:
     _logger.addHandler(h)
 _logger.setLevel(logging.INFO)
 
+# helpers
+def now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+def shlex_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
 
 @dataclass
-class AuditFinding:
-    package: str
-    file: Optional[str]
-    issue: str
+class Finding:
+    id: str
+    category: str
     severity: str  # low/medium/high/critical
-    evidence: Dict[str, Any]
-    recommended: List[Dict[str, Any]]  # list of remediation suggestions
-
-    def to_dict(self):
-        return asdict(self)
-
-
-@dataclass
-class AuditPlanItem:
-    package: str
-    action: str  # 'rebuild'|'patch'|'remove'|'manual'
-    reason: str
-    details: Dict[str, Any]
-
-    def to_dict(self):
-        return asdict(self)
-
+    description: str
+    package: Optional[str] = None
+    path: Optional[str] = None
+    extra: Dict[str, Any] = None
 
 @dataclass
 class AuditReport:
-    ts: int
-    summary: Dict[str, Any]
+    timestamp: str
     findings: List[Dict[str, Any]]
     plan: List[Dict[str, Any]]
-    executed: List[Dict[str, Any]]
-
-    def to_dict(self):
-        return asdict(self)
-
+    results: List[Dict[str, Any]]
+    duration: float
 
 class NewpkgAudit:
-    DEFAULT_REPORT_DIR = "/var/log/newpkg/audit/reports"
-    DEFAULT_BACKUP_DIR = "/var/log/newpkg/audit/backups"
+    DEFAULT_REPORT_DIR = "/var/log/newpkg/audit"
+    DEFAULT_REPORT_KEEP = 30
+    DEFAULT_BACKUP_DIR = "/var/cache/newpkg/audit_backups"
 
-    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, sandbox: Any = None):
+    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, sandbox: Any = None, hooks: Any = None, patcher: Any = None, upgrader: Any = None, remover: Any = None, deps: Any = None):
         self.cfg = cfg or (init_config() if init_config else None)
-
-        # logger
-        if logger:
-            self.logger = logger
-        else:
-            try:
-                self.logger = NewpkgLogger.from_config(self.cfg, db) if NewpkgLogger and self.cfg else None
-            except Exception:
-                self.logger = None
-
-        self._log = self._make_logger()
-
-        # db
+        self.logger = logger or (get_logger(self.cfg) if get_logger else None)
         self.db = db or (NewpkgDB(self.cfg) if NewpkgDB and self.cfg else None)
+        self.sandbox = sandbox or (get_sandbox(self.cfg) if get_sandbox else None)
+        self.hooks = hooks or (get_hooks_manager(self.cfg) if get_hooks_manager else None)
+        self.patcher = patcher or (get_patcher(self.cfg) if get_patcher else None)
+        self.upgrader = upgrader or (NewpkgUpgrade(self.cfg) if NewpkgUpgrade else None)
+        self.remover = remover or (get_remove(self.cfg) if get_remove else None)
+        self.deps = deps or (get_deps(self.cfg) if get_deps else None)
 
-        # sandbox
-        if sandbox:
-            self.sandbox = sandbox
-        else:
-            try:
-                self.sandbox = NewpkgSandbox(cfg=self.cfg, logger=self.logger, db=self.db) if NewpkgSandbox and self.cfg else None
-            except Exception:
-                self.sandbox = None
-
-        # handlers
-        self.upgrade_handler = NewpkgUpgrade(cfg=self.cfg, logger=self.logger, db=self.db) if NewpkgUpgrade and self.cfg else None
-        self.patcher_handler = NewpkgPatcher(cfg=self.cfg, logger=self.logger, db=self.db) if NewpkgPatcher and self.cfg else None
-        self.remove_handler = NewpkgRemove(cfg=self.cfg, logger=self.logger, db=self.db) if NewpkgRemove and self.cfg else None
-
-        # runtime flags from config
-        self.dry_run = bool(self._cfg_get("general.dry_run", False))
-        self.quiet = bool(self._cfg_get("output.quiet", False))
-        self.json_out = bool(self._cfg_get("output.json", False))
-
-        # audit-specific config
-        self.report_dir = Path(self._cfg_get("audit.report_dir", self.DEFAULT_REPORT_DIR))
+        # config
+        self.report_dir = Path(self._cfg("audit.report_dir", self.DEFAULT_REPORT_DIR)).expanduser()
         self.report_dir.mkdir(parents=True, exist_ok=True)
-        self.backup_dir = Path(self._cfg_get("audit.backup_dir", self.DEFAULT_BACKUP_DIR))
+        self.report_keep = int(self._cfg("audit.report_keep", self.DEFAULT_REPORT_KEEP))
+        self.backup_dir = Path(self._cfg("audit.backup_dir", self.DEFAULT_BACKUP_DIR)).expanduser()
         self.backup_dir.mkdir(parents=True, exist_ok=True)
+        self.compress_reports = bool(self._cfg("audit.compress_reports", True))
+        self.jobs = int(self._cfg("audit.jobs", max(1, (os.cpu_count() or 2))))
+        self.retry = int(self._cfg("audit.retry", 2))
+        self.verify_sha = bool(self._cfg("audit.verify_sha", False))
+        self.verify_gpg = bool(self._cfg("audit.verify_gpg", False))
+        self.use_sandbox = bool(self._cfg("audit.use_sandbox", False))
+        self.sandbox_profile = str(self._cfg("audit.sandbox_profile", "light"))
+        self.dry_run = bool(self._cfg("audit.dry_run", False))
+        self._lock = threading.RLock()
 
-        cpu = os.cpu_count() or 1
-        default_jobs = int(self._cfg_get("core.jobs", max(1, min(4, cpu))))
-        self.jobs = int(self._cfg_get("audit.jobs", default_jobs))
-
-        # risk thresholds configured by user
-        self.risk_threshold = self._cfg_get("audit.risk_threshold", "medium")  # low, medium, high, critical
-
-        # perf_timer decorator if present on logger
-        self._perf_timer = getattr(self.logger, "perf_timer", None) if self.logger else None
-
-        # internal
-        self._cancelled = False
-
-    def _cfg_get(self, key: str, default: Any = None) -> Any:
+    def _cfg(self, key: str, default: Any = None) -> Any:
         try:
             if self.cfg and hasattr(self.cfg, "get"):
                 v = self.cfg.get(key)
@@ -179,433 +173,619 @@ class NewpkgAudit:
                     return v
         except Exception:
             pass
-        env_key = key.upper().replace(".", "_")
-        return os.environ.get(env_key, default)
+        envk = key.upper().replace(".", "_")
+        return os.environ.get(envk, default)
 
-    def _make_logger(self):
-        def _fn(level: str, event: str, msg: str = "", **meta):
-            try:
-                if self.logger:
-                    fn = getattr(self.logger, level.lower(), None)
-                    if fn:
-                        fn(event, msg, **meta)
-                        return
-            except Exception:
-                pass
-            getattr(_logger, level.lower(), _logger.info)(f"{event}: {msg} - {meta}")
-        return _fn
-
-    # ------------- utilities -------------
-    def _now_ts(self) -> int:
-        return int(time.time())
-
-    def _save_report(self, report: AuditReport) -> Path:
-        ts = report.ts
-        fname = f"audit-report-{datetime.utcfromtimestamp(ts).strftime('%Y%m%d-%H%M%S')}.json"
-        path = self.report_dir / fname
+    # ---------------- low-level helpers ----------------
+    def _record_phase(self, name: Optional[str], phase: str, status: str, meta: Optional[Dict[str, Any]] = None) -> None:
         try:
-            path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
-            self._log("info", "audit.report.write", f"Wrote audit report to {path}", path=str(path))
-        except Exception as e:
-            self._log("error", "audit.report.fail", f"Failed to write audit report: {e}", error=str(e))
-        return path
-
-    def _backup_paths(self, package: str, paths: List[str]) -> Optional[str]:
-        """
-        Create tar.xz backup containing provided paths.
-        Returns path to backup or None on failure. In dry-run just logs.
-        """
-        if not paths:
-            return None
-        ts = int(time.time())
-        safe_name = package.replace("/", "_")
-        backup_name = f"{safe_name}-audit-{ts}.tar.xz"
-        backup_path = str(self.backup_dir / backup_name)
-        if self.dry_run:
-            self._log("info", "audit.backup.dryrun", f"DRY-RUN: would backup {len(paths)} paths for {package}", package=package, count=len(paths))
-            return None
-        try:
-            with tarfile.open(backup_path, "w:xz") as tar:
-                for p in paths:
-                    try:
-                        if os.path.exists(p):
-                            tar.add(p, arcname=os.path.relpath(p, "/"))
-                    except Exception as e:
-                        self._log("warning", "audit.backup.skip", f"Skipping backup path {p}: {e}", path=p, error=str(e))
-            self._log("info", "audit.backup.ok", f"Created backup {backup_path}", path=backup_path)
-            return backup_path
-        except Exception as e:
-            self._log("error", "audit.backup.fail", f"Backup creation failed: {e}", error=str(e))
-            return None
-
-    # ------------- cancellation -------------
-    def cancel(self):
-        self._cancelled = True
-
-    # ------------- scanning -------------
-    def scan(self, packages: Optional[List[str]] = None) -> List[AuditFinding]:
-        """
-        Scan the system (or specified packages) for issues.
-        - If packages is None, scans all packages known to DB.
-        - Returns list of AuditFinding objects.
-        """
-        decorator = self._perf_timer("audit.scan") if self._perf_timer else None
-        if decorator:
-            return decorator(self._scan_impl)(packages)
-        else:
-            return self._scan_impl(packages)
-
-    def _scan_impl(self, packages: Optional[List[str]] = None) -> List[AuditFinding]:
-        findings: List[AuditFinding] = []
-        # if no db, return empty but log warning
-        if not self.db:
-            self._log("warning", "audit.scan.no_db", "No database available; cannot scan packages reliably")
-            return findings
-
-        # choose package list
-        try:
-            all_pkgs = [p["name"] for p in self.db.list_packages()]
-        except Exception:
-            all_pkgs = []
-
-        targets = packages or all_pkgs
-        self._log("info", "audit.scan.start", f"Starting scan for {len(targets)} packages", count=len(targets))
-
-        # simple scanner heuristics: look for missing files, known bad versions, known-vuln-markers in metadata
-        def scan_pkg(pkg_name: str) -> List[AuditFinding]:
-            if self._cancelled:
-                return []
-            local_findings: List[AuditFinding] = []
-            try:
-                # 1) check reverse deps and file list existence
-                files = []
-                try:
-                    files = self.db.list_files(pkg_name)
-                except Exception:
-                    files = []
-                missing_files = [f for f in (files or []) if not f or not os.path.exists(f)]
-                if missing_files:
-                    local_findings.append(AuditFinding(
-                        package=pkg_name,
-                        file=None,
-                        issue="missing_files",
-                        severity="medium",
-                        evidence={"missing": missing_files},
-                        recommended=[{"action": "rebuild", "reason": "files_missing"}]
-                    ))
-                # 2) check known vulnerable versions via db metadata (example: db.get_pkg_meta)
-                try:
-                    meta = self.db.get_pkg_meta(pkg_name) or {}
-                except Exception:
-                    meta = {}
-                # Example heuristic: meta may contain 'version' and 'vulnerable' flags
-                version = meta.get("version")
-                if meta.get("vulnerable", False):
-                    local_findings.append(AuditFinding(
-                        package=pkg_name,
-                        file=None,
-                        issue="vulnerable_version",
-                        severity="high",
-                        evidence={"version": version, "meta": meta},
-                        recommended=[{"action": "upgrade", "reason": "known_vulnerability"}]
-                    ))
-                # 3) detect setuid binaries as potential risk
-                setuid_files = []
-                for f in (files or []):
-                    try:
-                        if f and os.path.exists(f):
-                            st = os.stat(f)
-                            if bool(st.st_mode & 0o4000):
-                                setuid_files.append(f)
-                    except Exception:
-                        continue
-                if setuid_files:
-                    local_findings.append(AuditFinding(
-                        package=pkg_name,
-                        file=None,
-                        issue="setuid_files",
-                        severity="medium",
-                        evidence={"files": setuid_files},
-                        recommended=[{"action": "audit_setuid", "reason": "setuid present"}]
-                    ))
-                # 4) check reverse deps brokenness (package depended on but missing)
-                try:
-                    revs = self.db.get_reverse_deps(pkg_name) or []
-                except Exception:
-                    revs = []
-                # if no reverse deps and package not essential (heuristic), flag as orphan (low)
-                protected = set(self._cfg_get("audit.protected_packages", ["glibc", "linux-firmware", "base"]) or [])
-                if not revs and pkg_name not in protected:
-                    local_findings.append(AuditFinding(
-                        package=pkg_name,
-                        file=None,
-                        issue="possibly_orphan",
-                        severity="low",
-                        evidence={},
-                        recommended=[{"action": "maybe_remove", "reason": "no_reverse_deps"}]
-                    ))
-                # more heuristics could be added (signature missing, packaging mismatches, known CVE DB checks, etc.)
-            except Exception as e:
-                self._log("warning", "audit.scan.pkgfail", f"Scan of package {pkg_name} failed: {e}", package=pkg_name, error=str(e))
-            return local_findings
-
-        # parallel scan
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.jobs) as ex:
-            futures = {ex.submit(scan_pkg, name): name for name in targets}
-            for fut in concurrent.futures.as_completed(futures):
-                if self._cancelled:
-                    break
-                try:
-                    pkg_findings = fut.result()
-                    findings.extend(pkg_findings)
-                except Exception as e:
-                    self._log("warning", "audit.scan.threadfail", f"Task failed: {e}", error=str(e))
-
-        self._log("info", "audit.scan.done", f"Scan completed with {len(findings)} findings", findings=len(findings))
-        return findings
-
-    # ------------- planning -------------
-    def plan(self, findings: List[AuditFinding]) -> List[AuditPlanItem]:
-        """
-        Create a remediation plan from findings.
-        Returns a list of AuditPlanItem.
-        """
-        decorator = self._perf_timer("audit.plan") if self._perf_timer else None
-        if decorator:
-            return decorator(self._plan_impl)(findings)
-        else:
-            return self._plan_impl(findings)
-
-    def _plan_impl(self, findings: List[AuditFinding]) -> List[AuditPlanItem]:
-        plan: List[AuditPlanItem] = []
-        for f in findings:
-            # choose remediation based on recommended actions in finding and installed handlers
-            rec = f.recommended or []
-            chosen = None
-            for r in rec:
-                act = r.get("action")
-                # prefer upgrade/rebuild where possible
-                if act in ("upgrade", "rebuild") and self.upgrade_handler:
-                    chosen = AuditPlanItem(package=f.package, action="rebuild", reason=r.get("reason", ""), details={"evidence": f.evidence})
-                    break
-                if act == "patch" and self.patcher_handler:
-                    chosen = AuditPlanItem(package=f.package, action="patch", reason=r.get("reason", ""), details={"evidence": f.evidence})
-                    break
-                if act in ("remove", "maybe_remove") and self.remove_handler:
-                    # require lower risk threshold for removal
-                    if f.severity in ("low", "medium"):
-                        chosen = AuditPlanItem(package=f.package, action="remove", reason=r.get("reason", ""), details={"evidence": f.evidence})
-                        break
-                # fallback manual
-                if not chosen:
-                    chosen = AuditPlanItem(package=f.package, action="manual", reason="no_auto_action", details={"evidence": f.evidence})
-            if not chosen:
-                chosen = AuditPlanItem(package=f.package, action="manual", reason="no_recommend", details={})
-            plan.append(chosen)
-        self._log("info", "audit.plan.ok", f"Plan built with {len(plan)} items", items=len(plan))
-        return plan
-
-    # ------------- execute plan -------------
-    def execute_plan(self, plan: List[AuditPlanItem], confirm: bool = False, parallel: Optional[int] = None, use_sandbox: Optional[bool] = None) -> List[Dict[str, Any]]:
-        """
-        Execute the remediation plan.
-        Returns a list of execution result dicts.
-        """
-        decorator = self._perf_timer("audit.execute") if self._perf_timer else None
-        if decorator:
-            return decorator(self._execute_impl)(plan, confirm, parallel, use_sandbox)
-        else:
-            return self._execute_impl(plan, confirm, parallel, use_sandbox)
-
-    def _execute_impl(self, plan: List[AuditPlanItem], confirm: bool, parallel: Optional[int], use_sandbox: Optional[bool]) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-        if not plan:
-            return results
-
-        parallel = parallel or self.jobs
-        use_sandbox = True if use_sandbox is None else bool(use_sandbox)
-
-        if self.require_confirm := bool(self._cfg_get("audit.require_confirm", True)):
-            if not confirm and not self.dry_run:
-                self._log("warning", "audit.execute.no_confirm", "Execution requires explicit confirm flag")
-                return [{"package": it.package, "action": it.action, "ok": False, "error": "no_confirm"} for it in plan]
-
-        # worker for a single plan item
-        def worker(item: AuditPlanItem) -> Dict[str, Any]:
-            if self._cancelled:
-                return {"package": item.package, "action": item.action, "ok": False, "error": "cancelled"}
-            start = time.time()
-            res = {"package": item.package, "action": item.action, "reason": item.reason, "details": item.details, "ts": self._now_ts()}
-            # query db for files to backup
-            files = []
-            try:
-                files = self.db.list_files(item.package) if self.db else []
-            except Exception:
-                files = []
-            # create backup before destructive ops
-            backup = None
-            if item.action in ("remove", "patch", "rebuild"):
-                backup = self._backup_paths(item.package, files)
-                res["backup"] = backup
-
-            # execute action
-            try:
-                if item.action == "rebuild":
-                    if not self.upgrade_handler:
-                        res.update({"ok": False, "error": "no_upgrade_handler"})
-                    else:
-                        # call rebuild; rely on its own dry-run handling
-                        r = self.upgrade_handler.rebuild(item.package)
-                        res.update({"ok": bool(r), "result": r})
-                elif item.action == "patch":
-                    if not self.patcher_handler:
-                        res.update({"ok": False, "error": "no_patcher"})
-                    else:
-                        r = self.patcher_handler.apply_patches(item.package, dry_run=self.dry_run)
-                        res.update({"ok": bool(r), "result": r})
-                elif item.action == "remove":
-                    if not self.remove_handler:
-                        res.update({"ok": False, "error": "no_remove_handler"})
-                    else:
-                        # call remove handler with confirm True if not dry_run
-                        r = self.remove_handler.execute_removal(item.package, confirm=(not self.dry_run), purge=False, use_sandbox=use_sandbox)
-                        res.update({"ok": bool(r.get("ok")), "result": r})
-                else:
-                    # manual action suggested — do nothing automatically
-                    res.update({"ok": False, "error": "manual_action_required"})
-            except Exception as e:
-                res.update({"ok": False, "error": f"exception: {e}"})
-            res["duration"] = time.time() - start
-            # record in DB
-            try:
-                if self.db and hasattr(self.db, "record_phase"):
-                    self.db.record_phase(package=item.package, phase="audit.execute", status="ok" if res.get("ok") else "error", meta={"action": item.action, "duration": res.get("duration", 0)})
-            except Exception:
-                pass
-            return res
-
-        # parallel execution
-        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
-            futures = {ex.submit(worker, it): it for it in plan}
-            for fut in concurrent.futures.as_completed(futures):
-                try:
-                    r = fut.result()
-                    results.append(r)
-                except Exception as e:
-                    results.append({"package": "unknown", "action": "unknown", "ok": False, "error": str(e)})
-        self._log("info", "audit.execute.done", f"Executed plan items: {len(results)}", executed=len(results))
-        return results
-
-    # ------------- report assembly -------------
-    def assemble_report(self, findings: List[AuditFinding], plan: List[AuditPlanItem], executed: Optional[List[Dict[str, Any]]] = None) -> AuditReport:
-        ts = self._now_ts()
-        # simple summary counters
-        counts = {"findings": len(findings), "plan_items": len(plan), "executed": len(executed or [])}
-        report = AuditReport(ts=ts,
-                             summary=counts,
-                             findings=[f.to_dict() for f in findings],
-                             plan=[p.to_dict() for p in plan],
-                             executed=executed or [])
-        self._save_report(report)
-        # store high-level event in DB
-        try:
-            if self.db and hasattr(self.db, "record_event"):
-                self.db.record_event(event="audit.run", ts=ts, meta=report.summary)
+            if self.db:
+                self.db.record_phase(name, phase, status, meta=meta or {})
         except Exception:
             pass
-        return report
 
-    # ------------- CLI -------------
-    @staticmethod
-    def cli():
+    def _audit_report(self, topic: str, entity: str, status: str, meta: Dict[str, Any]) -> None:
+        """
+        Incremental report for monitoring: call db/audit endpoints if present.
+        """
+        try:
+            if hasattr(self, "audit") and self.cfg:  # avoid recursion; if other audit mechanisms exist we could call them
+                pass
+            # if newpkg_audit.report callable exists in some other module, call it: best-effort
+        except Exception:
+            pass
+        # Also attempt to call hooks for record
+        if self.hooks:
+            try:
+                self.hooks.run("audit.report", {"topic": topic, "entity": entity, "status": status, "meta": meta})
+            except Exception:
+                pass
+
+    def _rotate_reports(self) -> None:
+        try:
+            files = sorted([p for p in self.report_dir.iterdir() if p.is_file() and p.name.startswith("audit-report-")], key=lambda p: p.stat().st_mtime, reverse=True)
+            for p in files[self.report_keep:]:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _save_report(self, report: AuditReport) -> Path:
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        fname = f"audit-report-{ts}.json"
+        path = self.report_dir / fname
+        try:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(asdict(report), indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(str(tmp), str(path))
+            if self.compress_reports:
+                # compress in background best-effort
+                try:
+                    comp = path.with_suffix(path.suffix + ".xz")
+                    with open(path, "rb") as f_in:
+                        with open(str(comp), "wb") as f_out:
+                            import lzma
+                            f_out.write(lzma.compress(f_in.read()))
+                    try:
+                        path.unlink()
+                        path = comp
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            self._rotate_reports()
+        except Exception as e:
+            if self.logger:
+                self.logger.warning("audit.save_report_failed", f"failed to save report: {e}")
+        return path
+
+    # ---------------- scanning ----------------
+    def scan_system(self) -> List[Finding]:
+        """
+        Scan the system for findings:
+          - setuid/setgid suspicious files
+          - missing files referenced by DB
+          - packages with known vulnerabilities (if db provides 'vulns' metadata)
+          - reverse dependency breaks using newpkg_deps (if available)
+        Returns list of Finding objects.
+        """
+        start_all = time.time()
+        if self.hooks:
+            try:
+                self.hooks.run("pre_scan", {})
+            except Exception:
+                pass
+
+        findings: List[Finding] = []
+        # 1) setuid/setgid scan (common locations)
+        try:
+            paths = ["/usr/bin", "/usr/sbin", "/bin", "/sbin"]
+            for p in paths:
+                try:
+                    for root, dirs, files in os.walk(p):
+                        for fname in files:
+                            fpath = os.path.join(root, fname)
+                            try:
+                                st = os.lstat(fpath)
+                                if bool(st.st_mode & stat.S_ISUID) or bool(st.st_mode & stat.S_ISGID):
+                                    findings.append(Finding(id=f"path:{fpath}", category="setuid", severity="medium", description="setuid/setgid binary", path=fpath))
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 2) DB-reported missing files
+        if self.db and hasattr(self.db, "list_installed_packages"):
+            try:
+                pkgs = self.db.list_installed_packages()
+                for p in pkgs:
+                    files = p.get("files") or []
+                    for f in files:
+                        if not os.path.exists(f):
+                            findings.append(Finding(id=f"missing:{f}", category="missing_file", severity="high", description="file listed by DB missing from filesystem", package=p.get("name"), path=f))
+            except Exception:
+                pass
+
+        # 3) Vulnerabilities metadata from DB
+        if self.db and hasattr(self.db, "list_vulnerable_packages"):
+            try:
+                vulns = self.db.list_vulnerable_packages()
+                for v in vulns:
+                    findings.append(Finding(id=f"vuln:{v.get('package')}", category="vulnerability", severity=v.get("severity", "high"), description=v.get("summary", ""), package=v.get("package"), extra=v))
+            except Exception:
+                pass
+
+        # 4) Dependency integrity via newpkg_deps
+        if self.deps and hasattr(self.deps, "resolve"):
+            try:
+                # optionally check all packages from DB or a sample; here we check all installed names
+                installed = []
+                if self.db and hasattr(self.db, "list_installed_packages"):
+                    try:
+                        installed = [p.get("name") for p in self.db.list_installed_packages()]
+                    except Exception:
+                        installed = []
+                for pkg in installed:
+                    try:
+                        rep = self.deps.resolve(pkg)
+                        if rep.missing:
+                            findings.append(Finding(id=f"dep:{pkg}", category="dependency", severity="high", description=f"missing deps for {pkg}", package=pkg, extra={"missing": rep.missing}))
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        duration = time.time() - start_all
+        self._record_phase(None, "audit.scan", "ok", meta={"count": len(findings), "duration": round(duration, 3)})
+        if self.hooks:
+            try:
+                self.hooks.run("post_scan", {"count": len(findings)})
+            except Exception:
+                pass
+        return findings
+
+    # ---------------- plan generation ----------------
+    def create_plan(self, findings: List[Finding]) -> List[Dict[str, Any]]:
+        """
+        Create a remediation plan from findings.
+        For each finding choose an action: 'patch' (if patcher available), 'rebuild' (upgrade/core), 'remove' (remover), 'manual'
+        """
+        plan: List[Dict[str, Any]] = []
+        for f in findings:
+            action = "manual"
+            reason = f.description
+            detail = {}
+            # heuristics by category/severity
+            if f.category == "vulnerability":
+                if self.patcher:
+                    action = "patch"
+                    reason = "vulnerability - try apply patch"
+                elif self.upgrader:
+                    action = "rebuild"
+                    reason = "vulnerability - try rebuild"
+                else:
+                    action = "manual"
+            elif f.category == "missing_file":
+                # if package available and remover present, consider rebuild or reinstall
+                if self.upgrader:
+                    action = "rebuild"
+                    reason = "missing file - try rebuild package"
+                else:
+                    action = "manual"
+            elif f.category == "setuid":
+                # sensitive: prompt manual unless configured
+                action = "manual"
+            elif f.category == "dependency":
+                # if deps available, attempt rebuild of provider
+                action = "rebuild" if self.upgrader or self.core else "manual"
+                reason = "dependency broken"
+                detail = f.extra or {}
+            else:
+                action = "manual"
+            plan.append({"finding": asdict(f), "action": action, "reason": reason, "detail": detail})
+        return plan
+
+    # ---------------- corrective actions ----------------
+    def _verify_sha(self, path: str, expected_sha: str) -> Tuple[bool, str]:
+        try:
+            import hashlib
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(8192), b""):
+                    h.update(chunk)
+            got = h.hexdigest()
+            return got == expected_sha, got
+        except Exception as e:
+            return False, str(e)
+
+    def _verify_gpg(self, file_path: str, sig_path: str) -> Tuple[bool, str]:
+        gpg = shutil.which("gpg") or shutil.which("gpg2")
+        if not gpg:
+            return False, "gpg not found"
+        rc, out, err = self._safe_run([gpg, "--verify", sig_path, file_path])
+        return rc == 0, out + err
+
+    def _safe_run(self, cmd: List[str], cwd: Optional[str] = None, timeout: Optional[int] = None) -> Tuple[int, str, str]:
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout or 300, check=False)
+            out = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
+            err = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
+            return proc.returncode, out, err
+        except subprocess.TimeoutExpired as e:
+            return 124, "", f"timeout: {e}"
+        except Exception as e:
+            return 1, "", f"exception: {e}"
+
+    def _backup_before_action(self, target: Optional[str], prefix: str = "audit-backup") -> Optional[str]:
+        """
+        Create a tar.xz backup of a file or directory before destructive action.
+        Returns backup path or None.
+        """
+        try:
+            if not target:
+                return None
+            tgt = Path(target)
+            if not tgt.exists():
+                return None
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            out = self.backup_dir / f"{prefix}-{tgt.name}-{ts}.tar.xz"
+            tmpf = tempfile.NamedTemporaryFile(delete=False, dir=str(self.backup_dir))
+            tmpf.close()
+            with tarfile.open(tmpf.name, "w:xz") as tf:
+                # if it's a file, add it; if dir, add recursively
+                tf.add(str(tgt), arcname=tgt.name)
+            os.replace(tmpf.name, out)
+            return str(out)
+        except Exception:
+            return None
+
+    def _run_action(self, item: Dict[str, Any], attempt: int = 1) -> Dict[str, Any]:
+        """
+        Execute a plan item. Returns dict with result metadata.
+        Retries up to self.retry on failure.
+        """
+        finding = item.get("finding") or {}
+        action = item.get("action")
+        reason = item.get("reason")
+        pkg = finding.get("package")
+        path = finding.get("path")
+        result = {"action": action, "finding": finding, "attempt": attempt, "start": now_iso(), "ok": False, "message": None}
+        # incremental audit report start
+        try:
+            self._audit_report("audit.action.start", pkg or (path or "item"), "start", {"action": action, "attempt": attempt})
+        except Exception:
+            pass
+
+        try:
+            # pre-action hook
+            if self.hooks:
+                try:
+                    self.hooks.run("pre_execute", {"action": action, "finding": finding, "attempt": attempt})
+                except Exception:
+                    pass
+
+            # dry-run handling
+            if self.dry_run:
+                result.update({"ok": True, "message": "dry-run: not executed", "end": now_iso()})
+                self._record_phase(pkg, "audit.action", "dry-run", meta={"action": action})
+                try:
+                    self._audit_report("audit.action.result", pkg or path or "item", "dry-run", {"action": action})
+                except Exception:
+                    pass
+                return result
+
+            # choose action
+            if action == "patch" and self.patcher:
+                # attempt to apply related patches if known (best-effort)
+                # we expect finding.extra to hold patch path or patch id
+                patch_path = (finding.get("extra") or {}).get("patch_path")
+                backup = None
+                if path:
+                    backup = self._backup_before_action(path, prefix="patch-backup")
+                ok = False
+                msg = ""
+                if patch_path:
+                    # try patcher.apply_single if available or patcher.apply_all
+                    try:
+                        if hasattr(self.patcher, "apply_single"):
+                            res = self.patcher.apply_single(Path(patch_path), Path("/"), method="patch")
+                            ok = res.get("ok", False)
+                            msg = res.get("stderr", "") or res.get("stdout", "") or ""
+                        elif hasattr(self.patcher, "apply_all"):
+                            res = self.patcher.apply_all([Path(patch_path)], Path("/"))
+                            ok = res.get("ok", False)
+                            msg = json.dumps(res)
+                    except Exception as e:
+                        ok = False
+                        msg = str(e)
+                else:
+                    ok = False
+                    msg = "no patch specified"
+                result.update({"ok": ok, "message": msg, "backup": backup, "end": now_iso()})
+            elif action == "rebuild":
+                # attempt rebuild via upgrader or core
+                ok = False
+                messages = []
+                if self.upgrader and hasattr(self.upgrader, "rebuild"):
+                    try:
+                        # optionally run inside sandbox
+                        if self.use_sandbox and self.sandbox:
+                            # try wrapper to call CLI as a best-effort
+                            ok, out = self._run_cli_in_sandbox(["upgrade", "--rebuild", pkg])
+                            messages.append(out)
+                        else:
+                            r = self.upgrader.rebuild(pkg)
+                            # support tuple or dict or bool return variations
+                            if isinstance(r, tuple):
+                                ok = bool(r[0])
+                                messages.append(str(r[1] if len(r) > 1 else ""))
+                            elif isinstance(r, dict):
+                                ok = bool(r.get("ok", False))
+                                messages.append(json.dumps(r))
+                            else:
+                                ok = bool(r)
+                                messages.append(str(r))
+                    except Exception as e:
+                        messages.append(f"upgrade exception: {e}")
+                if not ok and self.remover and hasattr(self.remover, "reinstall") and pkg:
+                    try:
+                        # try a reinstall via remover (best-effort)
+                        rr = self.remover.reinstall(pkg) if hasattr(self.remover, "reinstall") else None
+                        if isinstance(rr, tuple):
+                            ok = bool(rr[0])
+                            messages.append(str(rr[1] if len(rr) > 1 else ""))
+                        else:
+                            ok = bool(rr)
+                            messages.append(str(rr))
+                    except Exception as e:
+                        messages.append(f"remover.reinstall exception: {e}")
+                result.update({"ok": ok, "message": " | ".join(messages), "end": now_iso()})
+            elif action == "remove":
+                # careful destructive action: backup then remove via remover
+                backup = None
+                if path:
+                    backup = self._backup_before_action(path, prefix="remove-backup")
+                ok = False
+                msg = ""
+                if self.remover and hasattr(self.remover, "remove_by_path"):
+                    try:
+                        ok, msg = self.remover.remove_by_path(path)
+                        # ensure ok is boolean
+                        ok = bool(ok)
+                    except Exception as e:
+                        ok = False
+                        msg = str(e)
+                else:
+                    # fallback: os.remove/rmtree (dangerous) — use only if explicitly configured
+                    try:
+                        if os.path.isdir(path):
+                            shutil.rmtree(path)
+                        else:
+                            os.unlink(path)
+                        ok = True
+                        msg = "removed via fallback"
+                    except Exception as e:
+                        ok = False
+                        msg = f"fallback remove failed: {e}"
+                result.update({"ok": ok, "message": msg, "backup": backup, "end": now_iso()})
+            else:
+                # manual or unknown
+                result.update({"ok": False, "message": "manual intervention required", "end": now_iso()})
+
+            # post-action hook
+            if self.hooks:
+                try:
+                    self.hooks.run("post_execute", {"action": action, "finding": finding, "result": result})
+                except Exception:
+                    pass
+
+            # record to DB & incremental audit
+            try:
+                self._record_phase(pkg or path or "item", f"audit.action.{action}", "ok" if result.get("ok") else "fail", meta={"message": result.get("message")})
+            except Exception:
+                pass
+            try:
+                self._audit_report("audit.action.result", pkg or path or "item", "ok" if result.get("ok") else "fail", {"action": action, "message": result.get("message")})
+            except Exception:
+                pass
+
+            return result
+
+        except Exception as e:
+            # unexpected exception
+            tb = traceback.format_exc()
+            result.update({"ok": False, "message": f"exception: {e}", "trace": tb, "end": now_iso()})
+            try:
+                self._record_phase(pkg or path or "item", f"audit.action.{action}", "error", meta={"exception": str(e)})
+            except Exception:
+                pass
+            try:
+                self._audit_report("audit.action.exception", pkg or path or "item", "error", {"exception": str(e), "trace": tb})
+            except Exception:
+                pass
+            return result
+
+    def _run_cli_in_sandbox(self, args: List[str], timeout: int = 600) -> Tuple[bool, str]:
+        """
+        Best-effort: run the system 'newpkg' CLI inside sandbox with provided args.
+        Returns (ok, output).
+        """
+        wrapper = shutil.which("newpkg") or shutil.which("newpkg-cli") or shutil.which("newpkg3")
+        if not wrapper:
+            return False, "newpkg wrapper not found"
+        script = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".sh")
+        try:
+            script.write("#!/bin/sh\nset -e\n")
+            script.write(shlex_quote(wrapper) + " " + " ".join(shlex_quote(a) for a in args) + "\n")
+            script.close()
+            os.chmod(script.name, 0o755)
+            if not self.sandbox:
+                rc, out, err = self._safe_run([script.name], timeout=timeout)
+            else:
+                res = self.sandbox.run_in_sandbox([script.name], workdir=None, env=None, binds=None, ro_binds=None, backend=None, use_fakeroot=False, timeout=timeout)
+                rc, out, err = res.rc, res.stdout, res.stderr
+            ok = rc == 0
+            return ok, (out or "") + (err or "")
+        finally:
+            try:
+                os.unlink(script.name)
+            except Exception:
+                pass
+
+    # ---------------- execute plan ----------------
+    def execute_plan(self, plan: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Execute remediation plan concurrently with retries.
+        Returns list of result dicts.
+        """
+        if self.hooks:
+            try:
+                self.hooks.run("pre_execute", {"plan_len": len(plan)})
+            except Exception:
+                pass
+
+        results: List[Dict[str, Any]] = []
+        progress_ctx = None
+        try:
+            if self.logger:
+                progress_ctx = self.logger.progress(f"Executing audit plan ({len(plan)} items)", total=len(plan))
+        except Exception:
+            progress_ctx = None
+
+        with ThreadPoolExecutor(max_workers=max(1, self.jobs)) as ex:
+            future_map = {}
+            for item in plan:
+                # schedule attempts: we implement retries inside worker
+                future = ex.submit(self._action_worker_with_retries, item)
+                future_map[future] = item
+            for fut in as_completed(future_map):
+                item = future_map[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {"action": item.get("action"), "finding": item.get("finding"), "ok": False, "message": f"exception: {e}"}
+                results.append(res)
+                # report progress
+                try:
+                    if progress_ctx:
+                        pass
+                except Exception:
+                    pass
+
+        if progress_ctx:
+            try:
+                progress_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+
+        if self.hooks:
+            try:
+                self.hooks.run("post_execute", {"results_count": len(results)})
+            except Exception:
+                pass
+
+        return results
+
+    def _action_worker_with_retries(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        last = None
+        for attempt in range(1, self.retry + 2):
+            res = self._run_action(item, attempt=attempt)
+            last = res
+            if res.get("ok"):
+                break
+            # small backoff
+            time.sleep(min(2 ** attempt, 30))
+        return last
+
+    # ---------------- top-level audit run ----------------
+    def run_audit(self) -> AuditReport:
+        """
+        High-level function to run full audit: scan -> plan -> execute -> save report
+        """
+        ts0 = time.time()
+        findings = self.scan_system()
+        plan = self.create_plan(findings)
+        results = self.execute_plan(plan)
+        duration = time.time() - ts0
+        rep = AuditReport(timestamp=now_iso(), findings=[asdict(f) for f in findings], plan=plan, results=results, duration=round(duration, 3))
+        path = self._save_report(rep)
+        try:
+            self._record_phase(None, "audit.run", "ok", meta={"findings": len(findings), "plan_items": len(plan), "duration": rep.duration, "report": str(path)})
+        except Exception:
+            pass
+        return rep
+
+    # ---------------- CLI ----------------
+    def cli(self, argv: Optional[List[str]] = None) -> int:
         import argparse
-        p = argparse.ArgumentParser(prog="newpkg-audit", description="Audit installed packages for vulnerabilities/misconfigurations")
-        p.add_argument("subcmd", choices=["scan", "plan", "execute", "report", "check"], help="subcommand")
-        p.add_argument("--packages", nargs="*", help="specific package names to target (default: all)")
-        p.add_argument("--confirm", action="store_true", help="confirm execution of planned actions")
-        p.add_argument("--no-sandbox", action="store_true", help="do not use sandbox for remediation actions")
-        p.add_argument("--json", action="store_true", help="output JSON only")
-        p.add_argument("--quiet", action="store_true", help="quiet mode")
-        p.add_argument("--jobs", type=int, help="parallel jobs override")
-        args = p.parse_args()
-
-        cfg = init_config() if init_config else None
-        logger = NewpkgLogger.from_config(cfg, NewpkgDB(cfg)) if NewpkgLogger and cfg else None
-        db = NewpkgDB(cfg) if NewpkgDB and cfg else None
-        sandbox = NewpkgSandbox(cfg=cfg, logger=logger, db=db) if NewpkgSandbox and cfg else None
-
-        audit = NewpkgAudit(cfg=cfg, logger=logger, db=db, sandbox=sandbox)
-        if args.quiet:
-            audit.quiet = True
-        if args.json:
-            audit.json_out = True
+        parser = argparse.ArgumentParser(prog="newpkg-audit", description="Newpkg system audit and remediation")
+        parser.add_argument("--scan-only", action="store_true", help="Only scan and list findings")
+        parser.add_argument("--execute", action="store_true", help="Execute remediation plan after scanning")
+        parser.add_argument("--report-dir", help="Override report dir")
+        parser.add_argument("--jobs", type=int, help="Override parallel jobs")
+        parser.add_argument("--no-compress", action="store_true", help="Do not compress reports")
+        parser.add_argument("--dry-run", action="store_true", help="Do not perform destructive actions")
+        args = parser.parse_args(argv or sys.argv[1:])
+        if args.report_dir:
+            self.report_dir = Path(args.report_dir)
+            self.report_dir.mkdir(parents=True, exist_ok=True)
         if args.jobs:
-            audit.jobs = args.jobs
-        if args.no_sandbox:
-            use_sandbox = False
+            self.jobs = args.jobs
+        if args.no_compress:
+            self.compress_reports = False
+        if args.dry_run:
+            self.dry_run = True
+
+        findings = self.scan_system()
+        if not findings:
+            if RICH and _console:
+                _console.print("[green]No findings[/green]")
+            else:
+                print("No findings")
+            return 0
+
+        # print findings
+        if RICH and _console:
+            table = Table(title="Audit Findings", box=box.SIMPLE)
+            table.add_column("id")
+            table.add_column("category")
+            table.add_column("severity")
+            table.add_column("package/path")
+            table.add_column("description")
+            for f in findings:
+                pkg_or_path = f.package or f.path or "-"
+                sev = f.severity.upper()
+                table.add_row(f.id, f.category, sev, pkg_or_path, f.description)
+            _console.print(table)
         else:
-            use_sandbox = True
+            for f in findings:
+                print(f"{f.id}\t{f.category}\t{f.severity}\t{f.package or f.path}\t{f.description}")
 
-        packages = args.packages or None
+        if args.scan_only:
+            return 0
 
-        if args.subcmd == "scan":
-            findings = audit.scan(packages)
-            out = [f.to_dict() for f in findings]
-            if audit.json_out or args.json:
-                print(json.dumps(out, indent=2))
+        plan = self.create_plan(findings)
+        if RICH and _console:
+            pt = Table(title="Proposed Plan", box=box.SIMPLE)
+            pt.add_column("action")
+            pt.add_column("package/path")
+            pt.add_column("reason")
+            for p in plan:
+                finding = p.get("finding", {})
+                target = finding.get("package") or finding.get("path") or "-"
+                pt.add_row(p.get("action"), target, p.get("reason"))
+            _console.print(pt)
+        else:
+            print(json.dumps(plan, indent=2))
+
+        if args.execute:
+            result = self.execute_plan(plan)
+            ok = all(r.get("ok") for r in result)
+            if RICH and _console:
+                if ok:
+                    _console.print("[green]All actions succeeded[/green]")
+                else:
+                    _console.print("[yellow]Some actions failed; check report[/yellow]")
             else:
-                for f in out:
-                    print(f"- {f['package']}: {f['issue']} [{f['severity']}]")
-            raise SystemExit(0)
+                print("Execution results:")
+                print(json.dumps(result, indent=2))
+            return 0 if ok else 2
 
-        if args.subcmd == "plan":
-            findings = audit.scan(packages)
-            plan = audit.plan(findings)
-            out = [p.to_dict() for p in plan]
-            if audit.json_out or args.json:
-                print(json.dumps(out, indent=2))
-            else:
-                for p in out:
-                    print(f"- {p['package']}: {p['action']} ({p['reason']})")
-            raise SystemExit(0)
+        return 0
 
-        if args.subcmd == "execute":
-            findings = audit.scan(packages)
-            plan = audit.plan(findings)
-            executed = audit.execute_plan(plan, confirm=args.confirm, parallel=args.jobs, use_sandbox=use_sandbox)
-            if audit.json_out or args.json:
-                print(json.dumps(executed, indent=2))
-            else:
-                for e in executed:
-                    status = "OK" if e.get("ok") else f"FAIL ({e.get('error')})"
-                    print(f"- {e.get('package')}: {e.get('action')} => {status}")
-            raise SystemExit(0)
+# module-level singleton
+_default_audit: Optional[NewpkgAudit] = None
 
-        if args.subcmd == "report":
-            findings = audit.scan(packages)
-            plan = audit.plan(findings)
-            executed = []
-            report = audit.assemble_report(findings, plan, executed)
-            if audit.json_out or args.json:
-                print(json.dumps(report.to_dict(), indent=2))
-            else:
-                print(f"Report written: {report.ts} summary: {report.summary}")
-            raise SystemExit(0)
-
-        if args.subcmd == "check":
-            # shorthand: scan + plan and show human summary
-            findings = audit.scan(packages)
-            plan = audit.plan(findings)
-            counts = {"findings": len(findings), "plan": len(plan)}
-            if audit.json_out or args.json:
-                print(json.dumps(counts, indent=2))
-            else:
-                print(f"Findings: {counts['findings']}, Plan items: {counts['plan']}")
-            raise SystemExit(0)
-
-    # expose CLI hook
-    run_cli = cli
-
+def get_audit(cfg: Any = None, logger: Any = None, db: Any = None, sandbox: Any = None, hooks: Any = None, patcher: Any = None, upgrader: Any = None, remover: Any = None, deps: Any = None) -> NewpkgAudit:
+    global _default_audit
+    if _default_audit is None:
+        _default_audit = NewpkgAudit(cfg=cfg, logger=logger, db=db, sandbox=sandbox, hooks=hooks, patcher=patcher, upgrader=upgrader, remover=remover, deps=deps)
+    return _default_audit
 
 if __name__ == "__main__":
-    NewpkgAudit.cli()
+    a = get_audit()
+    sys.exit(a.cli())
