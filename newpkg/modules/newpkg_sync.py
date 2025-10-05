@@ -1,45 +1,33 @@
 #!/usr/bin/env python3
 # newpkg_sync.py
 """
-newpkg_sync.py
-
-Repository sync manager for Newpkg.
+newpkg_sync.py — synchronize multiple git repositories for newpkg
 
 Features:
- - add_repo / remove_repo / list_repos (in-memory + optional persisted config)
- - clone_repo, fetch_repo, sync_repo (clone+fetch+merge+verify)
- - sync_all with parallel limit and progress
- - rollback_repo (reset to commit + optional backup tar)
- - get_repo_info (commit, branch, ahead/behind)
- - verify_repo via GPG tags/commit verification (best-effort)
- - state cache in ~/.cache/newpkg/sync/repos_state.json
- - integration with NewpkgLogger (logger.info/error), NewpkgDB (record_phase),
-   HooksManager (pre_sync_all/post_sync_all, pre_sync_repo/post_sync_repo), Sandbox (sandbox.run)
- - structured result objects for CLI / API
-
-Design notes:
- - Best-effort GPG verification: tries 'git verify-commit' and 'git tag -v' where applicable.
- - Network retries configurable via cfg (sync.retries, sync.retry_delay)
- - Dry-run supported (reports actions without executing destructive steps)
+ - Manage a list of repositories (add/remove/list)
+ - Clone, fetch, and (optionally) update branches for many repos in parallel
+ - Respect global config: general.dry_run, output.quiet, output.json, general.cache_dir
+ - Integrates with NewpkgLogger, NewpkgDB, NewpkgHooks and NewpkgSandbox when available
+ - Record phases in DB via record_phase
+ - Save per-repo JSON reports to /var/log/newpkg/sync/
+ - Use logger.perf_timer when available
 """
 
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import os
 import shutil
 import subprocess
-import tarfile
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# optional imports from project
+# optional integrations (best-effort)
 try:
     from newpkg_config import init_config
 except Exception:
@@ -56,74 +44,104 @@ except Exception:
     NewpkgDB = None
 
 try:
-    from newpkg_hooks import HooksManager
+    from newpkg_hooks import NewpkgHooks
 except Exception:
-    HooksManager = None
+    NewpkgHooks = None
 
 try:
-    from newpkg_sandbox import Sandbox
+    from newpkg_sandbox import NewpkgSandbox
 except Exception:
-    Sandbox = None
+    NewpkgSandbox = None
 
-# constants
-CACHE_DIR = Path.home() / ".cache" / "newpkg" / "sync"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE = CACHE_DIR / "repos_state.json"
-REPOS_FILE = CACHE_DIR / "repos_config.json"
+# fallback stdlib logger for internal fallback
+import logging
+_logger = logging.getLogger("newpkg.sync")
+if not _logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[%(levelname)s] newpkg.sync: %(message)s"))
+    _logger.addHandler(h)
+_logger.setLevel(logging.INFO)
 
-DEFAULT_PARALLEL = 4
-DEFAULT_RETRIES = 2
-DEFAULT_RETRY_DELAY = 3  # seconds
 
-
+# small dataclasses for reports
 @dataclass
-class SyncStep:
-    phase: str
-    status: str
-    msg: str = ""
-    meta: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class RepoResult:
+class RepoSpec:
     name: str
     url: str
-    path: Optional[str] = None
-    status: str = "unknown"
-    commit: Optional[str] = None
     branch: Optional[str] = None
-    steps: List[SyncStep] = field(default_factory=list)
-    meta: Dict[str, Any] = field(default_factory=dict)
+    dst: Optional[str] = None  # destination path on disk
+    opts: Dict[str, Any] = None
+
+    def to_dict(self):
+        return asdict(self)
 
 
-class SyncError(Exception):
-    pass
+@dataclass
+class RepoReport:
+    name: str
+    url: str
+    dst: str
+    action: str
+    rc: int
+    duration: float
+    stdout: Optional[str] = None
+    stderr: Optional[str] = None
+    meta: Dict[str, Any] = None
+
+    def to_dict(self):
+        return asdict(self)
 
 
 class NewpkgSync:
+    DEFAULT_STATE = "~/.cache/newpkg/sync_state.json"
+    DEFAULT_REPORT_DIR = "/var/log/newpkg/sync"
+
     def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, hooks: Any = None, sandbox: Any = None):
-        self.cfg = cfg
-        self.logger = logger or (NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None)
-        self.db = db or (NewpkgDB(cfg) if NewpkgDB and cfg is not None else None)
-        self.hooks = hooks or (HooksManager(cfg, self.logger, self.db) if HooksManager and cfg is not None else None)
-        self.sandbox = sandbox or (Sandbox(cfg, self.logger, self.db) if Sandbox and cfg is not None else None)
+        self.cfg = cfg or (init_config() if init_config else None)
 
-        # settings
-        self.repos_dir = Path(self._cfg_get("sync.repos_dir", os.environ.get("NEWPKG_SYNC_REPOS", "./repos")))
-        self.repos_dir.mkdir(parents=True, exist_ok=True)
-        self.parallel = int(self._cfg_get("sync.parallel", os.environ.get("NEWPKG_SYNC_PARALLEL", DEFAULT_PARALLEL)))
-        self.retries = int(self._cfg_get("sync.retries", os.environ.get("NEWPKG_SYNC_RETRIES", DEFAULT_RETRIES)))
-        self.retry_delay = int(self._cfg_get("sync.retry_delay", os.environ.get("NEWPKG_SYNC_RETRY_DELAY", DEFAULT_RETRY_DELAY)))
-        self.verify_gpg = bool(self._cfg_get("sync.verify_gpg", os.environ.get("NEWPKG_SYNC_VERIFY_GPG", False)))
-        self.json_output = bool(self._cfg_get("sync.json_output", False))
+        # logger
+        if logger:
+            self.logger = logger
+        else:
+            try:
+                self.logger = NewpkgLogger.from_config(self.cfg, db) if NewpkgLogger and self.cfg else None
+            except Exception:
+                self.logger = None
 
-        # internal repo registry: name -> dict(url, branch, options)
-        self._repos_lock = threading.Lock()
-        self.repos: Dict[str, Dict[str, Any]] = self._load_repos_config()
-        # state cache loaded from disk
-        self.state = self._load_state()
+        # db
+        self.db = db or (NewpkgDB(self.cfg) if NewpkgDB and self.cfg else None)
 
-    # ---------------- util / logging ----------------
+        # hooks
+        self.hooks = hooks or (NewpkgHooks.from_config(self.cfg, self.logger, self.db) if NewpkgHooks and self.cfg else None)
+
+        # sandbox
+        self.sandbox = sandbox or (NewpkgSandbox(cfg=self.cfg, logger=self.logger, db=self.db) if NewpkgSandbox and self.cfg else None)
+
+        # runtime flags from config
+        self.dry_run = bool(self._cfg_get("general.dry_run", False))
+        self.quiet = bool(self._cfg_get("output.quiet", False))
+        self.json_out = bool(self._cfg_get("output.json", False))
+        # concurrency
+        cpu = os.cpu_count() or 1
+        self.parallel = int(self._cfg_get("sync.parallel_jobs", min(4, cpu)))
+        # retry
+        self.retries = int(self._cfg_get("sync.retries", 1))
+        self.retry_delay = float(self._cfg_get("sync.retry_delay", 1.0))
+
+        # state and reports
+        self.state_file = Path(os.path.expanduser(self._cfg_get("sync.state_file", self.DEFAULT_STATE)))
+        self.report_dir = Path(self._cfg_get("sync.report_dir", self.DEFAULT_REPORT_DIR))
+        self.report_dir.mkdir(parents=True, exist_ok=True)
+
+        # internal
+        self._lock = threading.Lock()
+        self._state: Dict[str, Any] = self._load_state()
+        # perf_timer decorator if available
+        self._perf_timer = getattr(self.logger, "perf_timer", None) if self.logger else None
+
+        # wrapper for logging
+        self._log = self._make_logger()
+
     def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
             if self.cfg and hasattr(self.cfg, "get"):
@@ -132,560 +150,400 @@ class NewpkgSync:
                     return v
         except Exception:
             pass
-        return default
+        env_key = key.upper().replace(".", "_")
+        return os.environ.get(env_key, default)
 
-    def _log(self, level: str, event: str, message: str = "", **meta):
-        if self.logger:
+    def _make_logger(self):
+        def _fn(level: str, event: str, msg: str = "", **meta):
             try:
-                fn = getattr(self.logger, level.lower(), None)
-                if fn:
-                    fn(event, message, **meta)
-                    return
+                if self.logger:
+                    fn = getattr(self.logger, level.lower(), None)
+                    if fn:
+                        fn(event, msg, **meta)
+                        return
             except Exception:
                 pass
-        # fallback
-        print(f"[{level}] {event}: {message}")
+            getattr(_logger, level.lower(), _logger.info)(f"{event}: {msg} - {meta}")
+        return _fn
 
-    def _record_db(self, repo: str, phase: str, status: str, meta: Optional[Dict[str, Any]] = None):
-        if not self.db:
-            return
-        try:
-            if hasattr(self.db, "record_phase"):
-                self.db.record_phase(repo, phase, status, log_path=None)
-        except Exception:
-            pass
-
-    # ---------------- config/state persistence ----------------
-    def _load_repos_config(self) -> Dict[str, Dict[str, Any]]:
-        try:
-            if REPOS_FILE.exists():
-                return json.loads(REPOS_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-        return {}
-
-    def _save_repos_config(self):
-        try:
-            REPOS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            REPOS_FILE.write_text(json.dumps(self.repos, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-
+    # ---------------- state management ----------------
     def _load_state(self) -> Dict[str, Any]:
         try:
-            if STATE_FILE.exists():
-                return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if self.state_file.exists():
+                return json.loads(self.state_file.read_text(encoding="utf-8"))
         except Exception:
             pass
-        return {}
+        return {"repos": {}}
 
     def _save_state(self):
         try:
-            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            STATE_FILE.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            self.state_file.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
+            self._log("debug", "sync.state.save", f"Saved state to {self.state_file}", path=str(self.state_file))
+        except Exception as e:
+            self._log("warning", "sync.state.save_fail", f"Failed saving state: {e}", error=str(e))
 
-    # ---------------- repo registry ----------------
-    def add_repo(self, name: str, url: str, branch: Optional[str] = None, options: Optional[Dict[str, Any]] = None) -> bool:
-        with self._repos_lock:
-            self.repos[name] = {"url": url, "branch": branch or "main", "options": options or {}}
-            self._save_repos_config()
-        self._log("info", "sync.repo.add", f"Added repo {name} -> {url}", name=name, url=url, branch=branch)
-        return True
+    def add_repo(self, name: str, url: str, branch: Optional[str] = None, dst: Optional[str] = None, opts: Optional[Dict[str, Any]] = None):
+        """Add or update repository spec to state."""
+        with self._lock:
+            self._state.setdefault("repos", {})
+            repo = {"url": url, "branch": branch, "dst": dst, "opts": opts or {}}
+            self._state["repos"][name] = repo
+            self._save_state()
+        self._log("info", "sync.repo.add", f"Added repo {name}", name=name, url=url)
 
-    def remove_repo(self, name: str) -> bool:
-        with self._repos_lock:
-            if name in self.repos:
-                self.repos.pop(name)
-                self._save_repos_config()
+    def remove_repo(self, name: str):
+        with self._lock:
+            if "repos" in self._state and name in self._state["repos"]:
+                self._state["repos"].pop(name, None)
+                self._save_state()
                 self._log("info", "sync.repo.remove", f"Removed repo {name}", name=name)
                 return True
         return False
 
     def list_repos(self) -> Dict[str, Dict[str, Any]]:
-        return dict(self.repos)
+        return dict(self._state.get("repos", {}))
 
-    # ---------------- low-level git helpers ----------------
-    def _repo_path(self, name: str) -> Path:
-        return (self.repos_dir / name).resolve()
+    # ----------------- low-level helpers -----------------
+    def _git_available(self) -> bool:
+        return bool(shutil.which("git"))
 
-    def _run_git(self, args: List[str], cwd: Optional[Path] = None, use_sandbox: bool = True, timeout: Optional[int] = None) -> Tuple[int, str, str]:
+    def _exec_git(self, args: List[str], cwd: Optional[str] = None, env: Optional[Dict[str, str]] = None, use_sandbox: bool = False, timeout: Optional[float] = None) -> Tuple[int, str, str]:
+        """
+        Execute git command; if sandbox is available and use_sandbox True, delegate.
+        Returns (rc, stdout, stderr).
+        """
         cmd = ["git"] + args
+        if self.dry_run:
+            self._log("info", "sync.git.dryrun", f"DRY-RUN: {' '.join(cmd)}", cmd=cmd, cwd=cwd)
+            return 0, "", ""
         if use_sandbox and self.sandbox:
             try:
-                # sandbox.run expects full argv list
-                res = self.sandbox.run(cmd, cwd=str(cwd) if cwd else None, timeout=timeout)
-                return res.rc, res.out or "", res.err or ""
-            except Exception:
-                pass
-        # fallback to local subprocess
+                res = self.sandbox.run_in_sandbox(cmd, cwd=cwd, captures=True, env=env, timeout=timeout)
+                return res.rc, res.stdout or "", res.stderr or ""
+            except Exception as e:
+                return 255, "", str(e)
+        # run locally
         try:
-            proc = subprocess.run(cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True, timeout=timeout)
+            proc = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
             return proc.returncode, proc.stdout or "", proc.stderr or ""
         except subprocess.TimeoutExpired as e:
             return 124, "", f"timeout: {e}"
         except Exception as e:
-            return 1, "", str(e)
+            return 255, "", str(e)
 
-    def _git_try(self, args: List[str], cwd: Optional[Path], phase: str, repo: str, retries: Optional[int] = None) -> Tuple[int, str, str]:
-        retries = self.retries if retries is None else retries
-        last = (1, "", "no-run")
-        for attempt in range(retries + 1):
-            rc, out, err = self._run_git(args, cwd=cwd)
-            if rc == 0:
-                return rc, out, err
-            last = (rc, out, err)
-            time.sleep(self.retry_delay)
-            self._log("warning", "sync.git.retry", f"Retrying git {' '.join(args)} for {repo} (attempt {attempt+1})", repo=repo, args=args)
-        return last
+    def _write_report(self, repo_name: str, report: RepoReport) -> Path:
+        ts = int(time.time())
+        fname = f"{repo_name}-{ts}.json"
+        path = self.report_dir / fname
+        try:
+            path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
+            self._log("info", "sync.report.write", f"Wrote report for {repo_name} to {path}", path=str(path))
+        except Exception as e:
+            self._log("warning", "sync.report.fail", f"Failed to write report: {e}", error=str(e))
+        return path
 
-    # ---------------- repo operations ----------------
-    def clone_repo(self, name: str, shallow: bool = True, branch: Optional[str] = None, dry_run: bool = False) -> RepoResult:
-        meta = self.repos.get(name)
-        if not meta:
-            raise SyncError(f"unknown repo {name}")
-        url = meta["url"]
-        branch = branch or meta.get("branch") or "main"
-        dst = self._repo_path(name)
-        res = RepoResult(name=name, url=url, path=str(dst))
-        if dry_run:
-            res.status = "dry-run"
-            res.steps.append(SyncStep("clone", "skipped", "dry-run", {"dst": str(dst)}))
-            return res
-
-        if dst.exists() and any(dst.iterdir()):
-            res.steps.append(SyncStep("clone", "skipped", "destination exists", {"dst": str(dst)}))
-            res.status = "exists"
-            return res
-
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        args = ["clone"]
-        if shallow:
-            args += ["--depth", "1"]
-        args += ["--branch", branch, url, str(dst)]
-        self._log("info", "sync.clone.start", f"Cloning {name} from {url}", name=name, url=url, dst=str(dst))
-        self._record_db(name, "sync.clone", "start")
-        rc, out, err = self._git_try(args, cwd=None, phase="clone", repo=name)
-        step = SyncStep("clone", "ok" if rc == 0 else "error", err.strip() if rc != 0 else "cloned", {"rc": rc})
-        res.steps.append(step)
-        res.status = "ok" if rc == 0 else "error"
-        if rc == 0:
-            # record commit & branch
-            c_rc, c_out, _ = self._run_git(["rev-parse", "HEAD"], cwd=dst)
-            b_rc, b_out, _ = self._run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=dst)
-            res.commit = c_out.strip() if c_rc == 0 else None
-            res.branch = b_out.strip() if b_rc == 0 else branch
-            self.state[name] = {"last_sync": datetime.utcnow().isoformat() + "Z", "commit": res.commit, "branch": res.branch}
-            self._save_state()
-            self._record_db(name, "sync.clone", "ok")
-            self._log("info", "sync.clone.ok", f"Cloned {name}", name=name, commit=res.commit, branch=res.branch)
-        else:
-            self._record_db(name, "sync.clone", "error")
-            self._log("error", "sync.clone.fail", f"Clone failed for {name}: {err}", name=name, stderr=err)
-        return res
-
-    def fetch_repo(self, name: str, dry_run: bool = False) -> RepoResult:
-        meta = self.repos.get(name)
-        if not meta:
-            raise SyncError(f"unknown repo {name}")
-        dst = self._repo_path(name)
-        res = RepoResult(name=name, url=meta["url"], path=str(dst))
-        if not dst.exists():
-            res.steps.append(SyncStep("fetch", "missing", "repo not cloned", {"dst": str(dst)}))
-            res.status = "missing"
-            return res
-        if dry_run:
-            res.steps.append(SyncStep("fetch", "skipped", "dry-run"))
-            res.status = "dry-run"
-            return res
-
-        self._log("info", "sync.fetch.start", f"Fetching {name}", name=name)
-        self._record_db(name, "sync.fetch", "start")
-        rc, out, err = self._git_try(["fetch", "--all", "--tags"], cwd=dst, phase="fetch", repo=name)
-        if rc == 0:
-            res.steps.append(SyncStep("fetch", "ok", "fetched"))
-            # update commit/branch info
-            c_rc, c_out, _ = self._run_git(["rev-parse", "HEAD"], cwd=dst)
-            b_rc, b_out, _ = self._run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=dst)
-            res.commit = c_out.strip() if c_rc == 0 else None
-            res.branch = b_out.strip() if b_rc == 0 else None
-            self.state[name] = {"last_sync": datetime.utcnow().isoformat() + "Z", "commit": res.commit, "branch": res.branch}
-            self._save_state()
-            res.status = "ok"
-            self._record_db(name, "sync.fetch", "ok")
-            self._log("info", "sync.fetch.ok", f"Fetched {name}", name=name)
-        else:
-            res.steps.append(SyncStep("fetch", "error", err.strip(), {"rc": rc}))
-            res.status = "error"
-            self._record_db(name, "sync.fetch", "error")
-            self._log("error", "sync.fetch.fail", f"Fetch failed for {name}: {err}", name=name, stderr=err)
-        return res
-
-    def _fast_forward_merge(self, dst: Path, remote_branch: str = "origin/main") -> Tuple[int, str]:
-        # attempt fast-forward merge
-        rc, out, err = self._run_git(["merge", "--ff-only", remote_branch], cwd=dst)
-        return rc, err
-
-    def sync_repo(self, name: str, dry_run: bool = False, shallow: bool = True, verify_gpg: Optional[bool] = None) -> RepoResult:
+    # ----------------- repo operations -----------------
+    def _sync_single(self, name: str, spec: Dict[str, Any], update: bool = True, use_sandbox: bool = True, timeout: Optional[float] = None) -> RepoReport:
         """
-        Full sync for a single repo: clone if needed, fetch, merge (fast-forward), verify.
-        Returns RepoResult with detailed steps.
+        Clone or fetch and optionally update branch. Returns RepoReport.
         """
-        verify_gpg = self.verify_gpg if verify_gpg is None else verify_gpg
-        meta = self.repos.get(name)
-        if not meta:
-            raise SyncError(f"unknown repo {name}")
+        start = time.time()
+        repo_url = spec.get("url")
+        branch = spec.get("branch") or "master"
+        dst = spec.get("dst") or os.path.abspath(os.path.join(self.state_file.parent, "repos", name))
+        Path(dst).mkdir(parents=True, exist_ok=True)
+        action = "noop"
+        rc = 0
+        out = ""
+        err = ""
 
-        self._log("info", "sync.repo.start", f"Starting sync for {name}", name=name)
-        result = RepoResult(name=name, url=meta["url"], path=str(self._repo_path(name)))
-        # pre-hook
+        # run pre-sync repo hooks
         try:
             if self.hooks and hasattr(self.hooks, "execute_safe"):
-                self.hooks.execute_safe("pre_sync_repo", pkg_dir=str(self._repo_path(name)))
+                self.hooks.execute_safe("pre_sync_repo", [f"pre_sync_repo:{name}"], cwd=dst, json_output=False)
         except Exception:
             pass
 
-        # clone if necessary
-        if not Path(result.path).exists() or not any(Path(result.path).iterdir()):
-            clone_res = self.clone_repo(name, shallow=shallow, branch=meta.get("branch"), dry_run=dry_run)
-            result.steps.extend(clone_res.steps)
-            if clone_res.status == "error":
-                result.status = "error"
-                return result
-
-        # fetch
-        fetch_res = self.fetch_repo(name, dry_run=dry_run)
-        result.steps.extend(fetch_res.steps)
-        if fetch_res.status == "error":
-            result.status = "error"
-            return result
-
-        if dry_run:
-            result.steps.append(SyncStep("merge", "skipped", "dry-run"))
-            result.status = "dry-run"
-            return result
-
-        dst = Path(result.path)
-        # determine remote tracking branch
-        branch = meta.get("branch") or "main"
-        remote_branch = f"origin/{branch}"
-        # attempt ff-only merge
-        rc, err = self._fast_forward_merge(dst, remote_branch)
-        if rc == 0:
-            result.steps.append(SyncStep("merge", "ok", f"fast-forwarded to {remote_branch}"))
-            # update commit
-            c_rc, c_out, _ = self._run_git(["rev-parse", "HEAD"], cwd=dst)
-            result.commit = c_out.strip() if c_rc == 0 else None
-            result.branch = branch
-            result.status = "ok"
-            self.state[name] = {"last_sync": datetime.utcnow().isoformat() + "Z", "commit": result.commit, "branch": result.branch}
-            self._save_state()
-            self._log("info", "sync.merge.ok", f"Merged {name} -> {remote_branch}", name=name)
-            self._record_db(name, "sync.merge", "ok")
+        # determine whether clone needed
+        git_dir = Path(dst) / ".git"
+        if not git_dir.exists():
+            action = "clone"
+            self._log("info", "sync.repo.clone.start", f"Cloning {name} from {repo_url} to {dst}", name=name, url=repo_url, dst=dst)
+            rc, out, err = self._exec_git(["clone", "--branch", branch, "--", repo_url, dst], cwd=None, use_sandbox=use_sandbox, timeout=timeout)
         else:
-            # non-fast-forward or conflicts; attempt safe merge strategy: create new branch and merge manually (best-effort)
-            result.steps.append(SyncStep("merge", "warn", "fast-forward failed, attempting safe merge", {"err": err}))
-            # try to reset to remote branch (safe policy: record but do not force-reset unless config allows)
-            allow_force = bool(self._cfg_get("sync.allow_force_reset", False))
-            if allow_force:
-                # backup current state
-                backup = self._backup_repo(dst, name)
-                rc2, out2, err2 = self._run_git(["reset", "--hard", remote_branch], cwd=dst)
+            action = "fetch"
+            self._log("info", "sync.repo.fetch.start", f"Fetching {name} in {dst}", name=name, dst=dst)
+            rc, out, err = self._exec_git(["-C", dst, "fetch", "--all", "--prune"], cwd=dst, use_sandbox=use_sandbox, timeout=timeout)
+            # optionally fast-forward branch
+            if rc == 0 and update:
+                rc2, out2, err2 = self._exec_git(["-C", dst, "checkout", branch], cwd=dst, use_sandbox=use_sandbox, timeout=timeout)
                 if rc2 == 0:
-                    result.steps.append(SyncStep("merge", "ok", f"force reset to {remote_branch}", {"backup": backup}))
-                    c_rc, c_out, _ = self._run_git(["rev-parse", "HEAD"], cwd=dst)
-                    result.commit = c_out.strip() if c_rc == 0 else None
-                    result.branch = branch
-                    result.status = "ok"
-                    self.state[name] = {"last_sync": datetime.utcnow().isoformat() + "Z", "commit": result.commit, "branch": result.branch}
-                    self._save_state()
-                    self._record_db(name, "sync.merge", "ok")
+                    rc3, out3, err3 = self._exec_git(["-C", dst, "pull", "--ff-only", "origin", branch], cwd=dst, use_sandbox=use_sandbox, timeout=timeout)
+                    # prefer last rc
+                    rc = rc3
+                    out += ("\n" + (out2 or "")) + ("\n" + (out3 or ""))
+                    err += ("\n" + (err2 or "")) + ("\n" + (err3 or ""))
                 else:
-                    result.steps.append(SyncStep("merge", "error", "force reset failed", {"err": err2}))
-                    result.status = "error"
-                    self._record_db(name, "sync.merge", "error")
-                    return result
-            else:
-                result.status = "conflict"
-                self._log("warning", "sync.merge.conflict", f"Merge conflict or non-ff for {name}", name=name)
-                self._record_db(name, "sync.merge", "conflict")
-                return result
+                    # cannot checkout target branch
+                    rc = rc2
+                    err += "\n" + (err2 or "")
 
-        # verification (GPG) if requested
-        if verify_gpg:
-            try:
-                v_ok, v_msg = self.verify_repo(name)
-                if v_ok:
-                    result.steps.append(SyncStep("verify", "ok", v_msg))
-                    self._record_db(name, "sync.verify", "ok")
-                else:
-                    result.steps.append(SyncStep("verify", "warn", v_msg))
-                    self._record_db(name, "sync.verify", "warn")
-            except Exception as e:
-                result.steps.append(SyncStep("verify", "error", str(e)))
-                self._record_db(name, "sync.verify", "error")
+        duration = time.time() - start
+        report = RepoReport(name=name, url=repo_url, dst=dst, action=action, rc=rc, duration=duration, stdout=out, stderr=err, meta={"branch": branch})
+        # save report file
+        self._write_report(name, report)
 
-        # post-hook
+        # run post-sync hooks
         try:
             if self.hooks and hasattr(self.hooks, "execute_safe"):
-                self.hooks.execute_safe("post_sync_repo", pkg_dir=str(dst))
+                self.hooks.execute_safe("post_sync_repo", [f"post_sync_repo:{name}"], cwd=dst, json_output=False)
         except Exception:
             pass
 
+        # record DB phase
+        try:
+            if self.db and hasattr(self.db, "record_phase"):
+                self.db.record_phase(package=name, phase="sync.repo", status="ok" if rc == 0 else "error", meta={"action": action, "rc": rc, "duration": duration})
+        except Exception:
+            pass
+
+        # update stored state (last_sync ts)
+        with self._lock:
+            self._state.setdefault("repos", {})
+            r = self._state["repos"].setdefault(name, {})
+            r["last_sync"] = int(time.time())
+            r["dst"] = dst
+            r["url"] = repo_url
+            r["branch"] = branch
+            self._save_state()
+
+        # return
+        return report
+
+    def sync_repo(self, name: str, update: bool = True, use_sandbox: bool = True, timeout: Optional[float] = None) -> RepoReport:
+        """Public wrapper with retries."""
+        spec = self._state.get("repos", {}).get(name)
+        if not spec:
+            self._log("warning", "sync.repo.notfound", f"Repo {name} not found in state", name=name)
+            return RepoReport(name=name, url="", dst="", action="missing", rc=127, duration=0.0, stdout="", stderr="not found", meta={})
+        last_exc = None
+        for attempt in range(max(1, self.retries)):
+            report = self._sync_single(name, spec, update=update, use_sandbox=use_sandbox, timeout=timeout)
+            if report.rc == 0:
+                return report
+            last_exc = report
+            time.sleep(self.retry_delay)
+        # failed after retries
+        return last_exc
+
+    def sync_all(self, names: Optional[List[str]] = None, update: bool = True, use_sandbox: bool = True, timeout: Optional[float] = None, parallel: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Sync multiple repositories in parallel.
+        names: list of repo names to sync; if None, sync all known repos.
+        Returns dict with per-repo reports.
+        """
+        if names is None:
+            names = list(self._state.get("repos", {}).keys())
+        if not names:
+            return {"ok": True, "reports": [], "duration": 0.0}
+
+        parallel = parallel or self.parallel
+        start = time.time()
+
+        # run pre-sync-all hooks
+        try:
+            if self.hooks and hasattr(self.hooks, "execute_safe"):
+                self.hooks.execute_safe("pre_sync_all", [], json_output=False)
+        except Exception:
+            pass
+
+        reports: List[RepoReport] = []
+        with ThreadPoolExecutor(max_workers=parallel) as ex:
+            futs = {ex.submit(self.sync_repo, n, update, use_sandbox, timeout): n for n in names}
+            for fut in as_completed(futs):
+                name = futs[fut]
+                try:
+                    rep = fut.result()
+                except Exception as e:
+                    rep = RepoReport(name=name, url="", dst="", action="error", rc=254, duration=0.0, stdout="", stderr=str(e), meta={})
+                reports.append(rep)
+
+        duration = time.time() - start
+
+        # run post-sync-all hooks
+        try:
+            if self.hooks and hasattr(self.hooks, "execute_safe"):
+                self.hooks.execute_safe("post_sync_all", [], json_output=False)
+        except Exception:
+            pass
+
+        # record overall phase
+        try:
+            if self.db and hasattr(self.db, "record_phase"):
+                ok_count = sum(1 for r in reports if r.rc == 0)
+                self.db.record_phase(package="system", phase="sync.all", status="ok" if ok_count == len(reports) else "partial", meta={"total": len(reports), "ok": ok_count, "duration": duration})
+        except Exception:
+            pass
+
+        # prepare structured result and optionally print JSON/human output
+        result = {"ok": True, "duration": duration, "reports": [r.to_dict() for r in reports]}
+        if self.json_out:
+            print(json.dumps(result, indent=2))
+        else:
+            for r in reports:
+                self._log("info", "sync.report.summary", f"{r.name}: {r.action} rc={r.rc} dur={r.duration:.2f}s", repo=r.name, rc=r.rc, duration=r.duration)
         return result
 
-    def sync_all(self, dry_run: bool = False, names: Optional[List[str]] = None, parallel: Optional[int] = None) -> List[Dict[str, Any]]:
+    def verify_repo(self, name: str, use_signature: bool = True, use_sandbox: bool = True, timeout: Optional[float] = None) -> Dict[str, Any]:
         """
-        Sync all configured repos (or subset `names`) in parallel up to `parallel`.
-        Returns list of result dicts.
+        Verify repository integrity: e.g. check last signed tag/commit.
+        Returns dict with verification info.
         """
-        names = names or list(self.repos.keys())
-        parallel = int(parallel or self.parallel or DEFAULT_PARALLEL)
-        self._log("info", "sync.all.start", f"Starting sync_all for {len(names)} repos", total=len(names))
-        # pre-hooks
-        try:
-            if self.hooks and hasattr(self.hooks, "execute_safe"):
-                self.hooks.execute_safe("pre_sync_all")
-        except Exception:
-            pass
+        spec = self._state.get("repos", {}).get(name)
+        if not spec:
+            return {"ok": False, "error": "not_found", "name": name}
+        dst = spec.get("dst") or os.path.abspath(os.path.join(self.state_file.parent, "repos", name))
+        if not Path(dst).exists():
+            return {"ok": False, "error": "missing_checkout", "path": dst}
 
-        results: List[Dict[str, Any]] = []
+        # try to use git verify-tag or show-signature on last commit
+        if not self._git_available():
+            return {"ok": False, "error": "git_missing"}
 
-        def _worker(n):
-            try:
-                r = self.sync_repo(n, dry_run=dry_run)
-                return r
-            except Exception as e:
-                rr = RepoResult(name=n, url=self.repos.get(n, {}).get("url", ""), path=str(self._repo_path(n)))
-                rr.status = "error"
-                rr.steps.append(SyncStep("sync", "error", str(e)))
-                return rr
+        if self.dry_run:
+            self._log("info", "sync.verify.dryrun", f"Would verify {name}", name=name, path=dst)
+            return {"ok": True, "simulated": True}
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
-            futs = {ex.submit(_worker, n): n for n in names}
-            for fut in concurrent.futures.as_completed(futs):
-                rr: RepoResult = fut.result()
-                results.append(self._reporesult_to_dict(rr))
-
-        # post-hooks
-        try:
-            if self.hooks and hasattr(self.hooks, "execute_safe"):
-                self.hooks.execute_safe("post_sync_all")
-        except Exception:
-            pass
-
-        self._log("info", "sync.all.done", f"Sync_all finished (repos={len(results)})")
-        return results
-
-    def get_repo_info(self, name: str) -> Dict[str, Any]:
-        meta = self.repos.get(name)
-        if not meta:
-            raise SyncError(f"unknown repo {name}")
-        dst = self._repo_path(name)
-        info = {"name": name, "url": meta["url"], "path": str(dst)}
-        if not dst.exists():
-            info["status"] = "missing"
-            return info
-        c_rc, c_out, _ = self._run_git(["rev-parse", "HEAD"], cwd=dst)
-        b_rc, b_out, _ = self._run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=dst)
-        info["commit"] = c_out.strip() if c_rc == 0 else None
-        info["branch"] = b_out.strip() if b_rc == 0 else None
-        # ahead/behind
-        ab_rc, ab_out, _ = self._run_git(["rev-list", "--left-right", "--count", f"HEAD...origin/{info.get('branch') or 'main'}"], cwd=dst)
-        if ab_rc == 0:
-            try:
-                left, right = [int(x) for x in ab_out.strip().split()]
-                info["ahead"] = left
-                info["behind"] = right
-            except Exception:
-                pass
-        return info
-
-    def verify_repo(self, name: str) -> Tuple[bool, str]:
-        """
-        Best-effort verification: check tags/signatures or verify-commit where possible.
-        Returns (ok, message).
-        """
-        meta = self.repos.get(name)
-        if not meta:
-            return False, "unknown repo"
-        dst = self._repo_path(name)
-        if not dst.exists():
-            return False, "not cloned"
-        # try verify-commit HEAD
-        rc, out, err = self._run_git(["verify-commit", "HEAD"], cwd=dst)
-        if rc == 0:
-            return True, "verify-commit ok"
-        # try verify tag on HEAD if tag exists
-        # find tags that point to HEAD
-        rc2, tags_out, _ = self._run_git(["tag", "--points-at", "HEAD"], cwd=dst)
-        tags = tags_out.strip().splitlines() if rc2 == 0 else []
-        for t in tags:
-            vr, vout, verr = self._run_git(["tag", "-v", t], cwd=dst)
-            if vr == 0:
-                return True, f"tag {t} verified"
-        # fallback: no signatures
-        return False, "no-signature-found"
-
-    # ---------------- rollback / backup ----------------
-    def _backup_repo(self, dst: Path, name: str) -> Optional[str]:
-        # create tar.xz backup of the repository working tree before destructive ops
-        try:
-            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-            out = CACHE_DIR / f"{name}-backup-{ts}.tar.xz"
-            with tarfile.open(out, "w:xz") as tar:
-                tar.add(dst, arcname=name)
-            self._log("info", "sync.backup", f"Created backup for {name}", path=str(out))
-            return str(out)
-        except Exception as e:
-            self._log("warning", "sync.backup.fail", f"Backup failed for {name}: {e}")
-            return None
-
-    def rollback_repo(self, name: str, commit: str, create_backup: bool = True) -> RepoResult:
-        meta = self.repos.get(name)
-        if not meta:
-            raise SyncError(f"unknown repo {name}")
-        dst = self._repo_path(name)
-        res = RepoResult(name=name, url=meta["url"], path=str(dst))
-        if not dst.exists():
-            res.steps.append(SyncStep("rollback", "error", "repo not present"))
-            res.status = "missing"
+        if use_signature:
+            rc, out, err = self._exec_git(["-C", dst, "log", "-1", "--show-signature"], cwd=dst, use_sandbox=use_sandbox, timeout=timeout)
+            ok = rc == 0
+            res = {"ok": ok, "rc": rc, "stdout": out, "stderr": err}
+            self._log("info", "sync.verify", f"Verification for {name}: ok={ok}", name=name, rc=rc)
             return res
-
-        if create_backup:
-            bkp = self._backup_repo(dst, name)
-            if bkp:
-                res.steps.append(SyncStep("rollback", "info", "backup_created", {"backup": bkp}))
-
-        # perform hard reset to commit
-        rc, out, err = self._run_git(["reset", "--hard", commit], cwd=dst)
-        if rc == 0:
-            res.steps.append(SyncStep("rollback", "ok", f"reset to {commit}"))
-            res.status = "ok"
-            self.state[name] = {"last_sync": datetime.utcnow().isoformat() + "Z", "commit": commit, "branch": self.state.get(name, {}).get("branch")}
-            self._save_state()
-            self._record_db(name, "sync.rollback", "ok", {"commit": commit})
-            self._log("info", "sync.rollback.ok", f"Rolled back {name} to {commit}", name=name, commit=commit)
         else:
-            res.steps.append(SyncStep("rollback", "error", err.strip()))
-            res.status = "error"
-            self._record_db(name, "sync.rollback", "error", {"commit": commit})
-            self._log("error", "sync.rollback.fail", f"Rollback failed for {name}: {err}", name=name, stderr=err)
+            # fallback: confirm HEAD exists
+            rc, out, err = self._exec_git(["-C", dst, "rev-parse", "HEAD"], cwd=dst, use_sandbox=use_sandbox, timeout=timeout)
+            ok = rc == 0
+            return {"ok": ok, "rc": rc, "stdout": out, "stderr": err}
+
+    def rollback_repo(self, name: str, to_ref: str, use_sandbox: bool = True, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Rollback repository working tree to a given ref (commit/tag). Saves a backup tar.xz before doing it.
+        """
+        spec = self._state.get("repos", {}).get(name)
+        if not spec:
+            return {"ok": False, "error": "not_found"}
+        dst = spec.get("dst") or os.path.abspath(os.path.join(self.state_file.parent, "repos", name))
+        if not Path(dst).exists():
+            return {"ok": False, "error": "missing_checkout"}
+
+        backup = None
+        try:
+            backup = tempfile.NamedTemporaryFile(prefix=f"{name}-backup-", suffix=".tar.xz", delete=False)
+            backup.close()
+            shutil.make_archive(backup.name.replace(".tar.xz", ""), "xztar", root_dir=dst)
+            self._log("info", "sync.rollback.backup", f"Created backup {backup.name}", backup=str(backup.name))
+        except Exception as e:
+            self._log("warning", "sync.rollback.backup_fail", f"Backup failed: {e}", error=str(e))
+
+        if self.dry_run:
+            return {"ok": True, "simulated": True, "backup": backup.name if backup else None}
+
+        # perform reset
+        rc, out, err = self._exec_git(["-C", dst, "reset", "--hard", to_ref], cwd=dst, use_sandbox=use_sandbox, timeout=timeout)
+        res = {"ok": rc == 0, "rc": rc, "stdout": out, "stderr": err, "backup": backup.name if backup else None}
+        self._log("info", "sync.rollback.done", f"Rollback {name} -> {to_ref} rc={rc}", repo=name, rc=rc)
         return res
 
-    # ---------------- helpers / serialization ----------------
-    def _reporesult_to_dict(self, rr: RepoResult) -> Dict[str, Any]:
-        return {
-            "name": rr.name,
-            "url": rr.url,
-            "path": rr.path,
-            "status": rr.status,
-            "commit": rr.commit,
-            "branch": rr.branch,
-            "steps": [{"phase": s.phase, "status": s.status, "msg": s.msg, "meta": s.meta} for s in rr.steps],
-            "meta": rr.meta,
-        }
-
-    def export_state(self) -> str:
-        self._save_state()
-        return str(STATE_FILE)
-
-    # ---------------- CLI convenience ----------------
-    @classmethod
-    def cli_main(cls, argv: Optional[List[str]] = None):
+    # ----------------- CLI -----------------
+    @staticmethod
+    def cli():
         import argparse
-        import sys
+        p = argparse.ArgumentParser(prog="newpkg-sync", description="Sync multiple git repos for newpkg")
+        p.add_argument("--add", nargs=2, metavar=("NAME", "URL"), help="add repo")
+        p.add_argument("--remove", metavar="NAME", help="remove repo")
+        p.add_argument("--list", action="store_true", help="list repos")
+        p.add_argument("--sync", nargs="*", metavar="NAME", help="sync named repos (or all if omitted)")
+        p.add_argument("--verify", metavar="NAME", help="verify repo")
+        p.add_argument("--rollback", nargs=2, metavar=("NAME", "REF"), help="rollback repo to REF")
+        p.add_argument("--json", action="store_true", help="print JSON outputs")
+        p.add_argument("--quiet", action="store_true", help="quiet mode")
+        p.add_argument("--no-sandbox", action="store_true", help="do not use sandbox")
+        p.add_argument("--jobs", type=int, help="parallel jobs override")
+        args = p.parse_args()
 
-        p = argparse.ArgumentParser(prog="newpkg-sync", description="Sync multiple git repositories for newpkg")
-        p.add_argument("cmd", choices=["add", "remove", "list", "clone", "fetch", "sync", "sync-all", "info", "rollback", "export-state"])
-        p.add_argument("--name", help="repository logical name")
-        p.add_argument("--url", help="git url")
-        p.add_argument("--branch", help="branch to track")
-        p.add_argument("--dry-run", action="store_true")
-        p.add_argument("--parallel", type=int, help="parallel workers for sync-all")
-        p.add_argument("--commit", help="commit for rollback")
-        p.add_argument("--json", action="store_true")
-        args = p.parse_args(argv)
+        cfg = init_config() if init_config else None
+        logger = NewpkgLogger.from_config(cfg, NewpkgDB(cfg)) if NewpkgLogger and cfg else None
+        db = NewpkgDB(cfg) if NewpkgDB and cfg else None
+        hooks = NewpkgHooks.from_config(cfg, logger, db) if NewpkgHooks and cfg else None
+        sandbox = NewpkgSandbox(cfg=cfg, logger=logger, db=db) if NewpkgSandbox and cfg else None
 
-        cfg = None
-        if init_config:
-            try:
-                cfg = init_config()
-            except Exception:
-                cfg = None
+        syncer = NewpkgSync(cfg=cfg, logger=logger, db=db, hooks=hooks, sandbox=sandbox)
 
-        db = NewpkgDB(cfg) if NewpkgDB and cfg is not None else None
-        logger = NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None
-        hooks = HooksManager(cfg, logger, db) if HooksManager and cfg is not None else None
-        sandbox = Sandbox(cfg, logger, db) if Sandbox and cfg is not None else None
+        if args.quiet:
+            syncer.quiet = True
+        if args.json:
+            syncer.json_out = True
+        if args.jobs:
+            syncer.parallel = args.jobs
+        if args.no_sandbox:
+            use_sandbox = False
+        else:
+            use_sandbox = True
 
-        sync = cls(cfg=cfg, logger=logger, db=db, hooks=hooks, sandbox=sandbox)
+        if args.add:
+            name, url = args.add
+            syncer.add_repo(name, url)
+            print(f"Added {name}: {url}")
+            raise SystemExit(0)
 
-        if args.cmd == "add":
-            if not args.name or not args.url:
-                print("add requires --name and --url")
-                return 2
-            sync.add_repo(args.name, args.url, branch=args.branch)
-            print("added")
-            return 0
-        if args.cmd == "remove":
-            if not args.name:
-                print("--name required")
-                return 2
-            ok = sync.remove_repo(args.name)
-            print("removed" if ok else "not found")
-            return 0
-        if args.cmd == "list":
-            print(json.dumps(sync.list_repos(), indent=2))
-            return 0
-        if args.cmd == "clone":
-            if not args.name:
-                print("--name required")
-                return 2
-            rr = sync.clone_repo(args.name, shallow=True, branch=args.branch, dry_run=args.dry_run)
-            out = sync._reporesult_to_dict(rr)
-            print(json.dumps(out, indent=2) if args.json else out)
-            return 0
-        if args.cmd == "fetch":
-            if not args.name:
-                print("--name required")
-                return 2
-            rr = sync.fetch_repo(args.name, dry_run=args.dry_run)
-            print(json.dumps(sync._reporesult_to_dict(rr), indent=2) if args.json else sync._reporesult_to_dict(rr))
-            return 0
-        if args.cmd == "sync":
-            if not args.name:
-                print("--name required")
-                return 2
-            rr = sync.sync_repo(args.name, dry_run=args.dry_run)
-            print(json.dumps(sync._reporesult_to_dict(rr), indent=2) if args.json else sync._reporesult_to_dict(rr))
-            return 0
-        if args.cmd == "sync-all":
-            res = sync.sync_all(dry_run=args.dry_run, parallel=args.parallel)
-            print(json.dumps(res, indent=2) if args.json else res)
-            return 0
-        if args.cmd == "info":
-            if not args.name:
-                print("--name required")
-                return 2
-            info = sync.get_repo_info(args.name)
-            print(json.dumps(info, indent=2))
-            return 0
-        if args.cmd == "rollback":
-            if not args.name or not args.commit:
-                print("--name and --commit required")
-                return 2
-            rr = sync.rollback_repo(args.name, args.commit)
-            print(json.dumps(sync._reporesult_to_dict(rr), indent=2) if args.json else sync._reporesult_to_dict(rr))
-            return 0
-        if args.cmd == "export-state":
-            path = sync.export_state()
-            print(path)
-            return 0
-        p.print_help()
-        return 1
+        if args.remove:
+            ok = syncer.remove_repo(args.remove)
+            raise SystemExit(0 if ok else 2)
+
+        if args.list:
+            repos = syncer.list_repos()
+            if syncer.json_out:
+                print(json.dumps(repos, indent=2))
+            else:
+                for n, spec in repos.items():
+                    print(f"{n:20} {spec.get('url')} -> {spec.get('dst','<auto>')}")
+            raise SystemExit(0)
+
+        if args.sync is not None:
+            names = args.sync if len(args.sync) > 0 else None
+            res = syncer.sync_all(names=names, update=True, use_sandbox=use_sandbox)
+            if syncer.json_out:
+                print(json.dumps(res, indent=2))
+            raise SystemExit(0)
+
+        if args.verify:
+            v = syncer.verify_repo(args.verify, use_sandbox=use_sandbox)
+            if syncer.json_out:
+                print(json.dumps(v, indent=2))
+            else:
+                print(v)
+            raise SystemExit(0)
+
+        if args.rollback:
+            name, ref = args.rollback
+            r = syncer.rollback_repo(name, ref, use_sandbox=use_sandbox)
+            if syncer.json_out:
+                print(json.dumps(r, indent=2))
+            else:
+                print(r)
+            raise SystemExit(0)
+
+        # default: list
+        repos = syncer.list_repos()
+        if syncer.json_out:
+            print(json.dumps(repos, indent=2))
+        else:
+            for n, spec in repos.items():
+                print(f"{n:20} {spec.get('url')} -> {spec.get('dst','<auto>')}")
+        raise SystemExit(0)
 
 
 if __name__ == "__main__":
-    NewpkgSync.cli_main()
+    NewpkgSync.cli()
