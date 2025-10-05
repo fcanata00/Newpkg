@@ -1,42 +1,107 @@
+#!/usr/bin/env python3
 """
 newpkg_upgrade.py
 
-Gerencia upgrades de pacotes no ecossistema newpkg.
+Upgrade manager for newpkg — safe, sandboxed, and integrated with the newpkg ecosystem.
 
-Funcionalidades implementadas:
-- check_updates(pkg_name): verifica se há versão mais recente (a partir de metadata no DB ou a partir de source_url/git)
-- fetch_new_source(pkg_name): usa NewpkgDownloader para baixar novas fontes
-- upgrade(pkg_name): fluxo completo (pre_upgrade hook, fetch, build via NewpkgCore, package, remove old via NewpkgRemove, deploy/install, post_upgrade hook)
-- batch_upgrade(pkg_list, parallel=True): executa upgrades em paralelo usando ThreadPool
-- rebuild(pkg_name): reconstrói a versão atual (ou a nova) em sandbox
-- rollback(pkg_name, archive_path): restaura backup criado anteriormente (integra com NewpkgRemove.rollback)
-- diff_versions(pkg_name, old_version, new_version): apresenta diffs entre pkginfo (metadados)
-- verify_integrity(pkg_name): verifica checksums registrados
-- clean_old_versions(pkg_name, keep=1): remove pacotes antigos pelo DB
-- update_db(pkg_name, version, status): atualiza DB com nova versão/status
+Features implemented:
+ - check_updates(pkg): check remote for newer versions (git tags or configured source in DB/metafile)
+ - fetch_new_source(pkg): download/clone new source (uses newpkg_download / newpkg_sync if available)
+ - upgrade(pkg, force=False): perform full upgrade: fetch -> build -> install -> package -> deploy (optionally) with backup+rollback
+ - batch_upgrade(pkgs, parallel): run upgrades in parallel with structured results
+ - rebuild(pkg): rebuild current version using core.full_build_cycle
+ - rollback(pkg, archive): restore backup and re-register package in DB
+ - verify_integrity(pkg): run basic integrity checks after upgrade
+ - clean_old_versions(pkg, keep=1): keep latest N packages, remove old archives/backups
 
-Este módulo assume a presença das seguintes abstrações criadas anteriormente:
- - NewpkgDownloader (downloader.download / clone_git)
- - NewpkgCore (prepare, build, install, package, deploy, record)
- - NewpkgRemove (remove/purge/rollback)
- - NewpkgHooks (run/execute_safe)
- - newpkg_db API (get_package, get_package_latest_source, add_package, update_package_status, list_package_versions, add_log)
- - newpkg_sandbox (used indiretamente via core and hooks)
+Design notes:
+ - Integrates with newpkg_config, newpkg_logger, newpkg_db, newpkg_hooks, newpkg_sandbox, newpkg_core, newpkg_remove, newpkg_deps when available
+ - Uses thread pool for parallel upgrades
+ - Records phases via db.record_phase if available
+ - Uses sandbox.run for executing external commands
+ - Creates backups in upgrade.backup_dir prior to destructive operations
 
-O código tenta ser defensivo: registra logs, cria backups antes de mudanças destrutivas e realiza rollback em erro.
-
+This module is defensive: missing optional modules will be gracefully skipped with warnings.
 """
 from __future__ import annotations
 
+import concurrent.futures
+import json
 import os
 import shutil
-import json
-import tempfile
 import subprocess
-import concurrent.futures
+import tarfile
+import tempfile
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
+
+# optional internal imports
+try:
+    from newpkg_config import init_config
+except Exception:
+    init_config = None
+
+try:
+    from newpkg_logger import NewpkgLogger
+except Exception:
+    NewpkgLogger = None
+
+try:
+    from newpkg_db import NewpkgDB
+except Exception:
+    NewpkgDB = None
+
+try:
+    from newpkg_hooks import HooksManager
+except Exception:
+    HooksManager = None
+
+try:
+    from newpkg_sandbox import Sandbox
+except Exception:
+    Sandbox = None
+
+try:
+    from newpkg_core import NewpkgCore
+except Exception:
+    NewpkgCore = None
+
+try:
+    from newpkg_remove import NewpkgRemover
+except Exception:
+    NewpkgRemover = None
+
+try:
+    from newpkg_deps import NewpkgDeps
+except Exception:
+    NewpkgDeps = None
+
+try:
+    from newpkg_download import NewpkgDownloader
+except Exception:
+    NewpkgDownloader = None
+
+# defaults
+DEFAULT_BACKUP_DIR = Path(os.environ.get("NEWPKG_UPGRADE_BACKUP", "/var/tmp/newpkg_upgrades"))
+DEFAULT_PARALLEL = int(os.environ.get("NEWPKG_UPGRADE_PARALLEL", "4"))
+
+DEFAULT_PACKAGE_OUTPUT = Path(os.environ.get("NEWPKG_PACKAGE_OUTPUT", "./packages"))
+
+DEFAULT_FAKERROOT = os.environ.get("NEWPKG_FAKEROOT_CMD", "fakeroot")
+
+
+@dataclass
+class UpgradeResult:
+    package: str
+    old_version: Optional[str] = None
+    new_version: Optional[str] = None
+    status: str = "unknown"
+    steps: List[Dict[str, Any]] = field(default_factory=list)
+    error: Optional[str] = None
+    backup: Optional[str] = None
 
 
 class UpgradeError(Exception):
@@ -44,536 +109,559 @@ class UpgradeError(Exception):
 
 
 class NewpkgUpgrade:
-    def __init__(self, cfg: Any, logger: Any = None, db: Any = None, downloader: Any = None, core: Any = None, remover: Any = None, hooks: Any = None, deps: Any = None, sandbox: Any = None):
+    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, hooks: Any = None, sandbox: Any = None):
         self.cfg = cfg
-        self.logger = logger
-        self.db = db
-        self.downloader = downloader
-        self.core = core
-        self.remover = remover
-        self.hooks = hooks
-        self.deps = deps
-        self.sandbox = sandbox
+        self.logger = logger or (NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None)
+        self.db = db or (NewpkgDB(cfg) if NewpkgDB and cfg is not None else None)
+        self.hooks = hooks or (HooksManager(cfg, self.logger, self.db) if HooksManager and cfg is not None else None)
+        self.sandbox = sandbox or (Sandbox(cfg, self.logger, self.db) if Sandbox and cfg is not None else None)
+        self.core = NewpkgCore(cfg, self.logger, self.db) if NewpkgCore and cfg is not None else None
+        self.remover = NewpkgRemover(cfg, self.logger, self.db) if NewpkgRemover and cfg is not None else None
+        self.deps = NewpkgDeps(cfg, self.logger, self.db) if NewpkgDeps and cfg is not None else None
+        self.downloader = NewpkgDownloader(cfg, self.logger, self.db) if NewpkgDownloader and cfg is not None else None
 
-        # configuration defaults
-        try:
-            self.auto_backup = bool(self.cfg.get('upgrade.backup_before_upgrade'))
-        except Exception:
-            self.auto_backup = True
-        try:
-            self.parallel = bool(self.cfg.get('upgrade.parallel'))
-        except Exception:
-            self.parallel = True
-        try:
-            self.clean_old = bool(self.cfg.get('upgrade.clean_old'))
-        except Exception:
-            self.clean_old = True
-        try:
-            self.use_sandbox = bool(self.cfg.get('upgrade.sandbox'))
-        except Exception:
-            self.use_sandbox = True
+        self.backup_dir = Path(self._cfg_get("upgrade.backup_dir", str(DEFAULT_BACKUP_DIR)))
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        self.parallel = int(self._cfg_get("upgrade.parallel", DEFAULT_PARALLEL))
+        self.package_output = Path(self._cfg_get("core.package_output", str(DEFAULT_PACKAGE_OUTPUT)))
+        self.fakeroot_cmd = self._cfg_get("core.fakeroot_cmd", DEFAULT_FAKERROOT)
+        self.verify_after = bool(self._cfg_get("upgrade.verify_after", True))
+        self.allow_force = bool(self._cfg_get("upgrade.allow_force", False))
 
-    # ---------------- logging ----------------
-    def _log(self, event: str, level: str = 'INFO', message: Optional[str] = None, meta: Optional[Dict[str, Any]] = None):
-        if self.logger:
-            self.logger.log_event(event, level=level, message=message or event, metadata=meta or {})
-
-    # ---------------- utilities ----------------
-    def _now(self) -> str:
-        return datetime.utcnow().isoformat() + 'Z'
-
-    def _pkginfo_path(self, pkg_name: str, version: Optional[str] = None) -> Optional[Path]:
-        # try to find pkginfo in package_dir produced by NewpkgCore
+    # ---------------- helpers ----------------
+    def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
-            pkgdir = self.core._pkg_package_dir(pkg_name, version)
-            p = Path(pkgdir) / 'pkginfo.json'
-            if p.exists():
-                return p
+            if self.cfg and hasattr(self.cfg, "get"):
+                v = self.cfg.get(key)
+                if v is not None:
+                    return v
         except Exception:
             pass
+        return os.environ.get(key.upper().replace('.', '_'), default)
+
+    def _log(self, level: str, event: str, message: str = "", **meta):
+        if self.logger:
+            try:
+                fn = getattr(self.logger, level.lower(), None)
+                if fn:
+                    fn(event, message, **meta)
+                    return
+            except Exception:
+                pass
+        print(f"[{level}] {event}: {message}")
+
+    def _record(self, pkg: str, phase: str, status: str, meta: Optional[Dict[str, Any]] = None):
+        if self.db and hasattr(self.db, 'record_phase'):
+            try:
+                self.db.record_phase(pkg, phase, status, meta or {})
+            except Exception:
+                pass
+
+    def _repo_info_from_db(self, pkg: str) -> Dict[str, Any]:
+        """Return package metadata from DB if available."""
+        try:
+            if self.db and hasattr(self.db, 'get_package'):
+                return self.db.get_package(pkg) or {}
+        except Exception:
+            pass
+        return {}
+
+    # ---------------- backup / rollback ----------------
+    def _create_backup(self, pkg: str) -> Optional[str]:
+        """Create a backup archive (.tar.xz) of installed files for pkg using DB list_files or heuristics."""
+        ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+        out = self.backup_dir / f"{pkg}-upgrade-{ts}.tar.xz"
+        targets = []
+        try:
+            if self.db and hasattr(self.db, 'list_files'):
+                targets = self.db.list_files(pkg)
+        except Exception:
+            targets = []
+        # fallback heuristics
+        if not targets:
+            heur = [f"/usr/lib/{pkg}", f"/usr/share/{pkg}", f"/etc/{pkg}", f"/opt/{pkg}"]
+            for h in heur:
+                if Path(h).exists():
+                    targets.append(h)
+        if not targets:
+            self._log('warning', 'upgrade.backup.skip', f'No targets found to backup for {pkg}')
+            return None
+        try:
+            with tarfile.open(out, 'w:xz') as tar:
+                for t in targets:
+                    try:
+                        tar.add(t, arcname=str(Path(t).relative_to('/')))
+                    except Exception:
+                        # best-effort: add by name
+                        try:
+                            tar.add(t)
+                        except Exception:
+                            continue
+            self._log('info', 'upgrade.backup.ok', f'Backup created for {pkg}: {out}', backup=str(out))
+            return str(out)
+        except Exception as e:
+            self._log('error', 'upgrade.backup.fail', f'Backup failed for {pkg}: {e}', error=str(e))
+            return None
+
+    def rollback(self, pkg: str, archive: str) -> bool:
+        """Restore package files from archive and register in DB if possible."""
+        try:
+            arch = Path(archive)
+            if not arch.exists():
+                raise UpgradeError(f'archive {archive} not found')
+            # extract to temporary dir and move into place
+            tmp = Path(tempfile.mkdtemp(prefix=f'newpkg_rollback_{pkg}_'))
+            with tarfile.open(arch, 'r:*') as tar:
+                tar.extractall(path=str(tmp))
+            # copy back
+            for item in tmp.iterdir():
+                dest = Path('/') / item.name
+                if dest.exists():
+                    if dest.is_dir():
+                        shutil.rmtree(dest)
+                    else:
+                        dest.unlink()
+                shutil.move(str(item), str(dest))
+            shutil.rmtree(tmp)
+            # record
+            self._record(pkg, 'rollback', 'ok', {'archive': str(archive)})
+            self._log('info', 'upgrade.rollback.ok', f'Rollback completed for {pkg}', archive=str(archive))
+            return True
+        except Exception as e:
+            self._record(pkg, 'rollback', 'error', {'error': str(e)})
+            self._log('error', 'upgrade.rollback.fail', f'Rollback failed for {pkg}: {e}', error=str(e))
+            return False
+
+    # ---------------- checking updates ----------------
+    def check_updates(self, pkg: str) -> Optional[Dict[str, Any]]:
+        """Check for available updates for a package.
+        Strategies:
+         - If DB/metafile contains source/git url: check git tags or remote version
+         - Otherwise return None
+        Returns dict with keys: pkg, current_version, candidate_version, source
+        """
+        info = self._repo_info_from_db(pkg)
+        current = info.get('version')
+        source = info.get('origin') or info.get('source')
+        candidate = None
+        try:
+            # if source is git repo, try to fetch tags
+            if source and isinstance(source, str) and source.startswith('git+'):
+                giturl = source.split('+', 1)[1]
+                # shallow clone to temp and get latest tag
+                tmp = Path(tempfile.mkdtemp(prefix=f'newpkg_check_{pkg}_'))
+                try:
+                    cmd = ['git', 'clone', '--bare', '--depth', '1', giturl, str(tmp)]
+                    rc = 1
+                    if self.sandbox:
+                        r = self.sandbox.run(cmd, cwd=None)
+                        rc = int(r.rc)
+                    else:
+                        p = subprocess.run(cmd, capture_output=True)
+                        rc = p.returncode
+                    if rc == 0:
+                        # list tags
+                        cmd2 = ['git', '--git-dir', str(tmp), 'tag', '--sort=-creatordate']
+                        out = subprocess.check_output(cmd2, text=True)
+                        tags = [t.strip() for t in out.splitlines() if t.strip()]
+                        if tags:
+                            candidate = tags[0]
+                finally:
+                    try:
+                        shutil.rmtree(tmp)
+                    except Exception:
+                        pass
+            # else if source lists a version field in DB, use remote mirrors (not implemented)
+        except Exception as e:
+            self._log('warning', 'upgrade.check.fail', f'Failed to check updates for {pkg}: {e}')
+        if candidate and candidate != current:
+            res = {'pkg': pkg, 'current': current, 'candidate': candidate, 'source': source}
+            self._log('info', 'upgrade.check.found', f'Candidate found for {pkg}: {candidate}', **res)
+            return res
+        self._log('info', 'upgrade.check.none', f'No update found for {pkg}', package=pkg)
         return None
 
-    # ---------------- check updates ----------------
-    def check_updates(self, pkg_name: str) -> Dict[str, Any]:
-        """Verifica se há nova versão disponível para pkg_name.
+    # ---------------- fetch new source ----------------
+    def fetch_new_source(self, pkg: str, dest: Optional[str] = None) -> Optional[str]:
+        """Fetch/clone the new source into a temp directory and return path. Uses NewpkgDownloader if available."""
+        info = self._repo_info_from_db(pkg)
+        source = info.get('origin') or info.get('source')
+        if not source:
+            self._log('warning', 'upgrade.fetch.no_source', f'No source for {pkg} in DB')
+            return None
+        tmp = Path(tempfile.mkdtemp(prefix=f'newpkg_source_{pkg}_'))
+        try:
+            # if git url
+            if isinstance(source, str) and source.startswith('git+'):
+                giturl = source.split('+', 1)[1]
+                cmd = ['git', 'clone', giturl, str(tmp)]
+                rc, out, err = (1, '', '')
+                if self.sandbox:
+                    res = self.sandbox.run(cmd)
+                    rc, out, err = int(res.rc), res.out or '', res.err or ''
+                else:
+                    proc = subprocess.run(cmd, capture_output=True, text=True)
+                    rc, out, err = proc.returncode, proc.stdout, proc.stderr
+                if rc == 0:
+                    self._log('info', 'upgrade.fetch.ok', f'Cloned source for {pkg} to {tmp}', path=str(tmp))
+                    return str(tmp)
+                else:
+                    self._log('error', 'upgrade.fetch.fail', f'Git clone failed for {pkg}: {err}')
+                    shutil.rmtree(tmp)
+                    return None
+            # otherwise, if Download helper available and source is URL, use it
+            if self.downloader and isinstance(source, str):
+                # dest path
+                dest = dest or str(tmp)
+                try:
+                    out = self.downloader.download_sync(source, dest=dest)
+                    self._log('info', 'upgrade.fetch.ok', f'Downloaded source for {pkg} to {dest}', path=str(dest))
+                    return str(dest)
+                except Exception as e:
+                    self._log('error', 'upgrade.fetch.fail', f'Download failed: {e}')
+                    shutil.rmtree(tmp)
+                    return None
+        except Exception as e:
+            self._log('error', 'upgrade.fetch.error', f'Error fetching source for {pkg}: {e}')
+        return None
 
-        Estratégia:
-          - consulta newpkg_db.get_package(pkg_name) para ver source_url/git/tag metadata
-          - se houver source_url apontando para git, procura por tags ou HEAD commit diferentes
-          - se houver source_url com um URL contendo versão, tenta inferir nova versão (heurística)
-
-        Retorna dict: {'update': True/False, 'current_version': x, 'candidate_version': y, 'reason': str}
+    # ---------------- upgrade flow ----------------
+    def upgrade(self, pkg: str, force: bool = False, do_package: bool = True, do_deploy: bool = False, dry_run: bool = False) -> UpgradeResult:
+        """Perform an upgrade for a single package.
+        Steps:
+          - check current metadata
+          - create backup (best-effort)
+          - fetch new source (if available)
+          - build/install/package via core.full_build_cycle
+          - verify and deploy
+          - cleanup and register new version in DB
         """
-        pkg = None
+        result = UpgradeResult(package=pkg)
         try:
-            pkg = self.db.get_package(pkg_name)
-        except Exception:
-            # fallback: try list_packages
-            for p in getattr(self.db, 'list_packages', lambda: [])():
-                if getattr(p, 'name', None) == pkg_name:
-                    pkg = p
-                    break
-        if not pkg:
-            raise UpgradeError(f'Package not found in DB: {pkg_name}')
+            info = self._repo_info_from_db(pkg)
+            old_version = info.get('version')
+            result.old_version = old_version
 
-        current_version = getattr(pkg, 'version', None)
-        candidate_version = None
-        reason = 'no-source'
+            self._log('info', 'upgrade.start', f'Starting upgrade for {pkg}', package=pkg, old_version=old_version)
+            self._record(pkg, 'upgrade', 'start', {'old_version': old_version})
 
-        # try to get source metadata from DB
-        source_meta = None
-        try:
-            source_meta = self.db.get_package_source(pkg_name)
-        except Exception:
-            # not available
-            source_meta = None
-
-        # if git URL provided, attempt to detect latest tag
-        if source_meta and source_meta.get('type') == 'git' and source_meta.get('url'):
-            git_url = source_meta.get('url')
+            # pre-upgrade hook
             try:
-                # shallow ls-remote --tags
-                proc = subprocess.run(['git', 'ls-remote', '--tags', git_url], capture_output=True, text=True)
-                if proc.returncode == 0 and proc.stdout:
-                    # parse tags, pick highest semver-like tag (heuristic)
-                    tags = [line.split('\t')[1] for line in proc.stdout.splitlines() if '\trefs/tags/' in line]
-                    tags = [t.replace('refs/tags/', '').strip() for t in tags]
-                    # prefer annotated tag names without ^{}
-                    tags = [t.replace('^{}', '') for t in tags]
-                    tags_sorted = sorted(tags, reverse=True)
-                    if tags_sorted:
-                        candidate_version = tags_sorted[0]
-                        reason = 'git-tags'
+                if self.hooks and hasattr(self.hooks, 'execute_safe'):
+                    self.hooks.execute_safe('pre_upgrade', pkg_dir=None)
             except Exception:
                 pass
 
-        # if http/ftp source with version in URL, attempt to find latest by checking mirrors metadata (best-effort)
-        if not candidate_version and source_meta and source_meta.get('url') and (source_meta.get('type') in ('http', 'ftp', 'http(s)')):
-            # heuristic: if url contains version number, try to bump and check existence (not implemented deeply)
-            reason = 'no-heuristic'
+            # backup
+            backup = self._create_backup(pkg)
+            result.backup = backup
+            if backup:
+                result.steps.append({'phase': 'backup', 'status': 'ok', 'path': backup})
+            else:
+                result.steps.append({'phase': 'backup', 'status': 'skipped'})
 
-        update = False
-        if candidate_version and candidate_version != current_version:
-            update = True
+            # check for updates/candidate
+            check = self.check_updates(pkg)
+            candidate_tag = None
+            if check:
+                candidate_tag = check.get('candidate')
+                result.new_version = candidate_tag
+                result.steps.append({'phase': 'check', 'status': 'found', 'candidate': candidate_tag})
+            else:
+                if not force:
+                    result.steps.append({'phase': 'check', 'status': 'none'})
+                    result.status = 'no-update'
+                    self._record(pkg, 'upgrade', 'no-update')
+                    return result
+                result.steps.append({'phase': 'check', 'status': 'force'})
 
-        res = {'update': update, 'current_version': current_version, 'candidate_version': candidate_version, 'reason': reason}
-        self._log('upgrade.check', level='INFO', message='Checked updates', meta={'pkg': pkg_name, **res})
-        return res
+            if dry_run:
+                result.status = 'dry-run'
+                self._record(pkg, 'upgrade', 'dry-run')
+                return result
 
-    # ---------------- fetch new source ----------------
-    def fetch_new_source(self, pkg_name: str, dest: Optional[Path] = None) -> Dict[str, Any]:
-        """Baixa novas fontes para pkg_name usando newpkg_downloader.
+            # fetch source
+            srcpath = self.fetch_new_source(pkg)
+            if not srcpath and not force:
+                result.status = 'fetch-fail'
+                self._record(pkg, 'upgrade', 'fetch-fail')
+                return result
+            result.steps.append({'phase': 'fetch', 'status': 'ok' if srcpath else 'skipped', 'path': srcpath})
 
-        Retorna metadata com caminho para sources (dir or archive) e status.
-        """
-        try:
-            source_meta = self.db.get_package_source(pkg_name)
-        except Exception:
-            source_meta = None
-        if not source_meta:
-            raise UpgradeError('No source metadata available')
+            # attempt full build cycle using core; prefer to pass metafile if available in DB
+            metafile = info.get('metafile') if isinstance(info, dict) else None
 
-        dest = Path(dest) if dest else Path(tempfile.mkdtemp(prefix=f'newpkg-src-{pkg_name}-'))
-        dest.mkdir(parents=True, exist_ok=True)
-
-        if source_meta.get('type') == 'git':
-            url = source_meta.get('url')
-            branch = source_meta.get('branch')
-            self._log('upgrade.fetch', level='INFO', message='Cloning git source', meta={'pkg': pkg_name, 'url': url})
-            res = self.downloader.clone_git(url, dest, branch=branch, shallow=True)
-            return {'status': res.get('status'), 'path': res.get('dest')}
-
-        # otherwise assume URL or mirrors
-        urls = [source_meta.get('url')] if source_meta.get('url') else []
-        mirrors = source_meta.get('mirrors') or []
-        if not urls:
-            raise UpgradeError('No URL to download')
-        filename = Path(urls[0]).name
-        outpath = dest / filename
-        coro = self.downloader.download(urls, outpath, mirrors=mirrors)
-        # downloader is async; run loop if needed
-        try:
-            import asyncio
-            res = asyncio.run(coro)
-        except Exception as e:
-            raise UpgradeError(f'Download failed: {e}')
-        if res.get('status') != 'ok':
-            raise UpgradeError(f'Download failed: {res}')
-        # if archive, optionally extract to dest/sources
-        if outpath.suffix in ('.xz', '.gz', '.bz2', '.zip', '.tar') or outpath.name.endswith('.tar.xz') or outpath.name.endswith('.tar.zst'):
-            extract_dir = dest / 'sources'
-            extract_dir.mkdir(parents=True, exist_ok=True)
-            ex = self.downloader.extract_archive(Path(res['path']), extract_dir)
-            if ex.get('status') != 'ok':
-                return {'status': 'ok', 'path': res['path'], 'extracted': False}
-            return {'status': 'ok', 'path': str(extract_dir)}
-        return {'status': 'ok', 'path': res['path']}
-
-    # ---------------- core upgrade flow ----------------
-    def upgrade(self, pkg_name: str, force: bool = False, rebuild: bool = False, profile: str = 'default') -> Dict[str, Any]:
-        """Fluxo completo de upgrade para um pacote.
-
-        Passos:
-         - check_updates (unless force)
-         - fetch_new_source
-         - run pre_upgrade hooks
-         - build (core.build)
-         - install/package
-         - backup old version and remove it via NewpkgRemove
-         - deploy new version (core.deploy or core.install)
-         - run post_upgrade hooks
-         - update DB
-        """
-        self._log('upgrade.start', level='INFO', message='Upgrade started', meta={'pkg': pkg_name})
-
-        # get current package information
-        try:
-            pkg = self.db.get_package(pkg_name)
-        except Exception:
-            pkg = None
-        current_version = getattr(pkg, 'version', None) if pkg else None
-
-        # if not force, check updates
-        if not force:
-            chk = self.check_updates(pkg_name)
-            if not chk.get('update'):
-                return {'status': 'noop', 'reason': 'no-update', 'pkg': pkg_name}
-
-        # fetch
-        try:
-            fetch_meta = self.fetch_new_source(pkg_name)
-        except Exception as e:
-            self._log('upgrade.fetch.fail', level='ERROR', message=str(e), meta={'pkg': pkg_name})
-            raise UpgradeError(f'Fetch failed: {e}')
-
-        src_path = Path(fetch_meta.get('path'))
-
-        # run pre_upgrade hook
-        try:
-            if self.hooks:
-                self.hooks.execute_safe('pre_upgrade', pkg_name=pkg_name, build_dir=src_path)
-        except Exception:
-            pass
-
-        # prepare build dir via core.prepare
-        try:
-            build_dir = self.core.prepare(pkg_name, version=None, profile=profile, src_dir=src_path)
-        except Exception as e:
-            raise UpgradeError(f'Prepare failed: {e}')
-
-        # resolve build deps
-        try:
-            if self.deps:
-                bdeps = self.deps.resolve(pkg_name, dep_type='build')
-                self._log('upgrade.deps', level='INFO', message='Resolved build deps', meta={'pkg': pkg_name, 'deps': bdeps})
-        except Exception:
-            pass
-
-        # run build
-        try:
-            self.core.build(pkg_name, profile=profile, src_dir=src_path)
-        except Exception as e:
-            self._log('upgrade.build.fail', level='ERROR', message=str(e), meta={'pkg': pkg_name})
-            # run on_error hooks
-            if self.hooks:
-                self.hooks.execute_safe('on_error', pkg_name=pkg_name, build_dir=build_dir)
-            raise UpgradeError(f'Build failed: {e}')
-
-        # install into destdir via core.install (fakeroot)
-        try:
-            self.core.install(pkg_name, fakeroot=True)
-        except Exception as e:
-            self._log('upgrade.install.fail', level='ERROR', message=str(e), meta={'pkg': pkg_name})
-            if self.hooks:
-                self.hooks.execute_safe('on_error', pkg_name=pkg_name, build_dir=build_dir)
-            raise UpgradeError(f'Install failed: {e}')
-
-        # package
-        try:
-            archive = self.core.package(pkg_name)
-        except Exception as e:
-            self._log('upgrade.package.fail', level='ERROR', message=str(e), meta={'pkg': pkg_name})
-            raise UpgradeError(f'Package failed: {e}')
-
-        # backup old version and remove (if present)
-        backup_archive = None
-        if current_version and self.remover:
-            try:
-                # create backup by archiving current installed files
-                files = [f.get('path') for f in self.db.list_files(pkg_name)] if hasattr(self.db, 'list_files') else []
-                if files:
-                    backup_archive = self.remover._archive_before_remove(pkg_name, files)
-                    self._log('upgrade.backup', level='INFO', message='Backup created', meta={'pkg': pkg_name, 'archive': str(backup_archive)})
-                    # remove current version
-                    self.remover.remove(pkg_name, purge=False, simulate=False)
-            except Exception:
-                # warn and continue
-                self._log('upgrade.backup.fail', level='WARNING', message='Backup or removal of old version failed', meta={'pkg': pkg_name})
-
-        # deploy new package
-        try:
-            target = self.cfg.get('NEWPKG_TARGET_ROOT') if self.cfg else '/'
-            self.core.deploy(pkg_name, archive=archive, target=target, rollback=True)
-        except Exception as e:
-            self._log('upgrade.deploy.fail', level='ERROR', message=str(e), meta={'pkg': pkg_name})
-            # attempt rollback from backup if possible
-            if backup_archive and self.remover:
+            if self.core:
+                # use a unique workdir under work_root
+                workdir = None
                 try:
-                    self.remover.rollback(str(backup_archive))
+                    workdir = None
+                    prep = self.core.prepare(pkg, metafile_path=metafile, profile=None)
+                    workdir = prep.get('workdir')
+                except Exception:
+                    workdir = None
+                # if we have fetched source, copy into workdir/sources
+                if srcpath and workdir:
+                    try:
+                        srcdest = Path(workdir) / 'sources'
+                        # remove any existing and copy new
+                        if srcdest.exists():
+                            shutil.rmtree(srcdest)
+                        shutil.copytree(srcpath, srcdest)
+                        self._log('info', 'upgrade.copy_source', f'Copied source into workdir for {pkg}', src=srcpath, dest=str(srcdest))
+                    except Exception as e:
+                        self._log('warning', 'upgrade.copy_source_fail', f'Copying source failed: {e}')
+                # build
+                self._log('info', 'upgrade.build.start', f'Building {pkg} in sandbox', package=pkg)
+                build_res = self.core.full_build_cycle(pkg, version=result.new_version, metafile_path=metafile, profile=None, install_prefix='/', do_package=do_package, do_deploy=False, dry_run=False)
+                result.steps.append({'phase': 'build', 'result': build_res.__dict__ if hasattr(build_res, '__dict__') else build_res})
+                if build_res.status != 'ok':
+                    result.status = 'build-fail'
+                    self._record(pkg, 'upgrade', 'build-fail')
+                    # attempt rollback
+                    if backup:
+                        self.rollback(pkg, backup)
+                    return result
+            else:
+                self._log('warning', 'upgrade.no_core', 'No core module; cannot build')
+                result.steps.append({'phase': 'build', 'status': 'skipped', 'note': 'no-core'})
+
+            # package path determination
+            package_archive = None
+            if do_package and self.package_output.exists():
+                # pick most recent archive for pkg in output dir
+                candidates = sorted(self.package_output.glob(f"{pkg}*.tar.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if candidates:
+                    package_archive = str(candidates[0])
+            result.steps.append({'phase': 'package', 'archive': package_archive})
+
+            # optional verification
+            if self.verify_after and package_archive:
+                ok = self.verify_integrity(pkg, package_archive)
+                result.steps.append({'phase': 'verify', 'ok': ok})
+                if not ok:
+                    result.status = 'verify-fail'
+                    self._record(pkg, 'upgrade', 'verify-fail')
+                    if backup:
+                        self.rollback(pkg, backup)
+                    return result
+
+            # deploy (if requested)
+            if do_deploy and package_archive:
+                dep = self.core.deploy(pkg, package_archive, install_prefix='/', use_fakeroot=True, rollback_on_fail=True)
+                result.steps.append({'phase': 'deploy', 'result': dep})
+                if dep.get('status') != 'ok':
+                    result.status = 'deploy-fail'
+                    self._record(pkg, 'upgrade', 'deploy-fail')
+                    if backup:
+                        self.rollback(pkg, backup)
+                    return result
+
+            # update DB record to new version if possible
+            try:
+                if self.db and hasattr(self.db, 'update_package'):
+                    newv = result.new_version or info.get('version')
+                    self.db.update_package(pkg, version=newv)
+                    self._log('info', 'upgrade.db.update', f'Updated DB version for {pkg} -> {newv}')
+            except Exception:
+                pass
+
+            result.status = 'ok'
+            self._record(pkg, 'upgrade', 'ok', {'new_version': result.new_version})
+
+            # post-upgrade hook
+            try:
+                if self.hooks and hasattr(self.hooks, 'execute_safe'):
+                    self.hooks.execute_safe('post_upgrade', pkg_dir=None)
+            except Exception:
+                pass
+
+            self._log('info', 'upgrade.done', f'Upgrade completed for {pkg}', package=pkg)
+            return result
+        except Exception as e:
+            result.status = 'error'
+            result.error = str(e)
+            self._record(pkg, 'upgrade', 'error', {'error': str(e)})
+            self._log('error', 'upgrade.fail', f'Upgrade failed for {pkg}: {e}', error=str(e))
+            # try rollback if backup exists
+            if result.backup:
+                try:
+                    self.rollback(pkg, result.backup)
                 except Exception:
                     pass
-            raise UpgradeError(f'Deploy failed: {e}')
-
-        # run post_upgrade hooks
-        try:
-            if self.hooks:
-                self.hooks.execute_safe('post_upgrade', pkg_name=pkg_name, build_dir=build_dir)
-        except Exception:
-            pass
-
-        # record in DB
-        try:
-            # com nome do pacote e versão extraída do pkginfo
-            pkginfo_path = self._pkginfo_path(pkg_name)
-            version = None
-            if pkginfo_path:
-                try:
-                    data = json.loads(pkginfo_path.read_text(encoding='utf-8'))
-                    version = data.get('version')
-                except Exception:
-                    version = None
-            self.update_db(pkg_name, version or 'unknown', 'installed')
-        except Exception:
-            pass
-
-        # clean old versions if configured
-        if self.clean_old:
-            try:
-                self.clean_old_versions(pkg_name, keep=1)
-            except Exception:
-                pass
-
-        self._log('upgrade.finish', level='INFO', message='Upgrade finished', meta={'pkg': pkg_name})
-        return {'status': 'ok', 'pkg': pkg_name, 'archive': str(archive)}
-
-    # ---------------- batch upgrade ----------------
-    def _upgrade_worker(self, pkg_name: str) -> Dict[str, Any]:
-        try:
-            return {'pkg': pkg_name, 'result': self.upgrade(pkg_name)}
-        except Exception as e:
-            return {'pkg': pkg_name, 'error': str(e)}
-
-    def batch_upgrade(self, pkg_list: Optional[List[str]] = None, parallel: Optional[bool] = None) -> List[Dict[str, Any]]:
-        if parallel is None:
-            parallel = self.parallel
-        if pkg_list is None:
-            # default: scan DB for packages with available updates
-            pkg_list = []
-            for p in self.db.list_packages():
-                try:
-                    chk = self.check_updates(p.name)
-                    if chk.get('update'):
-                        pkg_list.append(p.name)
-                except Exception:
-                    continue
-        results = []
-        if parallel:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(pkg_list)))) as ex:
-                futs = {ex.submit(self._upgrade_worker, pkg): pkg for pkg in pkg_list}
-                for fut in concurrent.futures.as_completed(futs):
-                    try:
-                        results.append(fut.result())
-                    except Exception as e:
-                        results.append({'pkg': futs[fut], 'error': str(e)})
-        else:
-            for pkg in pkg_list:
-                results.append(self._upgrade_worker(pkg))
-        return results
+            return result
 
     # ---------------- rebuild ----------------
-    def rebuild(self, pkg_name: str, profile: str = 'default') -> Dict[str, Any]:
-        # rebuild the currently installed version
+    def rebuild(self, pkg: str, dry_run: bool = True) -> UpgradeResult:
+        """Rebuild the currently installed package using core pipeline."""
+        res = UpgradeResult(package=pkg)
         try:
-            # prepare using installed sources if available, otherwise fetch
-            src = None
-            try:
-                src = self.db.get_package_source(pkg_name)
-            except Exception:
-                src = None
-            if not src:
-                # try to fetch
-                fetched = self.fetch_new_source(pkg_name)
-                src = fetched.get('path')
-            # use core to build
-            self.core.build(pkg_name, profile=profile, src_dir=Path(src))
-            self.core.install(pkg_name, fakeroot=True)
-            self._log('upgrade.rebuild', level='INFO', message='Rebuilt package', meta={'pkg': pkg_name})
-            return {'status': 'ok', 'pkg': pkg_name}
-        except Exception as e:
-            self._log('upgrade.rebuild.fail', level='ERROR', message=str(e), meta={'pkg': pkg_name})
-            raise UpgradeError(str(e))
-
-    # ---------------- rollback ----------------
-    def rollback(self, pkg_name: str, archive_path: str) -> Dict[str, Any]:
-        # delegate to remover.rollback
-        try:
-            res = self.remover.rollback(archive_path)
-            self._log('upgrade.rollback', level='INFO', message='Rollback applied', meta={'pkg': pkg_name})
+            info = self._repo_info_from_db(pkg)
+            metafile = info.get('metafile') if isinstance(info, dict) else None
+            if not self.core:
+                res.status = 'no-core'
+                return res
+            if dry_run:
+                res.status = 'dry-run'
+                return res
+            build_res = self.core.full_build_cycle(pkg, version=info.get('version'), metafile_path=metafile, do_package=False, do_deploy=False, dry_run=False)
+            res.steps.append({'phase': 'rebuild', 'result': build_res})
+            res.status = 'ok' if build_res.status == 'ok' else 'build-fail'
             return res
         except Exception as e:
-            self._log('upgrade.rollback.fail', level='ERROR', message=str(e), meta={'pkg': pkg_name})
-            raise UpgradeError(str(e))
-
-    # ---------------- diffs ----------------
-    def diff_versions(self, pkg_name: str, old_version: str, new_version: str) -> Dict[str, Any]:
-        # compare pkginfo.json between versions if available
-        try:
-            old_info = None
-            new_info = None
-            old_path = self._pkginfo_path(pkg_name, old_version)
-            new_path = self._pkginfo_path(pkg_name, new_version)
-            if old_path and old_path.exists():
-                old_info = json.loads(old_path.read_text(encoding='utf-8'))
-            if new_path and new_path.exists():
-                new_info = json.loads(new_path.read_text(encoding='utf-8'))
-            return {'old': old_info, 'new': new_info}
-        except Exception as e:
-            raise UpgradeError(str(e))
+            res.status = 'error'
+            res.error = str(e)
+            return res
 
     # ---------------- verify integrity ----------------
-    def verify_integrity(self, pkg_name: str) -> Dict[str, Any]:
-        # walk files from DB and check hashes if available
+    def verify_integrity(self, pkg: str, archive: str) -> bool:
+        """Basic sanity checks on packaged archive (size > 0 and can be opened)."""
         try:
-            files = self.db.list_files(pkg_name)
+            p = Path(archive)
+            if not p.exists() or p.stat().st_size == 0:
+                return False
+            with tarfile.open(p, 'r:*') as tar:
+                members = tar.getmembers()
+                return len(members) > 0
         except Exception:
-            return {'status': 'error', 'error': 'cannot list files'}
-        mismatches = []
-        missing = []
-        for f in files:
-            path = Path(f.get('path'))
-            expected = f.get('hash')
-            if not path.exists():
-                missing.append(str(path))
-                continue
-            if expected:
-                # compute sha256
-                import hashlib
-                h = hashlib.sha256()
-                with path.open('rb') as fh:
-                    for chunk in iter(lambda: fh.read(65536), b''):
-                        h.update(chunk)
-                if h.hexdigest() != expected:
-                    mismatches.append({'path': str(path), 'expected': expected, 'got': h.hexdigest()})
-        return {'missing': missing, 'mismatches': mismatches}
+            return False
 
-    # ---------------- clean old versions ----------------
-    def clean_old_versions(self, pkg_name: str, keep: int = 1) -> Dict[str, Any]:
-        # removes package versions from DB and disk, keeping `keep` most recent
-        try:
-            versions = []
-            for v in self.db.list_package_versions(pkg_name):
-                versions.append(v)
-        except Exception:
-            return {'status': 'error', 'error': 'cannot list versions'}
-        # assume versions are dicts with version and created_at
-        sorted_versions = sorted(versions, key=lambda x: x.get('created_at', ''), reverse=True)
-        to_remove = sorted_versions[keep:]
-        removed = []
-        failed = []
-        for v in to_remove:
-            ver = v.get('version')
+    # ---------------- batch upgrade ----------------
+    def batch_upgrade(self, pkgs: List[str], parallel: Optional[int] = None, dry_run: bool = False) -> List[UpgradeResult]:
+        parallel = int(parallel or self.parallel or DEFAULT_PARALLEL)
+        results: List[UpgradeResult] = []
+        self._log('info', 'upgrade.batch.start', f'Starting batch upgrade for {len(pkgs)} packages', total=len(pkgs), parallel=parallel)
+
+        def worker(pkg_name: str) -> UpgradeResult:
             try:
-                # remove package files and DB entries
-                if hasattr(self.remover, 'remove'):
-                    self.remover.remove(f'{pkg_name}-{ver}', purge=True, simulate=False)
-                # if db provides remove_package_version
-                if hasattr(self.db, 'remove_package_version'):
-                    self.db.remove_package_version(pkg_name, ver)
-                removed.append(ver)
+                return self.upgrade(pkg_name, force=False, do_package=True, do_deploy=False, dry_run=dry_run)
             except Exception as e:
-                failed.append({'version': ver, 'error': str(e)})
-        return {'removed': removed, 'failed': failed}
+                r = UpgradeResult(package=pkg_name, status='error', error=str(e))
+                return r
 
-    # ---------------- update db ----------------
-    def update_db(self, pkg_name: str, version: str, status: str) -> None:
-        try:
-            if hasattr(self.db, 'add_package'):
-                # add or update package
-                try:
-                    self.db.add_package(pkg_name, version, 1, origin='upgrade', status=status)
-                    return
-                except Exception:
-                    pass
-            if hasattr(self.db, 'update_package_status'):
-                self.db.update_package_status(pkg_name, status, version=version)
-            # fallback: log
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as ex:
+            futs = {ex.submit(worker, p): p for p in pkgs}
+            for fut in concurrent.futures.as_completed(futs):
+                r = fut.result()
+                results.append(r)
+
+        self._log('info', 'upgrade.batch.done', f'Batch upgrade completed', count=len(results))
+        return results
+
+    # ---------------- cleanup old versions ----------------
+    def clean_old_versions(self, pkg: str, keep: int = 1) -> Dict[str, Any]:
+        """Remove old package archives / backups keeping `keep` newest ones."""
+        removed = []
+        archives = sorted(self.package_output.glob(f"{pkg}*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for a in archives[keep:]:
             try:
-                self.db.add_log(pkg_name, 'upgrade', status, log_path=None)
+                a.unlink()
+                removed.append(str(a))
             except Exception:
-                pass
-        except Exception:
-            pass
+                continue
+        backups = sorted(self.backup_dir.glob(f"{pkg}-upgrade-*.tar.xz"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for b in backups[keep:]:
+            try:
+                b.unlink()
+                removed.append(str(b))
+            except Exception:
+                continue
+        self._log('info', 'upgrade.clean', f'Cleaned {len(removed)} old files for {pkg}', package=pkg)
+        return {'removed': removed}
+
+    # ---------------- CLI convenience ----------------
+    @classmethod
+    def cli_main(cls, argv: Optional[List[str]] = None):
+        import argparse
+        import sys
+
+        p = argparse.ArgumentParser(prog='newpkg-upgrade', description='Upgrade manager for newpkg')
+        p.add_argument('cmd', choices=['check', 'fetch', 'upgrade', 'batch', 'rebuild', 'rollback', 'clean'])
+        p.add_argument('--pkg', help='package name')
+        p.add_argument('--archive', help='archive path for rollback')
+        p.add_argument('--parallel', type=int, help='parallel workers for batch')
+        p.add_argument('--dry-run', action='store_true', help='do not perform changes')
+        p.add_argument('--force', action='store_true', help='force upgrade even if no candidate found')
+        args = p.parse_args(argv)
+
+        cfg = None
+        if init_config:
+            try:
+                cfg = init_config()
+            except Exception:
+                cfg = None
+
+        db = NewpkgDB(cfg) if NewpkgDB and cfg is not None else None
+        logger = NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None
+        hooks = HooksManager(cfg, logger, db) if HooksManager and cfg is not None else None
+        sandbox = Sandbox(cfg, logger, db) if Sandbox and cfg is not None else None
+
+        upgr = cls(cfg=cfg, logger=logger, db=db, hooks=hooks, sandbox=sandbox)
+
+        if args.cmd == 'check':
+            if not args.pkg:
+                print('specify --pkg')
+                return 2
+            res = upgr.check_updates(args.pkg)
+            print(json.dumps(res, indent=2) if res else 'no update')
+            return 0
+
+        if args.cmd == 'fetch':
+            if not args.pkg:
+                print('specify --pkg')
+                return 2
+            res = upgr.fetch_new_source(args.pkg)
+            print(res or 'fetch failed')
+            return 0
+
+        if args.cmd == 'upgrade':
+            if not args.pkg:
+                print('specify --pkg')
+                return 2
+            res = upgr.upgrade(args.pkg, force=args.force, do_package=True, do_deploy=False, dry_run=args.dry_run)
+            print(json.dumps(res.__dict__, indent=2) if isinstance(res, UpgradeResult) else res)
+            return 0
+
+        if args.cmd == 'batch':
+            # read packages from stdin or environment NEWPKG_UPGRADE_PKGS
+            pkgs = []
+            envpkgs = os.environ.get('NEWPKG_UPGRADE_PKGS')
+            if envpkgs:
+                pkgs = [p.strip() for p in envpkgs.split(',') if p.strip()]
+            else:
+                print('provide package names via NEWPKG_UPGRADE_PKGS env or pipe list to stdin')
+                return 2
+            res = upgr.batch_upgrade(pkgs, parallel=args.parallel, dry_run=args.dry_run)
+            print(json.dumps([r.__dict__ for r in res], indent=2))
+            return 0
+
+        if args.cmd == 'rebuild':
+            if not args.pkg:
+                print('specify --pkg')
+                return 2
+            res = upgr.rebuild(args.pkg, dry_run=args.dry_run)
+            print(json.dumps(res.__dict__, indent=2))
+            return 0
+
+        if args.cmd == 'rollback':
+            if not args.pkg or not args.archive:
+                print('specify --pkg and --archive')
+                return 2
+            ok = upgr.rollback(args.pkg, args.archive)
+            print('ok' if ok else 'failed')
+            return 0
+
+        if args.cmd == 'clean':
+            if not args.pkg:
+                print('specify --pkg')
+                return 2
+            res = upgr.clean_old_versions(args.pkg)
+            print(json.dumps(res, indent=2))
+            return 0
+
+        p.print_help()
+        return 1
 
 
-# ---------------- CLI demo ----------------
 if __name__ == '__main__':
-    import argparse
-    ap = argparse.ArgumentParser(prog='newpkg-upgrade')
-    ap.add_argument('--pkg', '-p', required=True)
-    ap.add_argument('--check', action='store_true')
-    ap.add_argument('--upgrade', action='store_true')
-    ap.add_argument('--batch', action='store_true')
-    args = ap.parse_args()
-
-    # minimal stubs if modules not present
-    try:
-        from newpkg_db import NewpkgDB
-    except Exception:
-        NewpkgDB = None
-    try:
-        from newpkg_download import NewpkgDownloader
-    except Exception:
-        NewpkgDownloader = None
-    try:
-        from newpkg_core import NewpkgCore
-    except Exception:
-        NewpkgCore = None
-    try:
-        from newpkg_remove import NewpkgRemove
-    except Exception:
-        NewpkgRemove = None
-    try:
-        from newpkg_hooks import NewpkgHooks
-    except Exception:
-        NewpkgHooks = None
-    try:
-        from newpkg_deps import NewpkgDeps
-    except Exception:
-        NewpkgDeps = None
-
-    cfg = None
-    class CfgShim:
-        def get(self, k):
-            return None
-    cfg = CfgShim()
-
-    db = None
-    if NewpkgDB is not None:
-        dbp = os.environ.get('NEWPKG_DB_PATH')
-        if dbp:
-            db = NewpkgDB(db_path=dbp)
-            db.init_db()
-
-    downloader = NewpkgDownloader() if NewpkgDownloader else None
-    core = NewpkgCore(cfg, db, logger=None, sandbox=None, deps=None) if NewpkgCore else None
-    remover = NewpkgRemove(cfg, logger=None, db=db, sandbox=None, hooks=None) if NewpkgRemove else None
-    hooks = NewpkgHooks(cfg) if NewpkgHooks else None
-    deps = NewpkgDeps(cfg, db) if NewpkgDeps else None
-
-    upgr = NewpkgUpgrade(cfg, logger=None, db=db, downloader=downloader, core=core, remover=remover, hooks=hooks, deps=deps)
-    if args.check:
-        print(upgr.check_updates(args.pkg))
-    if args.upgrade:
-        print(upgr.upgrade(args.pkg))
-    if args.batch:
-        print(upgr.batch_upgrade())
+    NewpkgUpgrade.cli_main()
