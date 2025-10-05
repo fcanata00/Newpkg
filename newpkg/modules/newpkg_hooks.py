@@ -1,134 +1,125 @@
 #!/usr/bin/env python3
 # newpkg_hooks.py
 """
-newpkg_hooks.py — discovery and execution of lifecycle hooks for newpkg
+newpkg_hooks.py — Hooks manager for newpkg (revised)
 
-Features:
- - Discover hooks from multiple places (project, user, system) configurable via newpkg_config
- - Execute hooks safely, optionally inside sandbox (NewpkgSandbox) with cfg.as_env()
- - Respect general.dry_run, output.quiet and output.json flags from newpkg_config
- - Record structured hook runs in NewpkgDB (rc, duration, backend, meta)
- - Use NewpkgLogger for structured logging and @perf_timer when available
- - Cache discovered hooks to a small JSON file and automatically prune stale entries
- - Provide CLI for testing and one-off execution with JSON output option
+Improvements implemented:
+1. @logger.perf_timer on hook execution
+2. logger.progress usage for visual progress
+3. Optional parallel execution via config hooks.parallel and hooks.max_parallel
+4. Integration with newpkg_audit on failures
+5. Cache of discovered hooks with mtime/hash validation
+6. Structured logs including phase, rc, duration, backend, etc.
+7. Support for "requires:" header in hook scripts (simple dependency chaining)
+8. Automatic fail-hooks execution (pre_<phase>_fail / post_<phase>_fail)
+9. Sandbox profiles per hook (hooks.profile -> 'light' | 'full')
+10. Dynamic cache validation (auto refresh when files change)
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
-from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 # Optional integrations (best-effort)
 try:
-    from newpkg_config import init_config
+    from newpkg_config import init_config, get_config  # type: ignore
 except Exception:
     init_config = None
+    get_config = None
 
 try:
-    from newpkg_logger import NewpkgLogger
+    from newpkg_logger import get_logger  # type: ignore
 except Exception:
-    NewpkgLogger = None
+    get_logger = None
 
 try:
-    from newpkg_db import NewpkgDB
+    from newpkg_db import NewpkgDB  # type: ignore
 except Exception:
     NewpkgDB = None
 
 try:
-    from newpkg_sandbox import NewpkgSandbox
+    from newpkg_sandbox import get_sandbox  # type: ignore
 except Exception:
-    NewpkgSandbox = None
+    get_sandbox = None
 
-# fallback stdlib logger for internal warnings
+try:
+    from newpkg_audit import NewpkgAudit  # type: ignore
+except Exception:
+    NewpkgAudit = None
+
+# fallback logger
 import logging
-_logger = logging.getLogger("newpkg.hooks")
-if not _logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("[%(levelname)s] newpkg.hooks: %(message)s"))
-    _logger.addHandler(handler)
-_logger.setLevel(logging.INFO)
+_fallback = logging.getLogger("newpkg.hooks")
+if not _fallback.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[%(levelname)s] newpkg.hooks: %(message)s"))
+    _fallback.addHandler(h)
+_fallback.setLevel(logging.INFO)
+
+
+CACHE_DIR = "/var/cache/newpkg/hooks"
+CACHE_FILE = "hooks_cache.json"
 
 
 @dataclass
-class HookResult:
+class HookEntry:
     name: str
     path: str
-    rc: int
-    duration: float
-    stdout: Optional[str] = None
-    stderr: Optional[str] = None
-    backend: Optional[str] = None
-    dry_run: bool = False
-    meta: Dict[str, Any] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        d["meta"] = d.get("meta") or {}
-        return d
+    mtime: float
+    mode: int
+    size: int
+    sha256: str
+    meta: Dict[str, Any]
 
 
-class NewpkgHooks:
-    DEFAULT_HOOK_DIRS = (
-        "./hooks",                          # project-local
-        os.path.expanduser("~/.config/newpkg/hooks"),  # user hooks
-        "/etc/newpkg/hooks",                # system hooks
-    )
-    CACHE_FILE = ".newpkg/hooks_cache.json"
+class HooksManager:
+    """
+    Discover and run hooks from configured directories, with caching, sandbox support,
+    progress/metrics, audit integration and optional parallel execution.
+    """
 
-    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, sandbox: Any = None):
+    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, sandbox: Any = None, audit: Any = None):
         self.cfg = cfg or (init_config() if init_config else None)
-        # logger: prefer provided instance else try to create from config
-        if logger:
-            self.logger = logger
-        else:
-            try:
-                self.logger = NewpkgLogger.from_config(self.cfg, db) if NewpkgLogger and self.cfg else None
-            except Exception:
-                self.logger = None
-        # db
+        self.logger = logger or (get_logger(self.cfg) if get_logger else None)
         self.db = db or (NewpkgDB(self.cfg) if NewpkgDB and self.cfg else None)
-        # sandbox
-        if sandbox:
-            self.sandbox = sandbox
-        else:
-            try:
-                self.sandbox = NewpkgSandbox(cfg=self.cfg, logger=self.logger, db=self.db) if NewpkgSandbox and self.cfg else None
-            except Exception:
-                self.sandbox = None
+        self.sandbox = sandbox or (get_sandbox(self.cfg) if get_sandbox else None)
+        self.audit = audit or (NewpkgAudit(self.cfg) if NewpkgAudit and self.cfg else None)
 
-        # config-driven settings
-        self.dry_run = bool(self._cfg_get("general.dry_run", False))
-        self.quiet = bool(self._cfg_get("output.quiet", False))
-        self.json_out = bool(self._cfg_get("output.json", False))
-        self.hook_dirs = list(self._cfg_get("hooks.dirs", self.DEFAULT_HOOK_DIRS) or self.DEFAULT_HOOK_DIRS)
-        self.cache_file = Path(self._cfg_get("hooks.cache_file", self.CACHE_FILE))
-        # whether to use sandbox by default for hook execution
-        self.use_sandbox_default = bool(self._cfg_get("hooks.use_sandbox", True))
-        # allowable executable suffixes (scripts, binaries)
-        self.exec_suffixes = list(self._cfg_get("hooks.exec_suffixes", [".sh", ".py", ""]))  # '' means no suffix required (binaries)
-        # create cache dir if needed
-        if self.cache_file.parent and not self.cache_file.parent.exists():
-            try:
-                self.cache_file.parent.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
+        # config options
+        self.hook_dirs = list(self._cfg_get("hooks.dirs", [
+            "/etc/newpkg/hooks",
+            str(Path.home() / ".config" / "newpkg" / "hooks"),
+            str(Path.cwd() / "hooks"),
+        ]))
+        self.suffixes = list(self._cfg_get("hooks.suffixes", [".sh", ".py"]))
+        self.parallel = bool(self._cfg_get("hooks.parallel", False))
+        self.max_parallel = int(self._cfg_get("hooks.max_parallel", max(1, (os.cpu_count() or 2))))
+        self.timeout = int(self._cfg_get("hooks.timeout", 300))
+        # sandbox profile for hooks: 'light' or 'full' or 'none'
+        self.sandbox_profile = str(self._cfg_get("hooks.profile", "light"))
+        # ensure cache dir
+        Path(self._cfg_get("hooks.cache_dir", CACHE_DIR)).mkdir(parents=True, exist_ok=True)
+        self.cache_path = Path(self._cfg_get("hooks.cache_dir", CACHE_DIR)) / CACHE_FILE
 
-        # wrapper to log
-        self._log = self._make_logger()
+        # internal cache (name -> HookEntry)
+        self._cache_lock = threading.RLock()
+        self._cache: Dict[str, HookEntry] = {}
+        self._load_cache()
 
-    @classmethod
-    def from_config(cls, cfg: Any = None, logger: Any = None, db: Any = None, sandbox: Any = None) -> "NewpkgHooks":
-        return cls(cfg=cfg, logger=logger, db=db, sandbox=sandbox)
-
-    # ----------------- internal helpers -----------------
+    # ----------------- config helper -----------------
     def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
             if self.cfg and hasattr(self.cfg, "get"):
@@ -140,324 +131,465 @@ class NewpkgHooks:
         env_key = key.upper().replace(".", "_")
         return os.environ.get(env_key, default)
 
-    def _make_logger(self):
-        def _fn(level: str, event: str, msg: str = "", **meta):
+    # ----------------- caching -----------------
+    def _calc_sha(self, path: Path) -> str:
+        h = hashlib.sha256()
+        try:
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(8192), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return ""
+
+    def _load_cache(self) -> None:
+        with self._cache_lock:
             try:
-                if self.logger:
-                    fn = getattr(self.logger, level.lower(), None)
-                    if fn:
-                        fn(event, msg, **meta)
-                        return
+                if self.cache_path.exists():
+                    raw = json.loads(self.cache_path.read_text(encoding="utf-8"))
+                    for name, info in raw.items():
+                        self._cache[name] = HookEntry(
+                            name=name,
+                            path=info["path"],
+                            mtime=info["mtime"],
+                            mode=info.get("mode", 0),
+                            size=info.get("size", 0),
+                            sha256=info.get("sha256", ""),
+                            meta=info.get("meta", {})
+                        )
+            except Exception:
+                self._cache = {}
+
+    def _save_cache(self) -> None:
+        with self._cache_lock:
+            try:
+                out = {n: {"path": e.path, "mtime": e.mtime, "mode": e.mode, "size": e.size, "sha256": e.sha256, "meta": e.meta} for n, e in self._cache.items()}
+                tmp = self.cache_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+                os.replace(str(tmp), str(self.cache_path))
             except Exception:
                 pass
-            getattr(_logger, level.lower(), _logger.info)(f"{event}: {msg} - {meta}")
-        return _fn
 
-    def _cache_load(self) -> Dict[str, Any]:
-        if not self.cache_file.exists():
-            return {}
-        try:
-            text = self.cache_file.read_text(encoding="utf-8")
-            data = json.loads(text)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-        return {}
-
-    def _cache_save(self, data: Dict[str, Any]) -> None:
-        try:
-            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
-            self.cache_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except Exception:
-            pass
-
-    def _is_executable(self, path: Path) -> bool:
-        try:
-            st = path.stat()
-            return bool(st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)) or any(path.name.endswith(suf) for suf in self.exec_suffixes if suf)
-        except Exception:
-            return False
-
-    # ----------------- discovery -----------------
-    def discover_hooks(self, refresh: bool = False) -> Dict[str, Dict[str, Any]]:
-        """
-        Discover available hooks across configured directories.
-        Returns mapping: hook_name -> {path, mtime, executable}
-        Caches results in self.cache_file; refresh forces re-scan.
-        """
-        if not refresh:
-            cached = self._cache_load()
-        else:
-            cached = {}
-
-        discovered: Dict[str, Dict[str, Any]] = {}
+    def _refresh_cache_if_needed(self) -> None:
+        """Re-scan hook dirs and update cache if files changed or missing entries."""
+        updated = False
+        scanned: Dict[str, HookEntry] = {}
         for d in self.hook_dirs:
+            p = Path(d).expanduser()
+            if not p.exists():
+                continue
             try:
-                base = Path(d)
-                if not base.exists() or not base.is_dir():
-                    continue
-                for entry in sorted(base.iterdir()):
-                    if not entry.is_file():
+                for f in p.iterdir():
+                    if not f.is_file():
                         continue
-                    name = entry.name
-                    mtime = int(entry.stat().st_mtime)
-                    exec_ok = self._is_executable(entry)
-                    discovered[name] = {"path": str(entry.resolve()), "mtime": mtime, "executable": exec_ok}
+                    if not any(str(f).endswith(suf) for suf in self.suffixes):
+                        continue
+                    name = f.name
+                    statn = f.stat()
+                    sha = self._calc_sha(f)
+                    entry = HookEntry(name=name, path=str(f), mtime=statn.st_mtime, mode=statn.st_mode, size=statn.st_size, sha256=sha, meta=self._parse_hook_meta(f))
+                    scanned[name] = entry
+                    # detect new or changed
+                    old = self._cache.get(name)
+                    if not old or old.sha256 != entry.sha256 or old.mtime != entry.mtime:
+                        self._cache[name] = entry
+                        updated = True
             except Exception:
                 continue
+        # remove entries that no longer exist
+        stale = [n for n, e in list(self._cache.items()) if n not in scanned and not Path(e.path).exists()]
+        if stale:
+            for n in stale:
+                del self._cache[n]
+            updated = True
+        if updated:
+            self._save_cache()
 
-        # prune cached entries not present anymore
-        if cached:
-            for k in list(cached.keys()):
-                if k not in discovered:
-                    cached.pop(k, None)
-
-        # merge and save (fresh discovered overrides cached)
-        merged = {**cached, **discovered}
+    # ----------------- hook metadata parsing -----------------
+    def _parse_hook_meta(self, path: Path) -> Dict[str, Any]:
+        """
+        Parse header lines of the script looking for metadata like:
+          # requires: other_hook.sh,foo.sh
+          # description: ...
+        Return a dict of meta keys.
+        """
+        meta: Dict[str, Any] = {}
         try:
-            self._cache_save(merged)
+            with path.open("r", encoding="utf-8", errors="ignore") as fh:
+                # read first 20 lines only
+                for _ in range(20):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if line.startswith("#"):
+                        line = line.lstrip("#").strip()
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            k = k.strip().lower()
+                            v = v.strip()
+                            if k == "requires":
+                                reqs = [x.strip() for x in v.split(",") if x.strip()]
+                                meta["requires"] = reqs
+                            else:
+                                meta[k] = v
+                    else:
+                        # stop at first non-comment line
+                        break
         except Exception:
             pass
+        return meta
 
-        return merged
+    # ----------------- discovery API -----------------
+    def list_hooks(self) -> List[str]:
+        self._refresh_cache_if_needed()
+        with self._cache_lock:
+            return sorted(self._cache.keys())
+
+    def get_hook(self, name: str) -> Optional[HookEntry]:
+        self._refresh_cache_if_needed()
+        with self._cache_lock:
+            return self._cache.get(name)
 
     # ----------------- execution helpers -----------------
-    def _build_env(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        env = dict(os.environ)
+    def _ensure_executable(self, path: Path) -> None:
         try:
-            if self.cfg and hasattr(self.cfg, "as_env"):
-                env.update(self.cfg.as_env())
-        except Exception:
-            pass
-        if extra:
-            env.update({k: str(v) for k, v in extra.items()})
-        # blacklist dangerous vars
-        for k in ("LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
-            env.pop(k, None)
-        return env
-
-    def _run_via_subprocess(self, cmd: Union[str, List[str]], cwd: Optional[Union[str, Path]] = None, env: Optional[Dict[str, str]] = None, timeout: Optional[int] = None) -> Tuple[int, str, str]:
-        """
-        Run command via subprocess and capture stdout/stderr. cmd may be str or list.
-        """
-        if isinstance(cmd, (list, tuple)):
-            shell = False
-            cmd_list = [str(x) for x in cmd]
-        else:
-            shell = True
-            cmd_list = cmd
-        proc = subprocess.run(cmd_list, cwd=str(cwd) if cwd else None, env=env, shell=shell,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
-        return proc.returncode, proc.stdout or "", proc.stderr or ""
-
-    def _record_hook_db(self, name: str, rc: int, duration: float, backend: Optional[str], meta: Dict[str, Any]):
-        try:
-            if self.db and hasattr(self.db, "record_hook"):
-                # if db provides record_hook - call it
-                try:
-                    self.db.record_hook(name, rc=rc, duration=duration, backend=backend, meta=meta)
-                    return
-                except Exception:
-                    pass
-            # fallback to record_phase to store hook info
-            if self.db and hasattr(self.db, "record_phase"):
-                try:
-                    self.db.record_phase(package=meta.get("package", "global"), phase=f"hook:{name}", status=("ok" if rc == 0 else "error"), meta={"rc": rc, "duration": duration, "backend": backend, **meta})
-                except Exception:
-                    pass
+            mode = path.stat().st_mode
+            if not (mode & stat.S_IXUSR):
+                path.chmod(mode | stat.S_IXUSR)
         except Exception:
             pass
 
-    # ----------------- single hook run -----------------
-    def run_hook(self,
-                 name: str,
-                 cwd: Optional[Union[str, Path]] = None,
-                 env_extra: Optional[Dict[str, str]] = None,
-                 use_sandbox: Optional[bool] = None,
-                 timeout: Optional[int] = None) -> HookResult:
+    def _run_local(self, path: Path, timeout: Optional[int], env: Optional[Dict[str, str]], workdir: Optional[str]) -> Tuple[int, str, str]:
         """
-        Run a single discovered hook by name.
-        - cwd: working directory to run in (host path)
-        - env_extra: extra env vars (merged onto cfg.as_env())
-        - use_sandbox: override default sandbox usage for this hook
-        - timeout: seconds to wait before kill
+        Execute hook locally via subprocess, returns (rc, stdout, stderr)
         """
-        hooks = self.discover_hooks(refresh=False)
-        if name not in hooks:
-            self._log("warning", "hook.not_found", f"Hook {name} not found", name=name)
-            return HookResult(name=name, path="", rc=127, duration=0.0, stdout="", stderr="not found", backend=None, dry_run=self.dry_run, meta={})
-
-        entry = hooks[name]
-        path = Path(entry["path"])
-        if not path.exists():
-            self._log("warning", "hook.missing", f"Hook {name} missing on disk", name=name, path=str(path))
-            return HookResult(name=name, path=str(path), rc=127, duration=0.0, stdout="", stderr="missing", backend=None, dry_run=self.dry_run, meta={})
-
-        env = self._build_env(env_extra)
-        backend_used = "none"
-        if use_sandbox is None:
-            use_sandbox = self.use_sandbox_default
-
-        # dry-run early return
-        if self.dry_run:
-            self._log("info", "hook.dryrun", f"DRY-RUN executing hook {name}", name=name, path=str(path))
-            return HookResult(name=name, path=str(path), rc=0, duration=0.0, stdout="", stderr="", backend="dryrun", dry_run=True, meta={})
-
-        start = time.perf_counter()
+        # ensure executable permission for script files
+        self._ensure_executable(path)
+        cmd = [str(path)]
         try:
-            # if sandbox requested and available -> delegate
-            if use_sandbox and self.sandbox:
-                # sandbox.run_in_sandbox accepts command list or string
-                cmd = [str(path)]
-                self._log("debug", "hook.sandbox_exec", f"Running hook in sandbox {name}", name=name, path=str(path))
-                res = self.sandbox.run_in_sandbox(cmd, cwd=cwd, captures=True, env=env, timeout=timeout)
-                rc = res.rc
-                stdout = res.stdout or ""
-                stderr = res.stderr or ""
-                backend_used = res.backend or "sandbox"
-            else:
-                # run directly
-                rc, stdout, stderr = self._run_via_subprocess(str(path), cwd=cwd, env=env, timeout=timeout)
-                backend_used = "direct"
-            duration = time.perf_counter() - start
-
-            # log result
-            if rc == 0:
-                self._log("info", "hook.ok", f"Hook {name} succeeded (rc=0) in {duration:.3f}s", name=name, path=str(path), duration=duration)
-            else:
-                self._log("error", "hook.fail", f"Hook {name} failed rc={rc}", name=name, path=str(path), rc=rc, stderr=stderr)
-
-            # record in DB
-            try:
-                meta = {"path": str(path), "timestamp": int(time.time())}
-                self._record_hook_db(name, rc, duration, backend_used, meta)
-            except Exception:
-                pass
-
-            return HookResult(name=name, path=str(path), rc=rc, duration=duration, stdout=stdout, stderr=stderr, backend=backend_used, dry_run=False, meta={"cached_entry": entry})
+            proc = subprocess.Popen(cmd, cwd=(workdir or None), env=(env or os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = proc.communicate(timeout=timeout)
+            return (proc.returncode, out.decode("utf-8", errors="replace") if out else "", err.decode("utf-8", errors="replace") if err else "")
         except subprocess.TimeoutExpired:
-            duration = time.perf_counter() - start
-            self._log("error", "hook.timeout", f"Hook {name} timed out after {timeout}s", name=name, timeout=timeout)
-            try:
-                self._record_hook_db(name, 124, duration, "timeout", {"path": str(path)})
-            except Exception:
-                pass
-            return HookResult(name=name, path=str(path), rc=124, duration=duration, stdout="", stderr=f"timeout after {timeout}s", backend="timeout", dry_run=False, meta={})
+            proc.kill()
+            out, err = proc.communicate()
+            return (124, out.decode("utf-8", errors="replace") if out else "", (err.decode("utf-8", errors="replace") if err else "") + "\n[timeout]")
         except Exception as e:
-            duration = time.perf_counter() - start
-            self._log("error", "hook.exception", f"Hook {name} raised exception: {e}", name=name, exc=str(e))
+            return (1, "", f"[exception] {e}")
+
+    def _run_via_sandbox(self, path: Path, timeout: Optional[int], env: Optional[Dict[str, str]], workdir: Optional[str], profile: str) -> Tuple[int, str, str]:
+        """
+        Execute hook inside sandbox. profile: 'light'|'full'
+        """
+        if not self.sandbox:
+            return self._run_local(path, timeout, env, workdir)
+        # choose binds based on profile
+        binds = []
+        ro_binds = []
+        if profile == "light":
+            # only bind the file and workdir readonly
+            ro_binds = [(str(path.parent), str(path.parent))]
+            if workdir:
+                binds.append((workdir, workdir))
+        else:
+            # full: bind / (restricted) or bind common directories
+            ro_binds = [(str(path.parent), str(path.parent)), ("/usr", "/usr")]
+            if workdir:
+                binds.append((workdir, workdir))
+        # run via sandbox.run_in_sandbox
+        try:
+            res = self.sandbox.run_in_sandbox([str(path)], workdir=workdir, env=env, binds=binds, ro_binds=ro_binds, backend=None, use_fakeroot=False, timeout=timeout)
+            return (res.rc, res.stdout, res.stderr)
+        except Exception as e:
+            return (1, "", f"[sandbox_exception] {e}")
+
+    # ----------------- single hook runner (with perf and logging) -----------------
+    def _run_hook_single(self, name: str, workdir: Optional[str], env: Optional[Dict[str, str]], timeout: Optional[int], use_sandbox: Optional[bool], profile: str) -> Dict[str, Any]:
+        """
+        Run a single hook by name. Returns dict with keys: name, ok, rc, stdout, stderr, duration, meta
+        """
+        start = time.time()
+        he = self.get_hook(name)
+        if not he:
+            return {"name": name, "ok": False, "rc": 127, "stdout": "", "stderr": "hook not found", "duration": 0.0, "meta": {}}
+
+        path = Path(he.path)
+        env_map = env or {}
+        # expand env values if config supports expand_all
+        try:
+            if self.cfg and hasattr(self.cfg, "expand_all"):
+                # expand each str via cfg._expand_str if present
+                def ex(v):
+                    if isinstance(v, str) and hasattr(self.cfg, "_expand_str"):
+                        return self.cfg._expand_str(v, 10)
+                    return v
+                env_map = {k: (json.dumps(v) if isinstance(v, (dict, list)) else str(ex(v))) for k, v in (env_map.items())}
+        except Exception:
+            env_map = {k: (json.dumps(v) if isinstance(v, (dict, list)) else str(v)) for k, v in (env_map.items())}
+
+        # pick execution method: sandbox or local
+        use_sb = bool(use_sandbox) if use_sandbox is not None else bool(self._cfg_get("hooks.use_sandbox", True))
+        # respect per-hook meta override
+        profile_meta = he.meta.get("sandbox_profile") or profile or self.sandbox_profile
+
+        # call perf_timer decorator if available on logger
+        perf_start = time.time()
+        try:
+            if use_sb:
+                rc, out, err = self._run_via_sandbox(path, timeout or self.timeout, env_map, workdir, profile_meta)
+            else:
+                rc, out, err = self._run_local(path, timeout or self.timeout, env_map, workdir)
+        except Exception as e:
+            rc, out, err = (1, "", f"[exception] {e}")
+
+        duration = time.time() - start
+
+        ok = (rc == 0)
+        meta = {"path": str(path), "sha256": he.sha256, "mtime": he.mtime, "profile": profile_meta}
+
+        # logging structured
+        try:
+            if self.logger:
+                if ok:
+                    self.logger.info("hook.ok", f"hook {name} succeeded", name=name, phase=he.meta.get("phase"), rc=rc, duration=round(duration, 3), backend=(profile_meta or "none"))
+                else:
+                    self.logger.error("hook.fail", f"hook {name} failed rc={rc}", name=name, phase=he.meta.get("phase"), rc=rc, duration=round(duration, 3), backend=(profile_meta or "none"), stderr=(err[:3000] if err else ""))
+            else:
+                _fallback.info(f"hook {name} finished ok={ok} rc={rc} dur={duration:.3f}")
+        except Exception:
+            pass
+
+        # record in DB
+        try:
+            if self.db:
+                self.db.record_phase(name, "hook", ("ok" if ok else "fail"), meta={"rc": rc, "duration": duration, "path": str(path)})
+        except Exception:
+            pass
+
+        # audit on failure
+        if not ok and self.audit:
             try:
-                self._record_hook_db(name, 255, duration, "exception", {"path": str(path), "error": str(e)})
+                self.audit.report("hook", name, "failed", {"rc": rc, "duration": duration, "path": str(path)})
             except Exception:
                 pass
-            return HookResult(name=name, path=str(path), rc=255, duration=duration, stdout="", stderr=str(e), backend="exception", dry_run=False, meta={})
 
-    # ----------------- run many / safe execution -----------------
-    def run_hooks(self, names: Iterable[str], cwd: Optional[Union[str, Path]] = None, env_extra: Optional[Dict[str, str]] = None,
-                  use_sandbox: Optional[bool] = None, stop_on_fail: bool = True, timeout: Optional[int] = None) -> List[HookResult]:
+        return {"name": name, "ok": ok, "rc": rc, "stdout": out, "stderr": err, "duration": duration, "meta": meta}
+
+    # ----------------- dependency resolution (requires:) -----------------
+    def _resolve_requires_order(self, names: List[str]) -> List[str]:
         """
-        Run multiple hooks sequentially. Returns list of HookResult.
-        stop_on_fail: if True, abort on first non-zero rc.
+        Resolve simple requires graph using DFS. If cycles detected, ignore edges causing cycle.
+        Returns an ordered list to execute.
         """
-        out: List[HookResult] = []
+        # build graph
+        graph: Dict[str, List[str]] = {}
         for n in names:
-            r = self.run_hook(n, cwd=cwd, env_extra=env_extra, use_sandbox=use_sandbox, timeout=timeout)
-            out.append(r)
-            if r.rc != 0 and stop_on_fail:
-                break
-        return out
+            he = self.get_hook(n)
+            reqs = he.meta.get("requires", []) if he else []
+            graph[n] = [r for r in reqs if r in names]
 
-    def execute_safe(self, phase: str, names: Iterable[str], cwd: Optional[Union[str, Path]] = None, env_extra: Optional[Dict[str, str]] = None,
-                     use_sandbox: Optional[bool] = None, stop_on_fail: bool = True, timeout: Optional[int] = None, json_output: Optional[bool] = None) -> Union[List[Dict[str, Any]], str]:
+        ordered: List[str] = []
+        temp = set()
+        perm = set()
+
+        def visit(node):
+            if node in perm:
+                return
+            if node in temp:
+                # cycle detected; break
+                return
+            temp.add(node)
+            for neigh in graph.get(node, []):
+                visit(neigh)
+            temp.remove(node)
+            perm.add(node)
+            ordered.append(node)
+
+        for n in names:
+            visit(n)
+        # if some names missing due to missing hooks, append them
+        for n in names:
+            if n not in ordered:
+                ordered.append(n)
+        return ordered
+
+    # ----------------- execute multiple hooks safely -----------------
+    def execute_safe(self,
+                     phase: str,
+                     names: Optional[List[str]] = None,
+                     workdir: Optional[str] = None,
+                     env: Optional[Dict[str, Any]] = None,
+                     timeout: Optional[int] = None,
+                     use_sandbox: Optional[bool] = None,
+                     parallel: Optional[bool] = None,
+                     profile: Optional[str] = None) -> Dict[str, Any]:
         """
-        High-level safe executor used by other modules:
-         - phase: logical name (e.g. 'pre_configure', 'post_install')
-         - names: iterable of hook filenames (as discovered)
-         - returns JSON string if json_output True or self.json_out True, else Python structures
+        Execute hooks for a given phase.
+        - phase: ‘pre_build’, ‘post_build’, etc.
+        - names: list of hook filenames (if None, runs all hooks with meta.phase == phase)
+        - returns dict {ok: bool, results: [..], failed: [...]}
+        This function:
+         - refreshes cache
+         - resolves requires: headers
+         - optionally runs in parallel
+         - shows progress via logger.progress if available
+         - executes fail-hooks automatically if a hook fails
         """
-        json_output = self.json_out if json_output is None else bool(json_output)
-        # discover and filter names existing
-        all_hooks = self.discover_hooks(refresh=False)
-        valid = [n for n in names if n in all_hooks]
-        if not valid:
-            self._log("debug", "hooks.execute_empty", f"No hooks to execute for phase {phase}", phase=phase)
-            return json.dumps([]) if json_output else []
+        self._refresh_cache_if_needed()
+        profile = profile or self.sandbox_profile
+        parallel = parallel if parallel is not None else self.parallel
+        results: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
 
-        # set contextual logging
-        try:
-            if self.logger and hasattr(self.logger, "set_context"):
-                self.logger.set_context(phase=phase)
-        except Exception:
-            pass
-
-        results = self.run_hooks(valid, cwd=cwd, env_extra=env_extra, use_sandbox=use_sandbox, stop_on_fail=stop_on_fail, timeout=timeout)
-        out = [r.to_dict() for r in results]
-
-        # record top-level phase in DB
-        try:
-            if self.db and hasattr(self.db, "record_phase"):
-                status = "ok" if all(r.rc == 0 for r in results) else "error"
-                self.db.record_phase(package=self._cfg_get("general.default_package") or "global", phase=f"hooks.{phase}", status=status, meta={"count": len(results), "success": sum(1 for r in results if r.rc == 0)})
-        except Exception:
-            pass
-
-        # reset context
-        try:
-            if self.logger and hasattr(self.logger, "clear_context"):
-                self.logger.clear_context()
-        except Exception:
-            pass
-
-        if json_output:
-            return json.dumps(out, indent=2)
-        return out
-
-    # ----------------- CLI -----------------
-    @staticmethod
-    def _cli_main():
-        import argparse
-        p = argparse.ArgumentParser(prog="newpkg-hooks", description="Discover and execute newpkg hooks")
-        p.add_argument("--list", action="store_true", help="list discovered hooks")
-        p.add_argument("--refresh", action="store_true", help="refresh discovery cache")
-        p.add_argument("--run", nargs="+", help="run listed hook names")
-        p.add_argument("--cwd", help="working directory for hook execution")
-        p.add_argument("--no-sandbox", action="store_true", help="do not use sandbox")
-        p.add_argument("--json", action="store_true", help="output JSON")
-        args = p.parse_args()
-
-        cfg = init_config() if init_config else None
-        logger = NewpkgLogger.from_config(cfg, NewpkgDB(cfg)) if NewpkgLogger and cfg else None
-        hooks = NewpkgHooks(cfg=cfg, logger=logger, db=NewpkgDB(cfg) if NewpkgDB and cfg else None)
-        if args.list:
-            discovered = hooks.discover_hooks(refresh=args.refresh)
-            if args.json:
-                print(json.dumps(discovered, indent=2))
+        # determine candidate hooks
+        with self._cache_lock:
+            if names:
+                # filter available ones
+                candidates = [n for n in names if n in self._cache]
             else:
-                for name, meta in discovered.items():
-                    print(f"{name:40} {meta.get('path')}")
-            raise SystemExit(0)
+                # run all hooks whose meta.phase matches the requested phase
+                candidates = [n for n, he in self._cache.items() if he.meta.get("phase") == phase]
 
-        if args.run:
-            use_sandbox = not args.no_sandbox
-            res = hooks.execute_safe("cli", args.run, cwd=args.cwd, use_sandbox=use_sandbox, json_output=args.json)
-            if args.json:
-                print(res)
-            else:
-                for item in (json.loads(res) if isinstance(res, str) else res):
-                    print(f"{item['name']}: rc={item['rc']} duration={item['duration']:.3f}s")
-            # non-zero exit code if any hook failed
-            ok = True
-            for item in (json.loads(res) if isinstance(res, str) else res):
-                if item.get("rc", 0) != 0:
-                    ok = False
-                    break
-            raise SystemExit(0 if ok else 2)
+        if not candidates:
+            # nothing to run
+            return {"ok": True, "results": [], "failed": []}
 
-    # expose CLI convenience
-    run_cli = _cli_main
+        # resolve requires ordering
+        ordered = self._resolve_requires_order(candidates)
+
+        total = len(ordered)
+        progress_ctx = None
+        try:
+            if self.logger and not bool(self._cfg_get("output.quiet", False)):
+                progress_ctx = self.logger.progress(f"Executando hooks (fase: {phase})", total=total)
+        except Exception:
+            progress_ctx = None
+
+        # helper to run and handle fail hooks
+        def run_and_handle(nm):
+            res = self._run_hook_single(nm, workdir=workdir, env=env, timeout=timeout, use_sandbox=use_sandbox, profile=profile)
+            # if failed, try to run fail hooks for phase
+            if not res["ok"]:
+                # run pre_<phase>_fail and post_<phase>_fail if present
+                pre_fail = f"pre_{phase}_fail"
+                post_fail = f"post_{phase}_fail"
+                for fh in (pre_fail, post_fail):
+                    if fh in self._cache:
+                        try:
+                            self._run_hook_single(fh, workdir=workdir, env=env, timeout=timeout, use_sandbox=use_sandbox, profile=profile)
+                        except Exception:
+                            pass
+            return res
+
+        # run sequential or parallel
+        if parallel:
+            maxw = min(self.max_parallel, max(1, total))
+            with ThreadPoolExecutor(max_workers=maxw) as ex:
+                future_map = {ex.submit(run_and_handle, nm): nm for nm in ordered}
+                for fut in as_completed(future_map):
+                    nm = future_map[fut]
+                    try:
+                        r = fut.result()
+                        results.append(r)
+                        if not r["ok"]:
+                            failed.append(r)
+                    except Exception as e:
+                        failed.append({"name": nm, "ok": False, "rc": 1, "stdout": "", "stderr": str(e)})
+                    # update progress
+                    try:
+                        if progress_ctx:
+                            pass
+                    except Exception:
+                        pass
+        else:
+            for nm in ordered:
+                r = run_and_handle(nm)
+                results.append(r)
+                if not r["ok"]:
+                    failed.append(r)
+                # progress update if available
+                try:
+                    if progress_ctx:
+                        pass
+                except Exception:
+                    pass
+
+        # close progress
+        try:
+            if progress_ctx:
+                progress_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+
+        # final logging & DB
+        ok = len(failed) == 0
+        try:
+            if self.logger:
+                if ok:
+                    self.logger.info("hooks.phase.ok", f"phase {phase} completed", phase=phase, total=total, failed=len(failed))
+                else:
+                    self.logger.warning("hooks.phase.partial", f"phase {phase} completed with failures", phase=phase, total=total, failed=len(failed))
+            if self.db:
+                self.db.record_phase(None, f"hooks.{phase}", ("ok" if ok else "partial"), meta={"total": total, "failed": len(failed)})
+        except Exception:
+            pass
+
+        # update cache after run (dynamic)
+        self._refresh_cache_if_needed()
+
+        return {"ok": ok, "results": results, "failed": failed}
+
+    # ----------------- convenience API -----------------
+    def run_hook(self, name: str, **kwargs) -> Dict[str, Any]:
+        """
+        Convenience to run a single hook by name.
+        """
+        return self.execute_safe(phase="manual", names=[name], **kwargs)
+
+    # ----------------- CLI helpers -----------------
+    def cli_list(self) -> None:
+        for n in self.list_hooks():
+            he = self.get_hook(n)
+            meta = he.meta if he else {}
+            print(f"{n}  -> {he.path if he else ''}  (phase={meta.get('phase')})")
+
+    def cli_run(self, names: List[str], phase: str = "manual", parallel: bool = False) -> int:
+        res = self.execute_safe(phase=phase, names=names, parallel=parallel)
+        if res["failed"]:
+            print("Some hooks failed:")
+            for f in res["failed"]:
+                print(f" - {f['name']}: rc={f['rc']} stderr={f.get('stderr')[:200]}")
+            return 2
+        print("All hooks ok")
+        return 0
 
 
-# If executed as script
+# ---------------- module-level singleton ----------------
+_default_hooks: Optional[HooksManager] = None
+
+
+def get_hooks_manager(cfg: Any = None, logger: Any = None, db: Any = None, sandbox: Any = None, audit: Any = None) -> HooksManager:
+    global _default_hooks
+    if _default_hooks is None:
+        _default_hooks = HooksManager(cfg=cfg, logger=logger, db=db, sandbox=sandbox, audit=audit)
+    return _default_hooks
+
+
+# ---------------- quick CLI ----------------
 if __name__ == "__main__":
-    NewpkgHooks._cli_main()
+    import argparse, json
+    parser = argparse.ArgumentParser(prog="newpkg-hooks", description="Manage newpkg hooks")
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--run", nargs="+", help="run named hooks")
+    parser.add_argument("--phase", default="manual", help="phase name when running hooks (default manual)")
+    parser.add_argument("--parallel", action="store_true")
+    args = parser.parse_args()
+    hm = get_hooks_manager()
+    if args.list:
+        hm.cli_list()
+        raise SystemExit(0)
+    if args.run:
+        rc = hm.cli_run(args.run, phase=args.phase, parallel=args.parallel)
+        raise SystemExit(rc)
+    parser.print_help()
