@@ -1,0 +1,108 @@
+[general]
+root_dir = "/"                     # Prefixo padrão de instalação (/ ou /mnt/lfs)
+build_root = "/var/tmp/newpkg"     # Diretório de builds temporários
+sandbox_backend = "bwrap"          # "bwrap", "proot", ou "none"
+jobs = 4                           # Paralelismo padrão
+use_sandbox = true
+auto_confirm = false
+strip_binaries = true              # Aplica strip automático
+default_profile = "system"         # Perfil de build default
+destdir = "/tmp/pkg-destdir"       # Diretório para staging DESTDIR
+
+[output]
+color = true
+json = false
+quiet = false
+log_level = "info"
+log_file = "/var/log/newpkg.log"
+
+[db]
+path = "/var/lib/newpkg/newpkg.db"
+auto_commit = true
+backup_before_update = true
+
+[hooks]
+enabled = true
+path = "/etc/newpkg/hooks"
+
+[downloads]
+cache_dir = "/var/cache/newpkg"
+verify_checksums = true
+gpg_verify = true
+parallel_downloads = 4
+timeout = 300
+
+# Repositórios principais de fontes e metafiles
+mirrors = [
+  "https://ftp.gnu.org/gnu",
+  "https://mirrors.kernel.org",
+  "https://sourceware.org/pub"
+]
+
+# Repositórios com os metafiles (.toml)
+metafile_repos = [
+  "https://github.com/newpkg/newpkg-metafiles.git",
+  "https://gitlab.com/newpkg/blfs-metafiles.git"
+]
+
+# Caminhos locais onde os metafiles são sincronizados
+metafile_local_dirs = [
+  "/var/lib/newpkg/metafiles",
+  "/etc/newpkg/metafiles"
+]
+
+# Ordem de busca — prioridade decrescente
+metafile_search_order = ["local", "git", "cache"]
+
+[patches]
+search_dirs = ["/etc/newpkg/patches", "./patches"]
+auto_apply = true
+
+[packages]
+manifest_dir = "/var/lib/newpkg/manifests"
+package_output_dir = "/var/cache/newpkg/packages"
+
+[sandbox]
+enabled = true
+backend = "bwrap"
+default_bind_ro = ["/etc", "/usr", "/lib", "/bin"]
+default_bind_rw = ["/tmp", "/var/tmp"]
+network = false
+fakeroot = true
+
+[audit]
+enabled = true
+vuln_db_path = "/var/lib/newpkg/vuln_db.json"
+auto_update = true
+auto_fix = false
+parallel = true
+trust_level = "official"
+min_severity = 5.0
+
+[upgrade]
+backup_dir = "/var/tmp/newpkg_backups"
+verify_after = true
+auto_rebuild_deps = true
+parallel = true
+confirm = false
+
+[logging]
+backend = "rich"
+color_theme = "soft"
+max_log_size = 20
+max_backups = 5
+metrics = true
+perf_timer = true
+
+[sync]
+repos_dir = "/var/lib/newpkg/repos"
+default_branch = "main"
+parallel = true
+git_timeout = 300
+
+[env]
+CFLAGS = "-O2 -pipe"
+CXXFLAGS = "-O2 -pipe"
+MAKEFLAGS = "-j4"
+LANG = "C.UTF-8"
+PATH = "/usr/local/bin:/usr/bin:/bin"
