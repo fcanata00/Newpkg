@@ -1,0 +1,92 @@
+[package]
+name = "gcc"
+version = "15.2.0-pass2"
+category = "toolchain"
+description = "GNU Compiler Collection (GCC) 15.2.0 – Pass 2 build for LFS toolchain"
+license = "GPL-3.0-or-later"
+homepage = "https://gcc.gnu.org"
+maintainer = "Newpkg Core <dev@newpkg.org>"
+depends = ["binutils", "glibc", "zlib", "gmp", "mpfr", "mpc"]
+runtime_depends = ["glibc"]
+build_type = "gnu"
+strip = true
+
+[source]
+urls = [
+  "https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz",
+  "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz",
+  "https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz",
+  "https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz"
+]
+sha256 = {
+  "gcc-15.2.0.tar.xz" = "",
+  "mpfr-4.2.1.tar.xz" = "",
+  "gmp-6.3.0.tar.xz"  = "",
+  "mpc-1.3.1.tar.gz"  = ""
+}
+
+[environment]
+LFS = "/mnt/lfs"
+LFS_TGT = "x86_64-lfs-linux-gnu"
+PATH = "/usr/bin"
+LANG = "C.UTF-8"
+LC_ALL = "C.UTF-8"
+MAKEFLAGS = "-j${jobs}"
+
+[pre]
+# Extract MPFR, GMP, MPC into GCC source tree as per LFS
+run = [
+  "tar -xf ../mpfr-*.tar.xz && mv -v mpfr-* mpfr",
+  "tar -xf ../gmp-*.tar.xz && mv -v gmp-* gmp",
+  "tar -xf ../mpc-*.tar.gz && mv -v mpc-* mpc"
+]
+
+[build]
+system = "autotools"
+workdir = "build"
+configure = [
+  "../configure",
+  "--build=$(../config.guess)",
+  "--host=${LFS_TGT}",
+  "--target=${LFS_TGT}",
+  "LDFLAGS_FOR_TARGET=-L$PWD/$LFS_TGT/lib",
+  "--prefix=/usr",
+  "--with-glibc-version=2.39",
+  "--with-sysroot=${LFS}",
+  "--enable-languages=c,c++",
+  "--disable-bootstrap",
+  "--disable-multilib",
+  "--enable-shared",
+  "--enable-threads=posix",
+  "--enable-__cxa_atexit",
+  "--with-system-zlib"
+]
+make = ["make"]
+install = ["make DESTDIR=${LFS} install"]
+strip = true
+
+[post]
+run = [
+  "ln -svf gcc ${LFS}/usr/bin/cc",
+  "echo 'Verificando toolchain specs...'",
+  "echo 'Checking that the correct specs file is in place:'",
+  "echo '--- gcc -dumpmachine ---'",
+  "gcc -dumpmachine || true",
+  "echo '--- specs sanity check ---'",
+  "echo 'Sanity check complete.'"
+]
+
+[check]
+verify_binaries = true
+verify_links = true
+run_tests = false
+
+[sandbox]
+enabled = true
+backend = "bwrap"
+network = false
+bind_rw = ["/tmp", "/var/tmp"]
+
+[metadata]
+tags = ["toolchain", "gcc", "lfs", "pass2"]
+estimated_build_time = "90m"
