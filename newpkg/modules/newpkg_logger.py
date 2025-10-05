@@ -1,356 +1,267 @@
 #!/usr/bin/env python3
+# newpkg_logger.py
 """
-newpkg_logger.py
+newpkg_logger.py — unified structured logger for newpkg
 
-Structured logger for Newpkg with:
- - human-readable colored text output by default
- - optional JSON output if config requests it (logging.format = "json")
- - integration with newpkg_db (record_phase / record_hook)
- - context manager for hierarchical context
- - perf_timer decorator
- - from_config() helper to create logger from ConfigStore
- - as_handler() to return a logging.Handler
+Features (revised):
+ - Reads settings from config: output.json, output.color, output.quiet, logging.debug
+ - Structured JSON and color console output
+ - Safe file logging via RotatingFileHandler (5 MB, 3 backups)
+ - Integrates with newpkg_db (records phases, hooks, perf_timer metrics)
+ - Provides decorator @perf_timer for timing critical functions
+ - Thread-safe, context-aware, human-readable or JSON modes
+ - Automatic suppression of console output when quiet=True
 """
+
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
 import sys
 import time
-from contextlib import contextmanager
+import traceback
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional
 
-# optional color support
+# color support
 try:
-    import colorama
-
-    colorama.init()
+    from colorama import Fore, Style, init as colorama_init
+    colorama_init()
     _HAS_COLOR = True
 except Exception:
     _HAS_COLOR = False
 
-# ANSI fallback colors (if colorama not present, terminals usually support ANSI)
-ANSI = {
-    "reset": "\033[0m",
-    "red": "\033[31m",
-    "green": "\033[32m",
-    "yellow": "\033[33m",
-    "blue": "\033[34m",
-    "magenta": "\033[35m",
-    "cyan": "\033[36m",
-    "bold": "\033[1m",
-}
+# project integration
+try:
+    from newpkg_config import init_config
+except Exception:
+    init_config = None
+
+try:
+    from newpkg_db import NewpkgDB
+except Exception:
+    NewpkgDB = None
 
 
-def _color(text: str, color: str) -> str:
+# ----------------- utility helpers -----------------
+def _shorten(s: str, width: int = 120) -> str:
+    """Truncate long text safely for console readability."""
+    if len(s) <= width:
+        return s
+    return s[:width - 3] + "..."
+
+
+def _color_for_level(level: str) -> str:
+    """Return color code for given log level."""
     if not _HAS_COLOR:
-        # still attempt ANSI; many terminals support it
-        code = ANSI.get(color, "")
-        reset = ANSI["reset"] if code else ""
-        return f"{code}{text}{reset}"
-    # colorama present: use same ANSI sequences (colorama handles them)
-    code = ANSI.get(color, "")
-    reset = ANSI["reset"]
-    return f"{code}{text}{reset}"
+        return ""
+    return {
+        "DEBUG": Fore.CYAN,
+        "INFO": Fore.GREEN,
+        "WARNING": Fore.YELLOW,
+        "ERROR": Fore.RED,
+        "CRITICAL": Fore.MAGENTA,
+    }.get(level.upper(), "")
 
 
+def _reset_color() -> str:
+    return Style.RESET_ALL if _HAS_COLOR else ""
+
+
+# ----------------- main logger -----------------
 class NewpkgLogger:
-    """
-    Lightweight logger wrapper.
+    def __init__(self, cfg: Any = None, db: Any = None):
+        self.cfg = cfg or (init_config() if init_config else None)
+        self.db = db or (NewpkgDB(self.cfg) if NewpkgDB and self.cfg else None)
 
-    Usage:
-        logger = NewpkgLogger.from_config(cfg, db)
-        logger.info("starting build", pkg="gcc")
-        with logger.context("build", pkg="gcc"):
-            ...
-        @logger.perf_timer("build")
-        def build_pkg(...):
-            ...
-    """
+        # config-based settings
+        self.json_mode = bool(self._cfg_get("output.json", False))
+        self.color_mode = bool(self._cfg_get("output.color", True))
+        self.quiet_mode = bool(self._cfg_get("output.quiet", False))
+        self.debug_mode = bool(self._cfg_get("logging.debug", False))
+        self.log_path = self._cfg_get("logging.file", "/var/log/newpkg.log")
 
-    def __init__(
-        self,
-        name: str = "newpkg",
-        cfg: Any = None,
-        db: Any = None,
-        log_dir: Optional[str] = None,
-        log_file: Optional[str] = None,
-        level: str = "INFO",
-    ):
-        self.name = name
-        self.cfg = cfg
-        self.db = db
-        self._context: list[str] = []
+        self.logger = logging.getLogger("newpkg")
+        self.logger.setLevel(logging.DEBUG if self.debug_mode else logging.INFO)
+
+        # setup handlers
+        self.logger.handlers.clear()
+        self._setup_handlers()
+
+        # runtime context for structured logs
+        self._context: Dict[str, Any] = {}
         self._extra: Dict[str, Any] = {}
-        self._perf_timers: Dict[str, float] = {}
 
-        # resolve logging configuration from cfg if provided
-        log_dir_conf = None
-        log_file_conf = None
-        level_conf = None
-        fmt_conf = None
+    # ------------- configuration helpers -------------
+    def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
-            if cfg:
-                try:
-                    # prefer get_path helper if available
-                    if hasattr(cfg, "get_path"):
-                        p = cfg.get_path("logging.log_dir")
-                        if p:
-                            log_dir_conf = str(p)
-                    else:
-                        log_dir_conf = cfg.get("logging.log_dir")
-                except Exception:
-                    log_dir_conf = None
-                try:
-                    log_file_conf = cfg.get("logging.log_file")
-                except Exception:
-                    log_file_conf = None
-                try:
-                    level_conf = cfg.get("logging.level")
-                except Exception:
-                    level_conf = None
-                try:
-                    fmt_conf = cfg.get("logging.format")
-                except Exception:
-                    fmt_conf = None
+            if self.cfg and hasattr(self.cfg, "get"):
+                v = self.cfg.get(key)
+                if v is not None:
+                    return v
+        except Exception:
+            pass
+        return os.environ.get(key.upper().replace(".", "_"), default)
+
+    def _setup_handlers(self):
+        """Configure console + rotating file handlers based on config."""
+        # file handler
+        try:
+            log_dir = os.path.dirname(self.log_path)
+            if log_dir and not os.path.exists(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
+            fh = RotatingFileHandler(self.log_path, maxBytes=5 * 1024 * 1024, backupCount=3, delay=True)
+            fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            self.logger.addHandler(fh)
         except Exception:
             pass
 
-        self.log_dir = log_dir or log_dir_conf or "./logs"
-        self.log_file = log_file or log_file_conf or "newpkg.log"
-        self.level = level_conf or level
-        self.format = (fmt_conf or "text").lower()  # 'text' or 'json'
-
-        # ensure dir exists
-        try:
-            os.makedirs(self.log_dir, exist_ok=True)
-        except Exception:
-            pass
-
-        # underlying stdlib logger
-        self._logger = logging.getLogger(self.name)
-        self._logger.setLevel(getattr(logging, self.level.upper(), logging.INFO))
-        # avoid duplicate handlers if multiple instantiations
-        if not self._logger.handlers:
-            fh = RotatingFileHandler(
-                os.path.join(self.log_dir, self.log_file), maxBytes=10 * 1024 * 1024, backupCount=5
-            )
-            fh.setLevel(getattr(logging, self.level.upper(), logging.INFO))
-            # file always JSON for easy parsing
-            fh.setFormatter(logging.Formatter("%(message)s"))
-            self._logger.addHandler(fh)
-
-        # console handler (human readable by default)
-        ch = logging.StreamHandler(sys.stderr)
-        ch.setLevel(getattr(logging, self.level.upper(), logging.INFO))
-        if self.format == "json":
+        # console handler (disabled if quiet)
+        if not self.quiet_mode:
+            ch = logging.StreamHandler(sys.stdout)
             ch.setFormatter(logging.Formatter("%(message)s"))
-        else:
-            ch.setFormatter(logging.Formatter("%(message)s"))
-        # attach only one console handler
-        if not any(isinstance(h, logging.StreamHandler) for h in self._logger.handlers):
-            self._logger.addHandler(ch)
+            self.logger.addHandler(ch)
 
-        # simple startup log
-        self.info("logger.started", message=f"Logger started (level={self.level}, dir={self.log_dir})")
-
-    # ---------------- convenience constructors ----------------
-    @classmethod
-    def from_config(cls, cfg: Any = None, db: Any = None, name: str = "newpkg") -> "NewpkgLogger":
-        log_dir = None
-        log_file = None
-        level = "INFO"
-        try:
-            if cfg:
-                log_dir = cfg.get("logging.log_dir") if hasattr(cfg, "get") else None
-                log_file = cfg.get("logging.log_file") if hasattr(cfg, "get") else None
-                level = cfg.get("logging.level") or level
-        except Exception:
-            pass
-        return cls(name=name, cfg=cfg, db=db, log_dir=log_dir, log_file=log_file, level=level)
-
-    def as_handler(self) -> logging.Handler:
-        """
-        Return a stdlib logging.Handler that forwards records through this logger.
-        Useful to attach to other modules.
-        """
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setLevel(self._logger.level)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        return handler
-
-    # ---------------- context management ----------------
-    @contextmanager
-    def context(self, ctx: str, **metadata):
-        """
-        Push a context string and optional metadata for the duration of a 'with' block.
-        """
-        self._context.append(ctx)
-        saved_extra = dict(self._extra)
-        try:
-            # merge metadata
-            self._extra.update(metadata)
-            yield
-        finally:
-            # restore
-            self._extra = saved_extra
-            if self._context:
-                self._context.pop()
-
-    def context_str(self) -> str:
-        return "/".join(self._context) if self._context else ""
-
-    # ---------------- core logging helpers ----------------
-    def _emit(self, level: str, event: str, message: Optional[str] = None, **meta):
-        now = datetime.utcnow().isoformat() + "Z"
-        full_meta = dict(self._extra)
-        full_meta.update(meta or {})
+    # ------------- structured logging core -------------
+    def _emit(self, level: str, event: str, msg: str = "", **meta):
+        timestamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
         record = {
-            "timestamp": now,
-            "level": level,
+            "logger": "newpkg",
+            "time": timestamp,
+            "level": level.upper(),
             "event": event,
-            "message": message or "",
-            "context": self.context_str(),
-            "meta": full_meta,
+            "message": msg,
+            **self._context,
+            **self._extra,
+            "meta": meta,
         }
 
-        # write to file as JSON (file handler expects plain message)
-        try:
-            # send JSON to file handler via standard logger (the file handler records %(message)s)
-            file_msg = json.dumps(record, ensure_ascii=False)
-            for h in self._logger.handlers:
-                if isinstance(h, RotatingFileHandler):
-                    h.emit(logging.LogRecord(self.name, logging.INFO, "", 0, file_msg, None, None))
-        except Exception:
-            # fallback to raw logging
+        if self.json_mode:
+            self.logger.log(getattr(logging, level.upper(), logging.INFO), json.dumps(record))
+        else:
+            color_prefix = _color_for_level(level) if self.color_mode else ""
+            reset = _reset_color() if self.color_mode else ""
+            context_str = self.context_str()
+            msg_line = f"{color_prefix}[{level}] {event}{reset}: {_shorten(msg)}"
+            if context_str:
+                msg_line += f" {context_str}"
+            self.logger.log(getattr(logging, level.upper(), logging.INFO), msg_line)
+
+        # also record DB phase when applicable
+        if self.db and hasattr(self.db, "record_phase"):
             try:
-                self._logger.info(json.dumps(record))
+                self.db.record_phase(
+                    package=meta.get("package") or self._context.get("package", "global"),
+                    phase=event,
+                    status=level.lower(),
+                    meta=meta or {},
+                )
             except Exception:
                 pass
 
-        # console: text or JSON
-        if self.format == "json":
-            console_msg = json.dumps(record, ensure_ascii=False)
-            print(console_msg, file=sys.stderr)
-        else:
-            # human readable with colors
-            lvl_color = "green" if level == "INFO" else "yellow" if level == "WARNING" else "red"
-            ctx = f"[{self.context_str()}] " if self.context_str() else ""
-            meta_str = " ".join(f"{k}={v}" for k, v in (full_meta or {}).items())
-            human = f"{_color(now, 'cyan')} {_color(level, lvl_color)} {_color(event, 'blue')} {ctx}{message or ''}"
-            if meta_str:
-                human = f"{human} {_color(meta_str, 'magenta')}"
-            print(human, file=sys.stderr)
+    # ------------- public logging API -------------
+    def debug(self, event: str, msg: str = "", **meta): self._emit("DEBUG", event, msg, **meta)
+    def info(self, event: str, msg: str = "", **meta): self._emit("INFO", event, msg, **meta)
+    def warning(self, event: str, msg: str = "", **meta): self._emit("WARNING", event, msg, **meta)
+    def error(self, event: str, msg: str = "", **meta): self._emit("ERROR", event, msg, **meta)
+    def critical(self, event: str, msg: str = "", **meta): self._emit("CRITICAL", event, msg, **meta)
 
-        # DB integration: try to record phase/hook as appropriate (best-effort)
-        try:
-            if self.db:
-                # if event starts with "hook:" treat as hook, else as phase
-                if event.startswith("hook:"):
-                    hook_name = event.split("hook:", 1)[1] or "unknown"
-                    try:
-                        if hasattr(self.db, "record_hook"):
-                            self.db.record_hook(full_meta.get("pkg") or full_meta.get("package") or "unknown", hook_name, level)
-                        else:
-                            # fallback to add_log
-                            self.db.add_log(full_meta.get("pkg") or full_meta.get("package") or "unknown", f"hook:{hook_name}", level)
-                    except Exception:
-                        pass
-                else:
-                    # treat as phase
-                    try:
-                        if hasattr(self.db, "record_phase"):
-                            self.db.record_phase(full_meta.get("pkg") or full_meta.get("package") or "unknown", event, level, log_path=full_meta.get("log_path"))
-                        else:
-                            self.db.add_log(full_meta.get("pkg") or full_meta.get("package") or "unknown", event, level, full_meta.get("log_path"))
-                    except Exception:
-                        pass
-        except Exception:
-            # never let logging error break the program
-            pass
+    # ------------- context management -------------
+    def set_context(self, **ctx):
+        """Set persistent context for all subsequent logs."""
+        self._context.update(ctx)
 
-    # Public convenience methods
-    def info(self, event: str, message: Optional[str] = None, **meta):
-        self._emit("INFO", event, message, **meta)
+    def clear_context(self):
+        self._context.clear()
 
-    def warning(self, event: str, message: Optional[str] = None, **meta):
-        self._emit("WARNING", event, message, **meta)
+    def context_str(self) -> str:
+        if not self._context:
+            return ""
+        return "[" + " ".join(f"{k}={v}" for k, v in self._context.items()) + "]"
 
-    def error(self, event: str, message: Optional[str] = None, **meta):
-        self._emit("ERROR", event, message, **meta)
-
-    def debug(self, event: str, message: Optional[str] = None, **meta):
-        # respect configured level
-        if self._logger.level <= logging.DEBUG:
-            self._emit("DEBUG", event, message, **meta)
-
-    # ---------------- perf timer decorator ----------------
-    def perf_timer(self, name: str = "perf"):
+    # ------------- decorators -------------
+    def perf_timer(self, event: Optional[str] = None) -> Callable:
         """
-        Decorator to measure execution time of a function and emit a log event with duration.
+        Decorator to measure performance of a function.
+        Logs duration in seconds; records in DB if available.
         """
-
-        def deco(func):
-            def wrapper(*args, **kwargs):
-                start = time.time()
+        def wrapper(fn: Callable):
+            @functools.wraps(fn)
+            def inner(*args, **kwargs):
+                name = event or fn.__name__
+                start = time.perf_counter()
+                self.info(f"{name}.start", f"Starting {fn.__name__}")
                 try:
-                    res = func(*args, **kwargs)
-                    ok = True
-                    return res
+                    result = fn(*args, **kwargs)
+                    duration = time.perf_counter() - start
+                    self.info(f"{name}.done", f"{fn.__name__} completed in {duration:.3f}s", duration=duration)
+                    # register in DB as perf metric
+                    if self.db and hasattr(self.db, "record_phase"):
+                        try:
+                            self.db.record_phase(
+                                package=self._context.get("package", "global"),
+                                phase=f"perf:{fn.__name__}",
+                                status="ok",
+                                meta={"duration": duration},
+                            )
+                        except Exception:
+                            pass
+                    return result
                 except Exception as e:
-                    ok = False
+                    duration = time.perf_counter() - start
+                    tb = traceback.format_exc(limit=5)
+                    self.error(f"{name}.fail", f"{fn.__name__} failed after {duration:.3f}s: {e}", traceback=tb)
+                    if self.db and hasattr(self.db, "record_phase"):
+                        try:
+                            self.db.record_phase(
+                                package=self._context.get("package", "global"),
+                                phase=f"perf:{fn.__name__}",
+                                status="error",
+                                meta={"error": str(e), "trace": tb},
+                            )
+                        except Exception:
+                            pass
                     raise
-                finally:
-                    end = time.time()
-                    dur = end - start
-                    self._emit("INFO", f"{name}.elapsed", f"duration={dur:.3f}s", duration=dur, ok=ok, func=getattr(func, "__name__", str(func)))
-            return wrapper
+            return inner
+        return wrapper
 
-        return deco
+    # ------------- hook / phase recorders -------------
+    def record_hook(self, name: str, phase: str, status: str = "ok", **meta):
+        """Record hook execution status into DB."""
+        self.info(f"hook.{name}", f"Hook {name} ({phase}) status={status}")
+        if self.db and hasattr(self.db, "record_phase"):
+            try:
+                self.db.record_phase(package="global", phase=f"hook:{name}", status=status, meta=meta)
+            except Exception:
+                pass
 
-    # ---------------- helper to set extra metadata (like current package) ----------------
-    def set_extra(self, **kw):
-        self._extra.update(kw)
+    # ------------- class constructors -------------
+    @classmethod
+    def from_config(cls, cfg: Any = None, db: Any = None) -> "NewpkgLogger":
+        return cls(cfg=cfg or (init_config() if init_config else None), db=db)
 
-    def clear_extra(self):
-        self._extra = {}
+    @classmethod
+    def as_handler(cls, cfg: Any = None, db: Any = None) -> logging.Logger:
+        """Return configured python logger instance."""
+        inst = cls.from_config(cfg, db)
+        return inst.logger
 
-    # ---------------- small convenience to create a stdlib logger wrapper ---------------
-    def get_stdlib_logger(self) -> logging.Logger:
-        return self._logger
 
-
-# If this module is run directly, show a small demo
+# ----------------- example main -----------------
 if __name__ == "__main__":
-    # quick demo
-    cfg = None
-    try:
-        from newpkg_config import init_config
+    cfg = init_config() if init_config else None
+    log = NewpkgLogger(cfg)
+    log.set_context(package="demo", phase="init")
 
-        cfg = init_config()
-    except Exception:
-        cfg = None
+    log.info("startup", "Logger initialized and ready.")
+    @log.perf_timer("test")
+    def demo_task():
+        time.sleep(0.3)
+        return "ok"
 
-    try:
-        from newpkg_db import NewpkgDB
-
-        db = NewpkgDB(cfg)
-        db.init_db()
-    except Exception:
-        db = None
-
-    logger = NewpkgLogger.from_config(cfg, db)
-    logger.info("demo.start", "Starting demo", pkg="demo")
-    with logger.context("demo", pkg="demo"):
-        logger.info("demo.step", "Doing step 1")
-        @logger.perf_timer("demo.work")
-        def work(n):
-            s = 0
-            for i in range(n):
-                s += i
-            return s
-        work(100000)
-        logger.info("demo.end", "Demo finished")
+    demo_task()
+    log.record_hook("configure", "pre", status="ok")
+    log.error("demo.fail", "Simulated error for test.")
