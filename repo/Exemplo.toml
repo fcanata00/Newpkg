@@ -1,0 +1,219 @@
+########################################################################
+# EXAMPLE FULL METAFILE TEMPLATE
+# This file demonstrates all fields and features supported by newpkg_metafile.py
+########################################################################
+
+[package]
+name = "example"
+version = "1.0.0"
+category = "utils"
+description = "An example package demonstrating all newpkg metafile fields"
+license = "MIT"
+homepage = "https://example.org"
+maintainer = "Example Maintainer <maintainer@example.org>"
+depends = ["libfoo", "libbar >=1.2.0", "zlib"]
+runtime_depends = ["libbar", "glibc"]
+optional_depends = ["bash-completion", "man-db"]
+build_type = "gnu"
+strip = true
+multi_build = false
+profile = "system"
+arch = "x86_64"
+
+########################################################################
+# MULTI-SOURCE DOWNLOAD EXAMPLE
+########################################################################
+[source]
+urls = [
+  "https://example.org/src/example-1.0.0.tar.xz",
+  "https://mirror.example.org/example-1.0.0.tar.xz"
+]
+sha256 = {
+  "example-1.0.0.tar.xz" = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+}
+verify_gpg = true
+gpg_key = "0x12345678ABCDEF00"
+resume_supported = true
+
+[source]
+type = "git"
+repo = "https://github.com/example/project.git"
+branch = "main"
+tag = "v1.2.0"
+commit = "abc123def4567890abcdef"
+depth = 1
+shallow = true
+submodules = true
+clone_dir = "project-src"
+
+# Extra downloads (auxiliary files, docs, assets)
+[[extra_sources]]
+url = "https://example.org/assets/example-docs.tar.xz"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+optional = true
+
+[[extra_sources]]
+url = "https://example.org/patches/fix-syntax.diff"
+sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+optional = false
+
+########################################################################
+# PATCHES
+########################################################################
+[[patches]]
+file = "example-1.0.0-buildfix.patch"
+description = "Fixes build on newer glibc"
+apply_order = 1
+
+[[patches]]
+url = "https://patches.example.org/security/example-CVE-2025-1001.patch"
+description = "Security fix for CVE-2025-1001"
+apply_order = 2
+
+########################################################################
+# ENVIRONMENT VARIABLES
+########################################################################
+[environment]
+LANG = "C.UTF-8"
+LC_ALL = "C.UTF-8"
+CFLAGS = "-O2 -pipe"
+CXXFLAGS = "-O2 -pipe"
+MAKEFLAGS = "-j${jobs}"
+DESTDIR = "${destdir:-/var/tmp/newpkg/destdir}"
+PATH = "/usr/local/bin:/usr/bin:/bin"
+PKG_CONFIG_PATH = "/usr/lib/pkgconfig"
+CUSTOM_FLAG = "example_value"
+
+########################################################################
+# BUILD SECTION (AUTOTOOLS EXAMPLE)
+########################################################################
+[build]
+system = "autotools"
+workdir = "build"
+configure = [
+  "../configure",
+  "--prefix=/usr",
+  "--sysconfdir=/etc",
+  "--disable-static",
+  "--enable-shared"
+]
+make = ["make"]
+check = ["make -k check"]
+install = ["make install"]
+strip = true
+
+########################################################################
+# BUILD SECTION (ALTERNATIVE MESON EXAMPLE)
+########################################################################
+[build.meson]
+system = "meson"
+builddir = "build-meson"
+configure = [
+  "meson setup build-meson --prefix=/usr --buildtype=release"
+]
+make = ["ninja -C build-meson"]
+install = ["ninja -C build-meson install"]
+
+########################################################################
+# PRE-BUILD AND POST-INSTALL HOOKS
+########################################################################
+[hooks]
+# Hooks are executed automatically if hooks.enabled = true in config
+pre_configure = ["echo 'Running pre-configure hook'"]
+post_configure = ["echo 'Post-configure tasks done'"]
+pre_build = ["echo 'Starting build process...'"]
+post_build = ["echo 'Build completed successfully'"]
+pre_install = ["echo 'Preparing install'"]
+post_install = [
+  "echo 'Installation finished!'",
+  "install -Dm644 LICENSE ${DESTDIR}/usr/share/licenses/${name}/LICENSE"
+]
+pre_remove = ["echo 'Pre-remove hook executed'"]
+post_remove = ["echo 'Post-remove hook executed'"]
+
+########################################################################
+# POST-INSTALL ACTIONS
+########################################################################
+[post]
+run = [
+  "install -Dm755 examples/example.sh /usr/bin/example",
+  "ln -svf example /usr/bin/example-cli"
+]
+cleanup = [
+  "rm -rf ${DESTDIR}/usr/share/doc/${name}"
+]
+
+########################################################################
+# SANDBOX SETTINGS
+########################################################################
+[sandbox]
+enabled = true
+backend = "bwrap"
+network = false
+fakeroot = true
+bind_ro = ["/usr", "/lib", "/etc"]
+bind_rw = ["/tmp", "/var/tmp", "${BUILD_ROOT}"]
+
+########################################################################
+# CHECKS AND VALIDATION
+########################################################################
+[check]
+verify_binaries = true
+verify_links = true
+verify_checksums = true
+run_tests = true
+max_failures = 5
+test_command = "make -k check"
+
+########################################################################
+# AUDIT AND SECURITY POLICY
+########################################################################
+[audit]
+auto_scan = true
+auto_fix = false
+min_severity = 5.0
+notify_email = "security@example.org"
+tags = ["security", "stable"]
+
+########################################################################
+# PACKAGE OUTPUT
+########################################################################
+[package_output]
+format = "tar.xz"
+compress_level = 19
+include_docs = true
+include_dev = true
+manifest = true
+
+########################################################################
+# CUSTOM COMMANDS / EXTENDED PHASES
+########################################################################
+[custom]
+pre_extract = ["echo 'Custom step before extraction'"]
+post_strip = ["echo 'Performing custom cleanup after strip'"]
+
+########################################################################
+# BUILD PROFILES (OPTIONAL)
+########################################################################
+[profiles.system]
+inherit = true
+CFLAGS = "-O2 -pipe -march=native"
+
+[profiles.debug]
+inherit = true
+CFLAGS = "-O0 -g -DDEBUG"
+strip = false
+
+[profiles.minimal]
+inherit = false
+configure = ["./configure --prefix=/usr --disable-shared"]
+strip = true
+install = ["make install DESTDIR=${destdir}"]
+
+########################################################################
+# METADATA
+########################################################################
+[metadata]
+tags = ["example", "demo", "documentation"]
+estimated_build_time = "5m"
+maintainer_notes = "This metafile demonstrates all supported features."
