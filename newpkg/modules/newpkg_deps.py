@@ -1,39 +1,36 @@
 #!/usr/bin/env python3
+# newpkg_deps.py
 """
-newpkg_deps.py
+newpkg_deps.py — resolver e gerenciar dependências para newpkg
 
-Dependency resolver and graph utilities for Newpkg.
-
-Features:
- - resolve(pkg, dep_type='all') -> ordered list (basic topological like DFS)
- - check_missing(pkg) -> list of missing deps
- - parse_depfile(pkg_dir) -> read metafile (toml/json/yaml) to extract declared deps (best-effort)
- - get_reverse_deps(pkg) -> list packages that depend on pkg (uses DB if available)
- - cache results to .newpkg/deps_cache.json with TTL
- - export graph to JSON or DOT
- - install_missing -> best-effort delegate to newpkg_core/newpkg_upgrade or log actions
- - integrated with ConfigStore, NewpkgLogger, NewpkgDB
+Principais funcionalidades:
+ - resolve dependências (build/runtime/optional separados)
+ - detecta dependências faltantes
+ - exporta grafo (JSON e opcional DOT text)
+ - encontra reverse-deps
+ - tenta "install_missing" via newpkg_core / newpkg_upgrade quando disponível (dry-run padrão)
+ - cache com TTL e relatório em /var/log/newpkg/deps/
+ - integra com newpkg_config, newpkg_logger, newpkg_db, newpkg_sandbox
+ - paralelo controlado por config (dep.parallel_jobs)
 """
 
 from __future__ import annotations
 
 import json
 import os
-import time
 import shutil
-import threading
-import concurrent.futures
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-# Try to import init_config / ConfigStore
+# Optional integrations
 try:
-    from newpkg_config import init_config, ConfigManager
+    from newpkg_config import init_config
 except Exception:
     init_config = None
-    ConfigManager = None
 
-# Try to import logger & db
 try:
     from newpkg_logger import NewpkgLogger
 except Exception:
@@ -44,61 +41,83 @@ try:
 except Exception:
     NewpkgDB = None
 
-# Optional parsers
 try:
-    import tomllib as _toml  # py3.11+
+    from newpkg_sandbox import NewpkgSandbox
 except Exception:
-    try:
-        import tomli as _toml  # type: ignore
-    except Exception:
-        _toml = None
+    NewpkgSandbox = None
 
-try:
-    import yaml
-    _HAS_YAML = True
-except Exception:
-    yaml = None
-    _HAS_YAML = False
-
-# constants
-CACHE_DIR = Path(".newpkg")
-CACHE_FILE = CACHE_DIR / "deps_cache.json"
-DEFAULT_CACHE_TTL = 60 * 60 * 24  # 24h
+# fallback logger
+import logging
+_logger = logging.getLogger("newpkg.deps")
+if not _logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[%(levelname)s] newpkg.deps: %(message)s"))
+    _logger.addHandler(h)
+_logger.setLevel(logging.INFO)
 
 
-class DepsError(Exception):
-    pass
+@dataclass
+class ResolveResult:
+    package: str
+    dep_type: str
+    resolved: Dict[str, List[str]]  # {'build': [...], 'runtime': [...], 'optional': [...]}
+    cycles: List[List[str]]
+    timestamp: float
+
+    def to_dict(self):
+        return asdict(self)
 
 
 class NewpkgDeps:
+    DEFAULT_REPORT_DIR = "/var/log/newpkg/deps"
+    CACHE_FILE = ".newpkg/deps_cache.json"
+
     def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None):
-        """
-        cfg: optional ConfigStore or dict-like
-        logger: NewpkgLogger-like
-        db: NewpkgDB-like
-        """
-        self.cfg = cfg
-        self.logger = logger or (NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None)
-        self.db = db or (NewpkgDB(cfg) if NewpkgDB and cfg is not None else None)
+        self.cfg = cfg or (init_config() if init_config else None)
 
-        # config defaults (prefer lowercase hierarchical keys)
-        self.cache_path = Path(self._cfg_get("deps.cache_path", str(CACHE_FILE)))
-        self.cache_ttl = int(self._cfg_get("deps.cache_ttl", os.environ.get("NEWPKG_DEPS_CACHE_TTL", DEFAULT_CACHE_TTL)))
-        self.graph_format = self._cfg_get("deps.graph_format", "json")
-        self.resolve_depth = int(self._cfg_get("deps.resolve_depth", self._cfg_get("DEPS_RESOLVE_DEPTH", 0)))  # 0 = unlimited
-        self.parallel = bool(self._cfg_get("deps.parallel", False))
+        # logger
+        if logger:
+            self.logger = logger
+        else:
+            try:
+                self.logger = NewpkgLogger.from_config(self.cfg, db) if NewpkgLogger and self.cfg else None
+            except Exception:
+                self.logger = None
 
-        # internal caches
-        self._mem_cache: Dict[str, Dict[str, Any]] = {}
-        self._cache_lock = threading.Lock()
-        # ensure cache dir exists
+        # db
+        self.db = db or (NewpkgDB(self.cfg) if NewpkgDB and self.cfg else None)
+
+        # sandbox (for optional operations)
         try:
-            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self.sandbox = NewpkgSandbox(cfg=self.cfg, logger=self.logger, db=self.db) if NewpkgSandbox and self.cfg else None
         except Exception:
-            pass
-        self._load_cache()
+            self.sandbox = None
 
-    # ---------------- config helper ----------------
+        # config-driven flags
+        self.dry_run = bool(self._cfg_get("general.dry_run", False))
+        self.quiet = bool(self._cfg_get("output.quiet", False))
+        self.json_out = bool(self._cfg_get("output.json", False))
+
+        # cache & reports
+        self.cache_file = Path(self._cfg_get("deps.cache_file", self.CACHE_FILE))
+        if self.cache_file.parent:
+            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+        self.cache_ttl = int(self._cfg_get("deps.cache_ttl_seconds", 3600))  # default 1h
+
+        # parallel jobs
+        cpu = os.cpu_count() or 1
+        default_jobs = int(self._cfg_get("deps.parallel_jobs", min(4, cpu)))
+        self.parallel_jobs = max(1, min(default_jobs, cpu))
+
+        # reports dir
+        self.report_dir = Path(self._cfg_get("deps.report_dir", self.DEFAULT_REPORT_DIR))
+        self.report_dir.mkdir(parents=True, exist_ok=True)
+
+        # internal
+        self._log = self._make_logger()
+        # try to obtain perf_timer decorator if available
+        self._perf_timer = getattr(self.logger, "perf_timer", None) if self.logger else None
+
     def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
             if self.cfg and hasattr(self.cfg, "get"):
@@ -107,462 +126,408 @@ class NewpkgDeps:
                     return v
         except Exception:
             pass
-        # legacy env fallback
-        ek = key.upper().replace(".", "_")
-        return os.environ.get(ek, default)
+        env_key = key.upper().replace(".", "_")
+        return os.environ.get(env_key, default)
 
-    # ---------------- logging helper ----------------
-    def _log(self, level: str, event: str, message: str = "", **meta):
-        if self.logger:
+    def _make_logger(self):
+        def _fn(level: str, event: str, msg: str = "", **meta):
             try:
-                fn = getattr(self.logger, level.lower(), None)
-                if fn:
-                    fn(event, message, **meta)
-                    return
-            except Exception:
-                pass
-        # fallback
-        print(f"[{level}] {event}: {message}")
-
-    # ---------------- cache management ----------------
-    def _load_cache(self):
-        with self._cache_lock:
-            try:
-                if not self.cache_path.exists():
-                    self._mem_cache = {}
-                    return
-                raw = json.loads(self.cache_path.read_text(encoding="utf-8"))
-                # verify structure: {pkg: {ts:..., data:...}}
-                self._mem_cache = raw or {}
-            except Exception:
-                self._mem_cache = {}
-
-    def _save_cache(self):
-        with self._cache_lock:
-            try:
-                tmp = self.cache_path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(self._mem_cache, indent=2), encoding="utf-8")
-                tmp.replace(self.cache_path)
-            except Exception:
-                pass
-
-    def _cache_get(self, key: str) -> Optional[Any]:
-        with self._cache_lock:
-            entry = self._mem_cache.get(key)
-            if not entry:
-                return None
-            ts = entry.get("ts", 0)
-            if self.cache_ttl and (time.time() - ts) > self.cache_ttl:
-                # stale
-                self._mem_cache.pop(key, None)
-                return None
-            return entry.get("data")
-
-    def _cache_set(self, key: str, data: Any):
-        with self._cache_lock:
-            self._mem_cache[key] = {"ts": time.time(), "data": data}
-            # persist async-ish
-            try:
-                self._save_cache()
-            except Exception:
-                pass
-
-    # ---------------- parsing manifest / metafile ----------------
-    def parse_depfile(self, pkg_dir: str) -> Dict[str, List[str]]:
-        """
-        Best-effort parse of local metafile to extract declared dependencies.
-        Supports: newpkg.toml, package.toml, package.json, deps.json, deps.yaml.
-        Returns dict: {'build':[], 'runtime':[], 'optional':[]}
-        """
-        p = Path(pkg_dir)
-        candidates = [
-            p / "newpkg.toml",
-            p / "package.toml",
-            p / "package.json",
-            p / "deps.json",
-            p / "deps.yaml",
-            p / "deps.yml",
-        ]
-        res = {"build": [], "runtime": [], "optional": []}
-        for c in candidates:
-            if not c.exists():
-                continue
-            try:
-                raw = c.read_bytes()
-                if c.suffix in (".toml", ".tml") and _toml:
-                    doc = _toml.loads(raw.decode("utf-8"))
-                elif c.suffix in (".yaml", ".yml") and _HAS_YAML:
-                    doc = yaml.safe_load(raw.decode("utf-8"))
-                else:
-                    doc = json.loads(raw.decode("utf-8"))
-                # try common keys
-                for key in ("deps", "dependencies", "requires"):
-                    if key in doc:
-                        deps = doc.get(key) or {}
-                        # doc may be mapping or list
-                        if isinstance(deps, dict):
-                            for k, v in deps.items():
-                                # attempt classify: if v contains 'build' or 'runtime' keyword
-                                if isinstance(v, dict) and v.get("type") == "build":
-                                    res["build"].append(k)
-                                elif isinstance(v, dict) and v.get("optional"):
-                                    res["optional"].append(k)
-                                else:
-                                    res["runtime"].append(k)
-                        elif isinstance(deps, list):
-                            for d in deps:
-                                if isinstance(d, str):
-                                    res["runtime"].append(d)
-                        break
-                # some toml formats may contain [build-deps], [runtime-deps]
-                for section, outk in (("build-deps", "build"), ("runtime-deps", "runtime"), ("optional-deps", "optional")):
-                    if section in doc:
-                        val = doc.get(section)
-                        if isinstance(val, dict):
-                            res[outk].extend(list(val.keys()))
-                        elif isinstance(val, list):
-                            res[outk].extend(val)
-                # dedupe
-                for k in res:
-                    res[k] = sorted(list(set(res[k])))
-                return res
-            except Exception as e:
-                self._log("warning", "deps.parse_fail", f"Failed to parse {c}: {e}", file=str(c))
-                continue
-        return res
-
-    # ---------------- core resolution ----------------
-    def resolve(self, pkg: str, dep_type: str = "all", include_optional: bool = False, depth: int = 0) -> List[str]:
-        """
-        Resolve dependencies for a package name or a local path.
-        - dep_type: 'all', 'build', 'runtime'
-        - include_optional: include optional deps
-        - returns ordered list of dependencies (naive DFS, duplicates removed preserving order)
-        Uses DB when available; otherwise parse local metafile (if pkg path exists).
-        """
-        cache_key = f"resolve:{pkg}:{dep_type}:{include_optional}:{self.resolve_depth}"
-        cached = self._cache_get(cache_key)
-        if cached:
-            self._log("debug", "deps.cache_hit", f"Cache hit for {pkg}", package=pkg)
-            return list(cached)
-
-        resolved_order: List[str] = []
-        seen: Set[str] = set()
-
-        def _add(dep_name: str):
-            if dep_name in seen:
-                return
-            seen.add(dep_name)
-            resolved_order.append(dep_name)
-
-        # use DB if possible
-        if self.db:
-            try:
-                # try db.get_deps which may return dicts or strings
-                deps_list = self.db.get_deps(pkg)
-                # normalize into list of names
-                normalized = []
-                for d in deps_list or []:
-                    if isinstance(d, dict):
-                        name = d.get("dep_name") or d.get("name") or d.get("package")
-                        dtype = d.get("dep_type") or "runtime"
-                    else:
-                        name = d
-                        dtype = "runtime"
-                    if not name:
-                        continue
-                    if dep_type == "all" or dtype == dep_type:
-                        normalized.append((name, dtype))
-                # recursively resolve
-                def _dfs(name, curdepth=0):
-                    if self.resolve_depth and curdepth > self.resolve_depth:
+                if self.logger:
+                    fn = getattr(self.logger, level.lower(), None)
+                    if fn:
+                        fn(event, msg, **meta)
                         return
-                    # fetch deps of name from DB
-                    try:
-                        child_deps = self.db.get_deps(name)
-                    except Exception:
-                        child_deps = []
-                    for cd in child_deps or []:
-                        if isinstance(cd, dict):
-                            cname = cd.get("dep_name") or cd.get("name")
-                            ctype = cd.get("dep_type") or "runtime"
-                        else:
-                            cname = cd
-                            ctype = "runtime"
-                        if not cname:
-                            continue
-                        if dep_type != "all" and ctype != dep_type:
-                            continue
-                        _dfs(cname, curdepth + 1)
-                        _add(cname)
-                # seed
-                for name, dtype in normalized:
-                    _dfs(name)
-                    _add(name)
-            except Exception as e:
-                self._log("warning", "deps.db_resolve_fail", f"DB resolve failed for {pkg}: {e}", package=pkg)
-
-        # if pkg is a path or DB failed, try parse local
-        p = Path(pkg)
-        if (not self.db) or p.exists():
-            parsed = self.parse_depfile(pkg) if p.exists() else {}
-            items = []
-            if dep_type in ("all", "build"):
-                items.extend(parsed.get("build", []))
-            if dep_type in ("all", "runtime"):
-                items.extend(parsed.get("runtime", []))
-            if include_optional:
-                items.extend(parsed.get("optional", []))
-            # recursively resolve parsed items (best-effort without DB)
-            def _dfs_local(name, curdepth=0):
-                if self.resolve_depth and curdepth > self.resolve_depth:
-                    return
-                # attempt to find local dir under ./packages/<name> or ./sources/<name>
-                candidates = [Path("packages") / name, Path("sources") / name, Path(name)]
-                for cand in candidates:
-                    if cand.exists() and cand.is_dir():
-                        sub = self.parse_depfile(str(cand))
-                        for subn in (sub.get("runtime", []) + sub.get("build", []) + (sub.get("optional", []) if include_optional else [])):
-                            _dfs_local(subn, curdepth + 1)
-                            _add(subn)
-                # if not found locally, nothing more to do
-            for it in items:
-                _dfs_local(it)
-                _add(it)
-
-        # final dedupe & preserve order is done via seen/resolved_order
-        self._cache_set(cache_key, resolved_order)
-        self._log("info", "deps.resolve", f"Resolved {len(resolved_order)} deps for {pkg}", package=pkg, deps=len(resolved_order))
-        return resolved_order
-
-    def check_missing(self, pkg: str, dep_type: str = "all", include_optional: bool = False) -> List[str]:
-        """
-        Return list of dependency names that are referenced but not present in DB or local packages.
-        """
-        resolved = self.resolve(pkg, dep_type=dep_type, include_optional=include_optional)
-        missing = []
-        # build map of known packages (DB preferred)
-        known: Set[str] = set()
-        if self.db:
-            try:
-                pkgs = self.db.list_packages()
-                known.update([p["name"] for p in pkgs])
-            except Exception:
-                known = set()
-        # local packages
-        for d in Path(".").iterdir():
-            if d.is_dir():
-                known.add(d.name)
-        for r in resolved:
-            if r not in known:
-                missing.append(r)
-        self._log("info", "deps.check_missing", f"{len(missing)} missing deps for {pkg}", package=pkg, missing=len(missing))
-        return sorted(list(set(missing)))
-
-    # ---------------- reverse deps ----------------
-    def get_reverse_deps(self, pkg: str) -> List[str]:
-        """
-        Return list of packages that depend on `pkg`.
-        Uses DB if available, else does a brute-force scan through known packages.
-        """
-        if self.db and hasattr(self.db, "get_reverse_deps"):
-            try:
-                return self.db.get_reverse_deps(pkg)
             except Exception:
                 pass
-        # brute force: scan packages and see who contains pkg in resolved deps
-        result = []
+            getattr(_logger, level.lower(), _logger.info)(f"{event}: {msg} - {meta}")
+        return _fn
+
+    # ----------------- caching helpers -----------------
+    def _cache_load(self) -> Dict[str, Any]:
+        if not self.cache_file.exists():
+            return {}
         try:
-            pkgs = [d.name for d in Path("packages").iterdir() if d.is_dir()] if Path("packages").exists() else []
-            # also include DB packages names if present
-            if self.db:
-                try:
-                    db_pkgs = self.db.list_packages()
-                    pkgs += [p["name"] for p in db_pkgs]
-                except Exception:
-                    pass
-            pkgs = sorted(set(pkgs))
-            # optionally parallelize
-            if self.parallel:
-                with concurrent.futures.ThreadPoolExecutor() as ex:
-                    futs = {ex.submit(self.resolve, p, "all", True): p for p in pkgs}
-                    for fut in concurrent.futures.as_completed(futs):
-                        p = futs[fut]
-                        try:
-                            deps = fut.result()
-                            if pkg in deps:
-                                result.append(p)
-                        except Exception:
-                            continue
-            else:
-                for p in pkgs:
-                    try:
-                        deps = self.resolve(p, "all", True)
-                        if pkg in deps:
-                            result.append(p)
-                    except Exception:
-                        continue
+            text = self.cache_file.read_text(encoding="utf-8")
+            data = json.loads(text)
+            # expire old entries
+            now = time.time()
+            out = {}
+            for k, v in data.items():
+                ts = v.get("ts", 0)
+                if (now - ts) <= self.cache_ttl:
+                    out[k] = v
+            return out
+        except Exception:
+            return {}
+
+    def _cache_save(self, data: Dict[str, Any]):
+        try:
+            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+            self.cache_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
             pass
-        return sorted(result)
 
-    # ---------------- graph export ----------------
-    def graph(self, pkg: str, dep_type: str = "all", include_optional: bool = False, fmt: Optional[str] = None, out: Optional[str] = None) -> str:
+    # ----------------- resolver -----------------
+    def resolve(self, package: str, dep_type: str = "all", use_cache: bool = True) -> ResolveResult:
+        """
+        Resolve dependencies for a package.
+        dep_type: 'build', 'runtime', 'optional' or 'all'
+        Returns ResolveResult with lists of package names and cycles detected.
+        """
+        start = time.time()
+        cache = self._cache_load() if use_cache else {}
+        cache_key = f"{package}::{dep_type}"
+        if use_cache and cache_key in cache:
+            entry = cache[cache_key]
+            self._log("info", "deps.resolve.cache", f"Using cache for {package}", package=package, dep_type=dep_type)
+            # register phase
+            try:
+                if self.db and hasattr(self.db, "record_phase"):
+                    self.db.record_phase(package=package, phase="deps.resolve", status="ok", meta={"from_cache": True})
+            except Exception:
+                pass
+            return ResolveResult(package=package, dep_type=dep_type, resolved=entry.get("resolved", {}), cycles=entry.get("cycles", []), timestamp=entry.get("ts", time.time()))
+
+        # use DB to walk dependencies
+        if not self.db:
+            self._log("warning", "deps.resolve.no_db", "No DB available; cannot resolve dependencies accurately", package=package)
+            return ResolveResult(package=package, dep_type=dep_type, resolved={"build": [], "runtime": [], "optional": []}, cycles=[], timestamp=time.time())
+
+        resolved = {"build": [], "runtime": [], "optional": []}
+        visited: Set[str] = set()
+        stack: List[str] = []
+        cycles: List[List[str]] = []
+
+        def walk(pkg: str, dtype: str):
+            if pkg in stack:
+                # cycle detected
+                idx = stack.index(pkg)
+                cycles.append(stack[idx:] + [pkg])
+                return
+            if pkg in visited:
+                return
+            visited.add(pkg)
+            stack.append(pkg)
+            # fetch deps from DB
+            try:
+                deps = self.db.get_deps(pkg) or []
+            except Exception:
+                deps = []
+            for d in deps:
+                dep_name = d.get("dep")
+                dep_t = d.get("type", "runtime")
+                # normalize types
+                if dep_t not in ("build", "runtime", "optional"):
+                    dep_t = "runtime"
+                # respect requested dep_type
+                if dep_type == "all" or dep_type == dep_t or (dep_type == "build" and dep_t == "build") or (dep_type == "runtime" and dep_t == "runtime"):
+                    if dep_t not in resolved:
+                        resolved[dep_t] = []
+                    if dep_name not in resolved[dep_t]:
+                        resolved[dep_t].append(dep_name)
+                # always continue walking to collect deeper deps
+                walk(dep_name, dep_t)
+            stack.pop()
+
+        walk(package, dep_type)
+        # dedupe and flatten
+        for k in resolved:
+            # preserve order but ensure unique
+            seen = set()
+            ordered = []
+            for x in resolved[k]:
+                if x not in seen:
+                    seen.add(x)
+                    ordered.append(x)
+            resolved[k] = ordered
+
+        res = ResolveResult(package=package, dep_type=dep_type, resolved=resolved, cycles=cycles, timestamp=time.time())
+
+        # cache result
+        try:
+            cache[cache_key] = {"resolved": resolved, "cycles": cycles, "ts": res.timestamp}
+            self._cache_save(cache)
+        except Exception:
+            pass
+
+        # record phase and duration
+        duration = time.time() - start
+        self._log("info", "deps.resolve.ok", f"Resolved deps for {package} in {duration:.2f}s", package=package, dep_type=dep_type, cycles=len(cycles))
+        try:
+            if self.db and hasattr(self.db, "record_phase"):
+                self.db.record_phase(package=package, phase="deps.resolve", status="ok", meta={"duration": duration, "cycles": len(cycles)})
+        except Exception:
+            pass
+
+        return res
+
+    # ----------------- check missing -----------------
+    def check_missing(self, package: str, dep_type: str = "all") -> Dict[str, Any]:
+        """
+        Check which resolved dependencies are missing (not present in DB packages).
+        Returns dict {missing: [...], present: [...]}.
+        """
+        start = time.time()
+        res = self.resolve(package, dep_type=dep_type, use_cache=True)
+        missing = []
+        present = []
+        # list available packages
+        try:
+            db_pkgs = {p["name"] for p in (self.db.list_packages() if self.db else [])}
+        except Exception:
+            db_pkgs = set()
+
+        for t, lst in res.resolved.items():
+            for dep in lst:
+                if dep not in db_pkgs:
+                    missing.append({"name": dep, "type": t})
+                else:
+                    present.append({"name": dep, "type": t})
+
+        duration = time.time() - start
+        self._log("info", "deps.missing", f"Missing check for {package}: {len(missing)} missing", package=package, missing=len(missing), duration=duration)
+        try:
+            if self.db and hasattr(self.db, "record_phase"):
+                self.db.record_phase(package=package, phase="deps.check_missing", status="ok", meta={"missing": len(missing)})
+        except Exception:
+            pass
+
+        return {"package": package, "missing": missing, "present": present, "duration": duration}
+
+    # ----------------- reverse deps -----------------
+    def reverse(self, package: str) -> List[str]:
+        """
+        Return list of packages that depend on the given package (reverse deps).
+        """
+        out = []
+        if not self.db:
+            return out
+        try:
+            pkgs = self.db.list_packages()
+            for p in pkgs:
+                name = p.get("name")
+                deps = self.db.get_deps(name) or []
+                for d in deps:
+                    if d.get("dep") == package:
+                        out.append(name)
+                        break
+        except Exception:
+            pass
+        self._log("info", "deps.reverse", f"Found {len(out)} reverse deps for {package}", package=package, count=len(out))
+        try:
+            if self.db and hasattr(self.db, "record_phase"):
+                self.db.record_phase(package=package, phase="deps.reverse", status="ok", meta={"count": len(out)})
+        except Exception:
+            pass
+        return out
+
+    # ----------------- graph export -----------------
+    def graph(self, package: str, dep_type: str = "all", format: str = "json", dest: Optional[str] = None) -> Dict[str, Any]:
         """
         Export dependency graph for a package.
-        fmt: 'json' or 'dot' (graphviz). Defaults to self.graph_format or 'json'.
-        If out specified, write to file and return path; otherwise return content string.
+        format: 'json' (structured) or 'dot' (Graphviz plain text)
+        dest: optional path to write the output; if None writes to report_dir and returns path
         """
-        fmt = (fmt or self.graph_format or "json").lower()
-        deps = self.resolve(pkg, dep_type=dep_type, include_optional=include_optional)
-        # build adjacency (simple)
-        adj = {}
-        for d in deps:
-            try:
-                children = self.resolve(d, dep_type=dep_type, include_optional=include_optional)
-            except Exception:
-                children = []
-            adj[d] = children
-
-        if fmt == "dot":
+        start = time.time()
+        res = self.resolve(package, dep_type=dep_type, use_cache=True)
+        graph_obj = {"package": package, "dep_type": dep_type, "resolved": res.resolved, "cycles": res.cycles, "ts": res.timestamp}
+        output_text = ""
+        if format == "json":
+            output_text = json.dumps(graph_obj, indent=2)
+        elif format == "dot":
+            # produce a small DOT graph
             lines = ["digraph deps {"]
-            lines.append('  node [shape=box];')
-            for k, vals in adj.items():
-                kq = k.replace("-", "_")
-                if not vals:
-                    lines.append(f'  "{kq}";')
-                for v in vals:
-                    vq = v.replace("-", "_")
-                    lines.append(f'  "{kq}" -> "{vq}";')
+            # add edges
+            for t, lst in res.resolved.items():
+                for dep in lst:
+                    lines.append(f'  "{package}" -> "{dep}" [label="{t}"];')
+            # add cycles
+            for c in res.cycles:
+                for i in range(len(c) - 1):
+                    lines.append(f'  "{c[i]}" -> "{c[i+1]}" [style=dashed];')
             lines.append("}")
-            content = "\n".join(lines)
+            output_text = "\n".join(lines)
         else:
-            content = json.dumps({"package": pkg, "graph": adj}, indent=2)
-        if out:
-            p = Path(out)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content, encoding="utf-8")
-            self._log("info", "deps.graph.export", f"Wrote graph to {out}", path=str(p))
-            return str(p)
-        return content
+            raise ValueError("unsupported format")
 
-    # ---------------- mutate DB helpers ----------------
-    def add_dep(self, package_name: str, dep_name: str, dep_type: str = "runtime") -> bool:
-        """
-        Add a dependency to DB (if DB present) and update cache.
-        """
+        # write to dest or report dir
+        ts = int(time.time())
+        filename = f"{package.replace('/', '_')}-deps-{dep_type}-{ts}.{('json' if format=='json' else 'dot')}"
+        target = Path(dest) if dest else (self.report_dir / filename)
         try:
-            if self.db and hasattr(self.db, "add_dep"):
-                self.db.add_dep(package_name, dep_name, dep_type)
-                # invalidate cache for the package
-                self._cache_set(f"resolve:{package_name}:all:False:{self.resolve_depth}", None)
-                self._log("info", "deps.add", f"Added dep {dep_name} to {package_name}", package=package_name, dep=dep_name)
-                return True
+            target.write_text(output_text, encoding="utf-8")
+            self._log("info", "deps.graph.write", f"Wrote graph to {target}", path=str(target))
+            if self.db and hasattr(self.db, "record_phase"):
+                self.db.record_phase(package=package, phase="deps.graph", status="ok", meta={"format": format, "path": str(target)})
         except Exception as e:
-            self._log("error", "deps.add_fail", f"Failed to add dep: {e}", package=package_name, dep=dep_name)
-        return False
+            self._log("error", "deps.graph.fail", f"Failed to write graph: {e}", error=str(e))
+            return {"ok": False, "error": str(e)}
+        duration = time.time() - start
+        return {"ok": True, "path": str(target), "duration": duration}
 
-    def remove_dep(self, package_name: str, dep_name: str) -> bool:
+    # ----------------- install missing -----------------
+    def install_missing(self, package: str, dep_type: str = "all", confirm: bool = False, jobs: Optional[int] = None) -> Dict[str, Any]:
         """
-        Remove a dependency (if DB exposes such). Also updates cache.
+        Try to install missing dependencies. By default runs in dry-run mode (no changes).
+        confirm: must be True to actually attempt real installation (unless self.dry_run False).
+        This method will try to call newpkg_upgrade.NewpkgUpgrade.rebuild(pkg) or fallback to logging.
         """
-        try:
-            if self.db and hasattr(self.db, "remove_dep"):
-                self.db.remove_dep(package_name, dep_name)
-                self._cache_set(f"resolve:{package_name}:all:False:{self.resolve_depth}", None)
-                self._log("info", "deps.remove", f"Removed dep {dep_name} from {package_name}", package=package_name, dep=dep_name)
-                return True
-        except Exception as e:
-            self._log("error", "deps.remove_fail", f"Failed to remove dep: {e}", package=package_name, dep=dep_name)
-        return False
+        start = time.time()
+        missing_info = self.check_missing(package, dep_type=dep_type)
+        missing = [m["name"] for m in missing_info["missing"]]
 
-    # ---------------- install missing (best-effort) ----------------
-    def install_missing(self, pkg: str, dep_type: str = "all", include_optional: bool = False, dry_run: bool = True) -> Dict[str, Any]:
-        """
-        Try to install missing dependencies:
-         - first attempt: delegate to newpkg_upgrade.NewpkgUpgrade.rebuild or .install_missing if available
-         - fallback: log and return list for manual action
-        """
-        missing = self.check_missing(pkg, dep_type=dep_type, include_optional=include_optional)
-        res = {"package": pkg, "missing": missing, "attempts": [], "dry_run": dry_run}
         if not missing:
-            return res
-        if dry_run:
-            self._log("info", "deps.install_missing.dry", f"Dry-run: would install {len(missing)} missing deps for {pkg}", package=pkg, missing=len(missing))
-            return res
+            return {"ok": True, "installed": [], "skipped": 0, "duration": time.time() - start}
 
-        # try to call newpkg_upgrade if available
+        if self.dry_run:
+            self._log("info", "deps.install.dryrun", f"Dry-run: would install {len(missing)} packages", package=package, missing=missing)
+            return {"ok": True, "installed": [], "skipped": len(missing), "duration": time.time() - start, "dry_run": True}
+
+        if not confirm and self._cfg_get("deps.require_confirm", True):
+            self._log("warning", "deps.install.no_confirm", "Installing missing packages requires explicit confirm=True")
+            return {"ok": False, "error": "no_confirm", "missing": missing}
+
+        # try to import and use NewpkgUpgrade if available
         try:
-            import importlib
+            from newpkg_upgrade import NewpkgUpgrade  # type: ignore
+            upgr = NewpkgUpgrade(cfg=self.cfg, logger=self.logger, db=self.db)
+        except Exception:
+            upgr = None
 
-            mod = importlib.import_module("newpkg_upgrade")
-            if hasattr(mod, "NewpkgUpgrade"):
-                upgr = mod.NewpkgUpgrade(self.cfg, logger=self.logger, db=self.db)
-                for dep in missing:
+        jobs = jobs or self.parallel_jobs
+        installed = []
+        skipped = []
+
+        def worker(pkgname: str) -> Tuple[str, bool, Optional[str]]:
+            # attempts to install/rebuild pkgname; return (pkgname, ok_bool, message)
+            try:
+                if upgr and hasattr(upgr, "rebuild"):
+                    self._log("info", "deps.install.call", f"Attempting rebuild via NewpkgUpgrade for {pkgname}", package=pkgname)
+                    ok = False
                     try:
-                        r = upgr.install(dep)
-                        res["attempts"].append({dep: "ok"})
-                        self._log("info", "deps.install_missing.ok", f"Installed {dep} via newpkg_upgrade", dep=dep)
+                        r = upgr.rebuild(pkgname)
+                        ok = bool(r)
                     except Exception as e:
-                        res["attempts"].append({dep: f"error: {e}"})
-                        self._log("error", "deps.install_missing.fail", f"Failed to install {dep}: {e}", dep=dep)
-                return res
+                        return (pkgname, False, f"rebuild exception: {e}")
+                    return (pkgname, ok, None if ok else "rebuild failed")
+                else:
+                    # fallback: log and skip (could call distro package manager if desired)
+                    return (pkgname, False, "no upgrade handler")
+            except Exception as e:
+                return (pkgname, False, f"exception: {e}")
+
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            futures = {ex.submit(worker, pkgname): pkgname for pkgname in missing}
+            for fut in as_completed(futures):
+                pkgname = futures[fut]
+                try:
+                    name, ok, msg = fut.result()
+                except Exception as e:
+                    name, ok, msg = pkgname, False, f"exception: {e}"
+                if ok:
+                    installed.append(name)
+                else:
+                    skipped.append({"name": name, "reason": msg})
+
+        duration = time.time() - start
+        self._log("info", "deps.install.done", f"Install_missing finished: installed={len(installed)} skipped={len(skipped)}", installed=len(installed), skipped=len(skipped), duration=duration)
+        try:
+            if self.db and hasattr(self.db, "record_phase"):
+                self.db.record_phase(package=package, phase="deps.install_missing", status="ok" if not skipped else "partial", meta={"installed": len(installed), "skipped": len(skipped)})
         except Exception:
             pass
 
-        # fallback: log what to do
-        self._log("warning", "deps.install_missing.manual", f"No installer available; missing deps for {pkg}: {missing}", package=pkg, missing=list(missing))
-        res["note"] = "no-installer"
-        return res
+        return {"ok": True, "installed": installed, "skipped": skipped, "duration": duration}
 
-    # ---------------- CLI convenience ----------------
-    @classmethod
-    def cli_main(cls, argv: Optional[List[str]] = None):
+    # ----------------- CLI -----------------
+    @staticmethod
+    def cli():
         import argparse
-        import sys
+        p = argparse.ArgumentParser(prog="newpkg-deps", description="Dependency resolver for newpkg")
+        p.add_argument("package", help="package name to inspect")
+        p.add_argument("--resolve", action="store_true", help="resolve dependencies")
+        p.add_argument("--missing", action="store_true", help="check missing dependencies")
+        p.add_argument("--graph", metavar="FORMAT", choices=["json", "dot"], help="export graph to report dir (json|dot)")
+        p.add_argument("--reverse", action="store_true", help="show reverse deps")
+        p.add_argument("--install-missing", action="store_true", help="attempt to install missing deps (requires --confirm)")
+        p.add_argument("--confirm", action="store_true", help="confirm install actions")
+        p.add_argument("--jobs", type=int, help="parallel jobs override")
+        p.add_argument("--json", action="store_true", help="print JSON output")
+        p.add_argument("--quiet", action="store_true", help="quiet mode")
+        p.add_argument("--no-cache", action="store_true", help="disable cache for resolve")
+        args = p.parse_args()
 
-        p = argparse.ArgumentParser(prog="newpkg-deps", description="newpkg dependency tools")
-        p.add_argument("cmd", choices=["resolve", "missing", "graph", "reverse"], help="subcommand")
-        p.add_argument("target", help="package name or directory")
-        p.add_argument("--type", choices=["all", "build", "runtime"], default="all")
-        p.add_argument("--optional", action="store_true")
-        p.add_argument("--out", help="output file (for graph)")
-        p.add_argument("--format", choices=["json", "dot"], help="graph format")
-        args = p.parse_args(argv)
+        cfg = init_config() if init_config else None
+        logger = NewpkgLogger.from_config(cfg, NewpkgDB(cfg)) if NewpkgLogger and cfg else None
+        db = NewpkgDB(cfg) if NewpkgDB and cfg else None
+        nd = NewpkgDeps(cfg=cfg, logger=logger, db=db)
 
-        cfg = None
-        if init_config:
-            try:
-                cfg = init_config()
-            except Exception:
-                cfg = None
+        if args.quiet:
+            nd.quiet = True
+        if args.json:
+            nd.json_out = True
+        if args.jobs:
+            nd.parallel_jobs = args.jobs
 
-        db = NewpkgDB(cfg) if NewpkgDB and cfg is not None else None
-        logger = NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None
-        deps = cls(cfg=cfg, logger=logger, db=db)
-
-        if args.cmd == "resolve":
-            out = deps.resolve(args.target, dep_type=args.type, include_optional=args.optional)
-            print(json.dumps(out, indent=2))
-            return 0
-        if args.cmd == "missing":
-            out = deps.check_missing(args.target, dep_type=args.type, include_optional=args.optional)
-            print(json.dumps(out, indent=2))
-            return 0
-        if args.cmd == "graph":
-            content = deps.graph(args.target, dep_type=args.type, include_optional=args.optional, fmt=args.format, out=args.out)
-            if args.out:
-                print(f"Wrote to {content}")
+        out = {}
+        if args.resolve:
+            res = nd.resolve(args.package, dep_type="all", use_cache=not args.no_cache)
+            out = res.to_dict()
+            if nd.json_out or args.json:
+                print(json.dumps(out, indent=2))
             else:
-                print(content)
-            return 0
-        if args.cmd == "reverse":
-            out = deps.get_reverse_deps(args.target)
-            print(json.dumps(out, indent=2))
-            return 0
-        return 1
+                print(f"Resolved for {args.package}:")
+                for t, lst in out["resolved"].items():
+                    print(f"  {t}: {', '.join(lst) if lst else '<none>'}")
+                if out["cycles"]:
+                    print("  Cycles detected:")
+                    for c in out["cycles"]:
+                        print("   - " + " -> ".join(c))
+        if args.missing:
+            res = nd.check_missing(args.package)
+            out = res
+            if nd.json_out or args.json:
+                print(json.dumps(out, indent=2))
+            else:
+                print(f"Missing for {args.package}:")
+                for m in res["missing"]:
+                    print(f"  - {m['name']} ({m['type']})")
+        if args.graph:
+            res = nd.graph(args.package, dep_type="all", format=args.graph)
+            out = res
+            if nd.json_out or args.json:
+                print(json.dumps(out, indent=2))
+            else:
+                print(f"Graph written to {res.get('path')}")
+        if args.reverse:
+            r = nd.reverse(args.package)
+            out = {"reverse": r}
+            if nd.json_out or args.json:
+                print(json.dumps(out, indent=2))
+            else:
+                print(f"Reverse deps for {args.package}: {', '.join(r) if r else '<none>'}")
+        if args.install_missing:
+            res = nd.install_missing(args.package, confirm=args.confirm, jobs=args.jobs)
+            out = res
+            if nd.json_out or args.json:
+                print(json.dumps(out, indent=2))
+            else:
+                print("Install missing result:")
+                print(res)
+
+        # write a small last-run report
+        try:
+            if out:
+                rpt = Path(nd.report_dir) / f"{args.package}-deps-last.json"
+                rpt.write_text(json.dumps(out, indent=2), encoding="utf-8")
+                nd._log("info", "deps.report.write", f"Wrote report {rpt}", path=str(rpt))
+        except Exception:
+            pass
+
+    # expose CLI convenience
+    run_cli = cli
 
 
-# If executed as script
+# If executed directly
 if __name__ == "__main__":
-    NewpkgDeps.cli_main()
+    NewpkgDeps.cli()
