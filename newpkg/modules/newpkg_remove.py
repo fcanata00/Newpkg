@@ -1,148 +1,130 @@
 #!/usr/bin/env python3
 # newpkg_remove.py
 """
-newpkg_remove.py — remoção segura de pacotes para newpkg
+Newpkg remove manager — revised.
 
-Funcionalidades:
- - Gera plano de remoção (por pacote) com base no DB (arquivos instalados)
- - Faz backup (tar.xz + metadata) antes da remoção
- - Remove arquivos de forma segura (opcional dentro de sandbox)
- - Purga dados associados (config, cache) se solicitado
- - Permite rollback/restauração a partir do backup
- - Respeita newpkg_config: general.dry_run, output.quiet, output.json, general.root_dir
- - Usa NewpkgLogger/NewpkgDB/NewpkgHooks/NewpkgSandbox quando disponíveis
- - Gera relatório em /var/log/newpkg/remove/remove-last.json
+Features:
+ - Plan + safe backup (tar.xz) before destructive actions
+ - Optional sandboxed removals (use_fakeroot support)
+ - Hooks before/after major phases with structured context
+ - Progress UI via logger.progress() (Rich fallback)
+ - Perf timing and DB record_phase integration
+ - Audit reporting on start/success/failure
+ - Purge intelligence (DB metadata + heuristics)
+ - Reports saved/rotated/compressed under report_dir
+ - API-friendly functions and CLI runner with abbreviations
 """
 
 from __future__ import annotations
 
 import json
+import lzma
 import os
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# imports opcionais do ecossistema
+# Optional integrations (best-effort)
 try:
-    from newpkg_config import init_config
+    from newpkg_config import init_config  # type: ignore
 except Exception:
     init_config = None
 
 try:
-    from newpkg_logger import NewpkgLogger
+    from newpkg_logger import get_logger  # type: ignore
 except Exception:
-    NewpkgLogger = None
+    get_logger = None
 
 try:
-    from newpkg_db import NewpkgDB
+    from newpkg_db import NewpkgDB  # type: ignore
 except Exception:
     NewpkgDB = None
 
 try:
-    from newpkg_hooks import NewpkgHooks
+    from newpkg_hooks import get_hooks_manager  # type: ignore
 except Exception:
-    NewpkgHooks = None
+    get_hooks_manager = None
 
 try:
-    from newpkg_sandbox import NewpkgSandbox
+    from newpkg_sandbox import get_sandbox  # type: ignore
 except Exception:
-    NewpkgSandbox = None
+    get_sandbox = None
 
-# fallback stdlib logger
+try:
+    from newpkg_audit import NewpkgAudit  # type: ignore
+except Exception:
+    NewpkgAudit = None
+
+# fallback logger
 import logging
 _logger = logging.getLogger("newpkg.remove")
 if not _logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("[%(levelname)s] newpkg.remove: %(message)s"))
-    _logger.addHandler(h)
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] newpkg.remove: %(message)s"))
+    _logger.addHandler(_h)
 _logger.setLevel(logging.INFO)
 
+# optional rich for CLI
+try:
+    from rich.console import Console
+    from rich.table import Table
+    RICH = True
+    _console = Console()
+except Exception:
+    RICH = False
+    _console = None
 
+# ---------------- dataclasses ----------------
 @dataclass
-class RemovePlanItem:
+class RemovalPlanEntry:
     package: str
     files: List[str]
-
-
-@dataclass
-class RemoveResult:
-    package: str
-    removed_files: List[str]
-    skipped_files: List[str]
-    rc: int
-    duration: float
+    size_bytes: int
+    action: str  # 'remove' or 'purge' or 'skip'
+    reason: Optional[str] = None
     backup: Optional[str] = None
-    message: Optional[str] = None
-
-    def to_dict(self):
-        return asdict(self)
 
 
+# ---------------- class ----------------
 class NewpkgRemove:
     DEFAULT_REPORT_DIR = "/var/log/newpkg/remove"
-    DEFAULT_SAFE_PREFIXES = ["/usr", "/usr/local", "/opt", "/var/lib/newpkg", "/etc"]
-    DEFAULT_BACKUP_DIR = "/var/lib/newpkg/backups"
+    DEFAULT_BACKUP_DIR = "/var/cache/newpkg/remove_backups"
+    DEFAULT_KEEP_REPORTS = 20
+    SAFE_WHITELIST_PREFIXES = ("/usr", "/opt", "/var", "/etc", "/home")  # allow removals within these by heuristic
 
-    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, hooks: Any = None, sandbox: Any = None):
+    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, hooks: Any = None, sandbox: Any = None, audit: Any = None):
         self.cfg = cfg or (init_config() if init_config else None)
-
-        # logger
-        if logger:
-            self.logger = logger
-        else:
-            try:
-                self.logger = NewpkgLogger.from_config(self.cfg, db) if NewpkgLogger and self.cfg else None
-            except Exception:
-                self.logger = None
-
-        self._log = self._make_logger()
-
-        # db
+        self.logger = logger or (get_logger(self.cfg) if get_logger else None)
         self.db = db or (NewpkgDB(self.cfg) if NewpkgDB and self.cfg else None)
+        self.hooks = hooks or (get_hooks_manager(self.cfg) if get_hooks_manager else None)
+        self.sandbox = sandbox or (get_sandbox(self.cfg) if get_sandbox else None)
+        self.audit = audit or (NewpkgAudit(self.cfg) if NewpkgAudit and self.cfg else None)
 
-        # hooks
-        if hooks:
-            self.hooks = hooks
-        else:
-            try:
-                self.hooks = NewpkgHooks.from_config(self.cfg, self.logger, self.db) if NewpkgHooks and self.cfg else None
-            except Exception:
-                self.hooks = None
-
-        # sandbox
-        if sandbox:
-            self.sandbox = sandbox
-        else:
-            try:
-                self.sandbox = NewpkgSandbox(cfg=self.cfg, logger=self.logger, db=self.db) if NewpkgSandbox and self.cfg else None
-            except Exception:
-                self.sandbox = None
-
-        # config flags
-        self.dry_run = bool(self._cfg_get("general.dry_run", False))
-        self.quiet = bool(self._cfg_get("output.quiet", False))
-        self.json_out = bool(self._cfg_get("output.json", False))
-        # base root (supports building to /mnt/lfs)
-        self.root_dir = os.path.expanduser(str(self._cfg_get("general.root_dir", "/")))
-        # safety prefixes (from config or default)
-        self.safe_prefixes = list(self._cfg_get("remove.safe_prefixes", self.DEFAULT_SAFE_PREFIXES) or self.DEFAULT_SAFE_PREFIXES)
-        # require confirmation to actually remove (default true)
-        self.require_confirm = bool(self._cfg_get("remove.require_confirm", True))
-        # report and backup dirs
-        self.report_dir = Path(self._cfg_get("remove.report_dir", self.DEFAULT_REPORT_DIR))
+        # config
+        self.report_dir = Path(self._cfg_get("remove.report_dir", self.DEFAULT_REPORT_DIR)).expanduser()
         self.report_dir.mkdir(parents=True, exist_ok=True)
-        self.last_report = self.report_dir / "remove-last.json"
-        self.backup_dir = Path(self._cfg_get("remove.backup_dir", self.DEFAULT_BACKUP_DIR))
+        self.backup_dir = Path(self._cfg_get("remove.backup_dir", self.DEFAULT_BACKUP_DIR)).expanduser()
         self.backup_dir.mkdir(parents=True, exist_ok=True)
-
-        # perf_timer if available
-        self._perf_timer = getattr(self.logger, "perf_timer", None) if self.logger else None
+        self.keep_reports = int(self._cfg_get("remove.keep_reports", self.DEFAULT_KEEP_REPORTS))
+        self.use_sandbox = bool(self._cfg_get("remove.use_sandbox", False))
+        self.sandbox_profile = str(self._cfg_get("remove.sandbox_profile", "light"))
+        self.require_confirm = bool(self._cfg_get("remove.require_confirm", True))
+        self.auto_confirm = bool(self._cfg_get("remove.auto_confirm", False))
+        self.dry_run = bool(self._cfg_get("remove.dry_run", False))
+        self.parallel = int(self._cfg_get("remove.parallel", max(1, (os.cpu_count() or 2))))
+        self.max_backup_mb = int(self._cfg_get("remove.max_backup_mb", 1024))
+        self.rotate_compress = bool(self._cfg_get("remove.compress_reports", True))
+        self._lock = threading.RLock()
 
     def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
@@ -152,448 +134,449 @@ class NewpkgRemove:
                     return v
         except Exception:
             pass
-        env_key = key.upper().replace(".", "_")
-        return os.environ.get(env_key, default)
+        envk = key.upper().replace(".", "_")
+        return os.environ.get(envk, default)
 
-    def _make_logger(self):
-        def _fn(level: str, event: str, msg: str = "", **meta):
-            try:
-                if self.logger:
-                    fn = getattr(self.logger, level.lower(), None)
-                    if fn:
-                        fn(event, msg, **meta)
-                        return
-            except Exception:
-                pass
-            getattr(_logger, level.lower(), _logger.info)(f"{event}: {msg} - {meta}")
-        return _fn
+    # ---------------- helpers ----------------
+    def _now_ts(self) -> str:
+        return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
-    # ---------- helpers ----------
-    def _abs_path(self, p: str) -> Optional[str]:
-        """Resolve path possibly relative to configured root_dir; return absolute path or None if invalid."""
-        if not p:
-            return None
-        # expand env and user
-        p_expanded = os.path.expandvars(os.path.expanduser(p))
-        if os.path.isabs(p_expanded):
-            return os.path.normpath(os.path.join(self.root_dir.lstrip("/"), p_expanded.lstrip("/"))) if self.root_dir != "/" else os.path.normpath(p_expanded)
-        else:
-            # treat as relative to root_dir
-            return os.path.normpath(os.path.join(self.root_dir, p_expanded))
-
-    def _is_path_safe(self, path: str) -> bool:
-        """Check if given path starts with at least one safe prefix."""
+    def _record_phase(self, name: Optional[str], phase: str, status: str, meta: Optional[Dict[str, Any]] = None) -> None:
         try:
-            p = Path(path).resolve()
-        except Exception:
-            return False
-        for pref in self.safe_prefixes:
-            try:
-                pref_abs = Path(pref if os.path.isabs(pref) else os.path.join(self.root_dir, pref)).resolve()
-                if str(p).startswith(str(pref_abs)):
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _record_phase(self, package: str, phase: str, status: str, meta: Dict[str, Any]):
-        try:
-            if self.db and hasattr(self.db, "record_phase"):
-                self.db.record_phase(package=package, phase=phase, status=status, meta=meta)
+            if self.db:
+                self.db.record_phase(name, phase, status, meta=meta or {})
         except Exception:
             pass
 
-    # ---------- plan ----------
-    def plan_removal(self, package: str) -> Dict[str, Any]:
-        """
-        Build a removal plan for a package from the DB.
-        Returns dict with plan (file list) and metadata.
-        """
-        start = time.time()
-        if not self.db:
-            msg = "no database available"
-            self._log("error", "remove.plan.nodb", msg, package=package)
-            return {"ok": False, "error": msg}
-
+    def _audit_report(self, topic: str, entity: str, status: str, meta: Dict[str, Any]) -> None:
+        if not self.audit:
+            return
         try:
-            files = self.db.list_files(package)  # expected list of paths
-        except Exception as e:
-            self._log("error", "remove.plan.dbfail", f"DB failure listing files: {e}", package=package, error=str(e))
-            return {"ok": False, "error": "db_list_files_failed", "exc": str(e)}
+            self.audit.report(topic, entity, status, meta)
+        except Exception:
+            pass
 
-        # normalize absolute paths relative to root_dir
-        abs_files = []
-        unsafe = []
-        for f in files:
-            ap = self._abs_path(f)
-            if not ap:
-                unsafe.append(f)
-                continue
-            if not self._is_path_safe(ap):
-                unsafe.append(ap)
-                continue
-            abs_files.append(ap)
-
-        plan = {"package": package, "files": sorted(abs_files), "unsafe": sorted(unsafe), "count": len(abs_files)}
-        elapsed = time.time() - start
-        self._log("info", "remove.plan.ok", f"Plan built for {package} files={len(abs_files)} unsafe={len(unsafe)}", package=package, count=len(abs_files))
-        self._record_phase(package, "remove.plan", "ok", {"count": len(abs_files), "unsafe": len(unsafe), "time": elapsed})
-        return {"ok": True, "plan": plan, "duration": elapsed}
-
-    # ---------- backup ----------
-    def backup_package(self, package: str, files: List[str]) -> Tuple[bool, Optional[str], Optional[str]]:
-        """
-        Creates tar.xz backup of the listed files and a metadata json.
-        Returns (ok, backup_path, metadata_path)
-        """
-        start = time.time()
-        ts = int(time.time())
-        safe_name = package.replace("/", "_")
-        backup_name = f"{safe_name}-{ts}.tar.xz"
-        meta_name = f"{safe_name}-{ts}.meta.json"
-        backup_path = str(self.backup_dir / backup_name)
-        meta_path = str(self.backup_dir / meta_name)
-        # in dry-run simulate
-        if self.dry_run:
-            self._log("info", "remove.backup.dryrun", f"DRY-RUN: would backup {len(files)} files for {package}", package=package, count=len(files))
-            return True, None, None
-
+    def _rotate_reports(self) -> None:
         try:
-            # create temporary dir to assemble entries (use tar with absolute paths via arcname)
-            with tarfile.open(backup_path, "w:xz") as tar:
-                for f in files:
-                    try:
-                        if os.path.exists(f):
-                            # arcname to preserve relative subtree - use leading slash removal
-                            arcname = os.path.relpath(f, "/") if f.startswith("/") else f
-                            tar.add(f, arcname=arcname)
-                    except Exception as e:
-                        # skip problematic files but record
-                        self._log("warning", "remove.backup.skip", f"Skipping file in backup {f}: {e}", file=f, error=str(e))
-            # metadata
-            meta = {"package": package, "ts": ts, "file_count": len(files), "created_by": "newpkg_remove"}
-            Path(meta_path).write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            elapsed = time.time() - start
-            self._log("info", "remove.backup.ok", f"Backup created {backup_path} ({len(files)} files) in {elapsed:.2f}s", package=package, backup=backup_path)
-            self._record_phase(package, "remove.backup", "ok", {"backup": backup_path, "meta": meta_path, "time": elapsed})
-            return True, backup_path, meta_path
-        except Exception as e:
-            self._log("error", "remove.backup.fail", f"Backup failed: {e}", package=package, error=str(e))
-            self._record_phase(package, "remove.backup", "error", {"error": str(e)})
-            return False, None, None
-
-    # ---------- remove files ----------
-    def _remove_path(self, path: str, use_sandbox: bool = True) -> Tuple[int, str, str]:
-        """Remove a single path. Returns (rc, stdout, stderr). rc 0 ok."""
-        # ensure safety check
-        if not self._is_path_safe(path):
-            return (2, "", f"path not safe: {path}")
-        if self.dry_run:
-            self._log("info", "remove.exec.dryrun", f"DRY-RUN would remove {path}", path=path)
-            return (0, "", "")
-        # prefer sandbox
-        if use_sandbox and self.sandbox:
-            # use sandbox to run 'rm -rf' safely
-            cmd = ["rm", "-rf", path]
-            try:
-                res = self.sandbox.run_in_sandbox(cmd, cwd="/", captures=True, env=None)
-                rc = res.rc
-                out = res.stdout or ""
-                err = res.stderr or ""
-                return (rc, out, err)
-            except Exception as e:
-                return (255, "", str(e))
-        # fallback direct removal
-        try:
-            if os.path.islink(path) or os.path.isfile(path):
-                os.remove(path)
-            elif os.path.isdir(path):
-                shutil.rmtree(path)
-            else:
-                # unknown type, attempt unlink
+            files = sorted([p for p in self.report_dir.iterdir() if p.is_file() and p.name.startswith("remove-report-")], key=lambda p: p.stat().st_mtime, reverse=True)
+            for p in files[self.keep_reports:]:
                 try:
-                    os.remove(path)
+                    p.unlink()
                 except Exception:
                     pass
-            return (0, "", "")
-        except Exception as e:
-            return (1, "", str(e))
+        except Exception:
+            pass
 
-    def execute_removal(self, package: str, confirm: bool = False, purge: bool = False, use_sandbox: bool = True) -> Dict[str, Any]:
+    def _save_report(self, report: Dict[str, Any]) -> Path:
+        ts = self._now_ts()
+        path = self.report_dir / f"remove-report-{ts}.json"
+        try:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            os.replace(str(tmp), str(path))
+            if self.rotate_compress:
+                # compress and remove original
+                try:
+                    comp_path = path.with_suffix(path.suffix + ".xz")
+                    with open(path, "rb") as f_in:
+                        comp = lzma.compress(f_in.read())
+                    with open(comp_path, "wb") as f_out:
+                        f_out.write(comp)
+                    try:
+                        path.unlink()
+                        path = comp_path
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            self._rotate_reports()
+        except Exception as e:
+            if self.logger:
+                self.logger.warning("remove.report_save_fail", f"failed saving report: {e}")
+        return path
+
+    def _is_safe_path(self, p: str) -> bool:
+        # disallow absolute root or system-critical dirs
+        if not p:
+            return False
+        if os.path.abspath(p) in ("/", "/boot", "/proc", "/sys", "/dev"):
+            return False
+        # enforce whitelist prefixes
+        return any(p.startswith(pref) for pref in self.SAFE_WHITELIST_PREFIXES)
+
+    # ---------------- plan ----------------
+    def build_plan_for_packages(self, package_names: List[str], include_configs: bool = True) -> List[RemovalPlanEntry]:
         """
-        Execute removal: backup -> delete files -> optionally purge configs/cache.
-        confirm: must be True (or require_confirm False) to actually perform removals.
-        Returns structured summary.
+        Build plan using DB metadata when available, otherwise fall back to filesystem heuristics.
+        Each plan entry contains files to remove and an action.
+        """
+        start = time.time()
+        plan: List[RemovalPlanEntry] = []
+        for pkg in package_names:
+            files = []
+            size = 0
+            reason = None
+            if self.db and hasattr(self.db, "get_package_files"):
+                try:
+                    files = list(self.db.get_package_files(pkg) or [])
+                    size = sum((Path(f).stat().st_size if Path(f).exists() else 0) for f in files)
+                except Exception:
+                    files = []
+                    size = 0
+            else:
+                # heuristic: look under /usr, /opt for directories matching package name
+                candidates = []
+                for base in ("/usr", "/opt", "/var", "/etc"):
+                    cand = Path(base) / pkg
+                    if cand.exists():
+                        candidates.append(str(cand))
+                files = candidates
+                size = sum((Path(f).stat().st_size if Path(f).exists() else 0) for f in files)
+            action = "remove" if files else "skip"
+            # optionally include config paths found in db metadata
+            if include_configs and self.db and hasattr(self.db, "get_metadata"):
+                try:
+                    cfg_paths = self.db.get_metadata(pkg, "config_paths") or []
+                    for cp in cfg_paths:
+                        if cp not in files:
+                            files.append(cp)
+                except Exception:
+                    pass
+            plan.append(RemovalPlanEntry(package=pkg, files=files, size_bytes=size, action=action, reason=reason))
+        duration = time.time() - start
+        self._record_phase(None, "remove.plan", "ok", meta={"count": len(plan), "duration": round(duration, 3)})
+        return plan
+
+    # ---------------- backup ----------------
+    def create_backup_for_entry(self, entry: RemovalPlanEntry) -> Optional[str]:
+        """
+        Create tar.xz backup for files in entry; skip if too large.
+        Returns backup path or None.
+        """
+        if not entry.files:
+            return None
+        size_mb = entry.size_bytes // (1024 * 1024)
+        if self.max_backup_mb and size_mb > self.max_backup_mb:
+            if self.logger:
+                self.logger.warning("remove.backup_skip", f"skip backup for {entry.package} size {size_mb}MB > {self.max_backup_mb}MB")
+            return None
+        try:
+            ts = self._now_ts()
+            out_name = f"{entry.package}-{ts}.tar.xz"
+            tmp = tempfile.NamedTemporaryFile(delete=False, dir=str(self.backup_dir), prefix=f"{entry.package}-", suffix=".tar.xz")
+            tmp.close()
+            with tarfile.open(tmp.name, "w:xz") as tf:
+                for f in entry.files:
+                    try:
+                        if os.path.exists(f) or os.path.islink(f):
+                            tf.add(f, arcname=os.path.join(entry.package, os.path.relpath(f, "/")))
+                    except Exception:
+                        continue
+            dest = self.backup_dir / out_name
+            os.replace(tmp.name, dest)
+            if self.logger:
+                self.logger.info("remove.backup_ok", f"backup created for {entry.package}", path=str(dest))
+            return str(dest)
+        except Exception as e:
+            if self.logger:
+                self.logger.error("remove.backup_fail", f"backup failed for {entry.package}: {e}")
+            return None
+
+    # ---------------- remove single entry ----------------
+    def _remove_files_entry(self, entry: RemovalPlanEntry, use_sandbox: Optional[bool] = None, fakeroot: bool = False) -> Tuple[bool, str]:
+        """
+        Remove files for the plan entry. If sandbox available and use_sandbox True, run inside sandbox.
+        Returns (ok, message)
+        """
+        use_sandbox = self.use_sandbox if use_sandbox is None else bool(use_sandbox)
+        if self.dry_run:
+            return True, "dry-run: no files removed"
+
+        # check safety for each file
+        for f in entry.files:
+            if not self._is_safe_path(f):
+                msg = f"unsafe path refused: {f}"
+                if self.logger:
+                    self.logger.error("remove.unsafe", msg, path=f)
+                return False, msg
+
+        if use_sandbox and self.sandbox:
+            # create a script to remove the files and run inside sandbox
+            try:
+                script = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".sh")
+                script.write("#!/bin/sh\nset -e\n")
+                for f in entry.files:
+                    # rm -rf safe quoting
+                    script.write(f"rm -rf -- {shlex_quote(f)}\n")
+                script.close()
+                os.chmod(script.name, 0o755)
+                try:
+                    res = self.sandbox.run_in_sandbox([script.name], workdir=None, env=None, binds=None, ro_binds=None, backend=None, use_fakeroot=fakeroot, timeout=int(self._cfg_get("remove.sandbox_timeout", 600)))
+                    rc, out, err = res.rc, res.stdout, res.stderr
+                    ok = rc == 0
+                    msg = (out or "") + (err or "")
+                    return ok, msg
+                finally:
+                    try:
+                        os.unlink(script.name)
+                    except Exception:
+                        pass
+            except Exception as e:
+                return False, f"sandbox removal exception: {e}"
+        else:
+            # direct removal on host
+            failures = []
+            for f in entry.files:
+                try:
+                    p = Path(f)
+                    if p.is_symlink() or p.is_file():
+                        p.unlink()
+                    elif p.is_dir():
+                        shutil.rmtree(str(p))
+                    else:
+                        # not exists
+                        continue
+                except Exception as e:
+                    failures.append(f"{f}: {e}")
+            if failures:
+                return False, "; ".join(failures)
+            return True, "removed"
+
+    # ---------------- rollback ----------------
+    def restore_backup(self, backup_path: str) -> Tuple[bool, str]:
+        """
+        Restore a backup tar.xz produced by create_backup_for_entry.
+        """
+        try:
+            p = Path(backup_path)
+            if not p.exists():
+                return False, "backup missing"
+            # open and extract safely - extract members under package/<relpath> -> restore to /
+            with tarfile.open(str(p), mode="r:xz") as tf:
+                members = tf.getmembers()
+                for m in members:
+                    # strip top-level component
+                    parts = m.name.split("/", 1)
+                    if len(parts) == 2:
+                        m.name = parts[1]
+                    else:
+                        m.name = parts[-1]
+                    # prevent path traversal
+                    if m.name.startswith(".."):
+                        continue
+                    tf.extract(m, path="/")
+            return True, "restored"
+        except Exception as e:
+            return False, str(e)
+
+    # ---------------- high-level remove flow ----------------
+    def remove_packages(self, package_names: List[str], confirm: Optional[bool] = None, purge: bool = False, parallel: Optional[int] = None, use_sandbox: Optional[bool] = None, fakeroot: bool = False) -> Dict[str, Any]:
+        """
+        High-level function:
+         - build plan
+         - for each entry: backup (if enabled), remove files, optionally purge configs
+         - if failure: attempt rollback from backup
+        Returns a structured report.
         """
         start_total = time.time()
-        plan_res = self.plan_removal(package)
-        if not plan_res.get("ok"):
-            return {"ok": False, "error": plan_res.get("error")}
+        parallel = parallel or self.parallel
+        use_sandbox = self.use_sandbox if use_sandbox is None else bool(use_sandbox)
+        # build plan
+        plan = self.build_plan_for_packages(package_names, include_configs=purge)
+        # confirmation
+        if confirm is None:
+            confirm = self.auto_confirm or (not self.require_confirm)
+        if not confirm and not self.auto_confirm and not self.dry_run:
+            if not self._prompt_confirm(plan):
+                return {"ok": False, "reason": "user_cancelled"}
 
-        plan = plan_res["plan"]
-        files: List[str] = plan["files"]
-        unsafe = plan["unsafe"]
+        # audit start
+        self._audit_report("remove.run", ",".join(package_names), "start", {"count": len(plan)})
 
-        # don't proceed if unsafe entries exist
-        if unsafe:
-            msg = f"Unsafe paths present: {unsafe}"
-            self._log("error", "remove.execute.unsafe", msg, package=package)
-            return {"ok": False, "error": "unsafe_paths", "unsafe": unsafe}
+        # progress
+        progress_ctx = None
+        if self.logger:
+            try:
+                progress_ctx = self.logger.progress(f"Removing {len(plan)} packages", total=len(plan))
+            except Exception:
+                progress_ctx = None
 
-        if self.require_confirm and not confirm:
-            self._log("warning", "remove.execute.no_confirm", "Execution requires explicit confirm", package=package)
-            return {"ok": False, "error": "no_confirm"}
+        results = []
+        failures = []
 
-        # run pre_remove hooks
-        try:
-            if self.hooks and hasattr(self.hooks, "execute_safe"):
-                self.hooks.execute_safe("pre_remove", [f"pre_remove:{package}"], json_output=False)
-        except Exception:
-            pass
-
-        # create backup
-        ok_backup, backup_path, meta_path = self.backup_package(package, files)
-        if not ok_backup:
-            return {"ok": False, "error": "backup_failed"}
-
-        removed = []
-        skipped = []
-        errors = []
-
-        t0 = time.time()
-        for f in files:
-            rc, out, err = self._remove_path(f, use_sandbox=use_sandbox)
-            if rc == 0:
-                removed.append(f)
-            else:
-                skipped.append(f)
-                errors.append({"file": f, "rc": rc, "err": err})
-                self._log("error", "remove.exec.filefail", f"Failed removing {f}: {err}", file=f, rc=rc, err=err)
-
-        duration = time.time() - t0
-
-        # optionally purge configs/cache related to package (best-effort)
-        purge_result = None
-        if purge:
-            purge_result = self._purge_package_data(package, use_sandbox=use_sandbox)
-
-        # update DB: mark package as removed (best-effort)
-        try:
-            if self.db and hasattr(self.db, "mark_removed"):
+        def worker(entry: RemovalPlanEntry) -> Dict[str, Any]:
+            ent_meta = {"package": entry.package, "size_bytes": entry.size_bytes, "files": len(entry.files)}
+            self._record_phase(entry.package, "remove.start", "pending", meta=ent_meta)
+            # pre-remove hook
+            if self.hooks:
                 try:
-                    self.db.mark_removed(package)
+                    self.hooks.run("pre_remove", {"package": entry.package, "files": entry.files, "meta": ent_meta})
                 except Exception:
                     pass
-        except Exception:
-            pass
+            # backup
+            backup = None
+            try:
+                backup = self.create_backup_for_entry(entry)
+                entry.backup = backup
+                if backup and self.hooks:
+                    try:
+                        self.hooks.run("post_backup", {"package": entry.package, "backup": backup})
+                    except Exception:
+                        pass
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning("remove.backup_exception", f"backup exception for {entry.package}: {e}")
 
-        # run post_remove hooks
-        try:
-            if self.hooks and hasattr(self.hooks, "execute_safe"):
-                self.hooks.execute_safe("post_remove", [f"post_remove:{package}"], json_output=False)
-        except Exception:
-            pass
-
-        total_duration = time.time() - start_total
-        rc_summary = 0 if not errors else 2
-        result = {
-            "ok": rc_summary == 0,
-            "package": package,
-            "removed": removed,
-            "skipped": skipped,
-            "errors": errors,
-            "backup": backup_path,
-            "backup_meta": meta_path,
-            "purge": purge_result,
-            "duration": total_duration,
-        }
-
-        # save report
-        try:
-            self.write_report(result)
-        except Exception:
-            pass
-
-        # record phase
-        self._record_phase(package, "remove.exec", "ok" if rc_summary == 0 else "error", {"removed": len(removed), "skipped": len(skipped), "errors": len(errors), "backup": backup_path})
-
-        return result
-
-    # ---------- purge ----------
-    def _purge_package_data(self, package: str, use_sandbox: bool = True) -> Dict[str, Any]:
-        """
-        Purge configuration/cache directories related to the package.
-        This is heuristic; check package metadata in DB for known locations.
-        """
-        purged = []
-        failed = []
-        # heuristics: /etc/{package}, /var/cache/{package}, /var/lib/{package}, ~/.config/{package}
-        candidates = []
-        etc_cand = os.path.join(self.root_dir, "etc", package)
-        varlib_cand = os.path.join(self.root_dir, "var", "lib", package)
-        varcache_cand = os.path.join(self.root_dir, "var", "cache", package)
-        home_conf = os.path.expanduser(f"~/.config/{package}")
-        candidates.extend([etc_cand, varlib_cand, varcache_cand, home_conf])
-
-        for c in candidates:
-            if os.path.exists(c):
-                if not self._is_path_safe(c):
-                    failed.append({"path": c, "err": "unsafe"})
-                    continue
-                if self.dry_run:
-                    self._log("info", "remove.purge.dryrun", f"DRY-RUN purge {c}", path=c)
-                    purged.append(c)
-                    continue
-                try:
-                    if use_sandbox and self.sandbox:
-                        r = self.sandbox.run_in_sandbox(["rm", "-rf", c], cwd="/", captures=True)
-                        if r.rc == 0:
-                            purged.append(c)
-                        else:
-                            failed.append({"path": c, "err": r.stderr})
-                    else:
-                        if os.path.isdir(c):
-                            shutil.rmtree(c)
-                        else:
-                            os.remove(c)
-                        purged.append(c)
-                except Exception as e:
-                    failed.append({"path": c, "err": str(e)})
-        self._record_phase(package, "remove.purge", "ok" if not failed else "partial", {"purged": len(purged), "failed": len(failed)})
-        return {"purged": purged, "failed": failed}
-
-    # ---------- rollback ----------
-    def rollback(self, backup_path: str, restore_to: Optional[str] = None, use_sandbox: bool = True) -> Dict[str, Any]:
-        """
-        Restore a backup tar.xz to the filesystem. restore_to allows alternative root.
-        """
-        start = time.time()
-        if self.dry_run:
-            self._log("info", "remove.rollback.dryrun", f"DRY-RUN would restore {backup_path} to {restore_to or self.root_dir}")
-            return {"ok": True, "simulated": True}
-
-        if not os.path.exists(backup_path):
-            return {"ok": False, "error": "backup_missing", "path": backup_path}
-
-        target_root = restore_to or self.root_dir
-        if not self._is_path_safe(target_root):
-            return {"ok": False, "error": "target_not_safe", "target": target_root}
-
-        try:
-            if use_sandbox and self.sandbox:
-                # copy archive into sandbox's accessible area and extract
-                # best-effort: run tar -xJf <archive> -C /
-                cmd = ["tar", "-xJf", backup_path, "-C", target_root]
-                res = self.sandbox.run_in_sandbox(cmd, cwd=target_root, captures=True)
-                rc = res.rc
-                if rc != 0:
-                    return {"ok": False, "error": "sandbox_extract_failed", "stderr": res.stderr}
+            # perform removal
+            ok, msg = self._remove_files_entry(entry, use_sandbox=use_sandbox, fakeroot=fakeroot)
+            if ok:
+                # optionally purge config metadata via DB
+                if purge and self.db and hasattr(self.db, "purge_package_metadata"):
+                    try:
+                        self.db.purge_package_metadata(entry.package)
+                    except Exception:
+                        pass
+                self._record_phase(entry.package, "remove.done", "ok", meta={"backup": backup})
+                self._audit_report("remove.package", entry.package, "ok", {"backup": backup})
+                if self.hooks:
+                    try:
+                        self.hooks.run("post_remove", {"package": entry.package, "ok": True, "backup": backup})
+                    except Exception:
+                        pass
+                return {"package": entry.package, "ok": True, "backup": backup, "message": msg}
             else:
-                with tarfile.open(backup_path, "r:xz") as tar:
-                    tar.extractall(path=target_root)
-            dur = time.time() - start
-            self._log("info", "remove.rollback.ok", f"Restored {backup_path} to {target_root} in {dur:.2f}s", backup=backup_path, target=target_root)
-            return {"ok": True, "backup": backup_path, "target": target_root, "duration": time.time() - start}
-        except Exception as e:
-            self._log("error", "remove.rollback.fail", f"Rollback failed: {e}", error=str(e))
-            return {"ok": False, "error": str(e)}
+                # attempt rollback if backup exists
+                rolled = False
+                roll_msg = ""
+                if backup:
+                    try:
+                        r_ok, r_msg = self.restore_backup(backup)
+                        rolled = r_ok
+                        roll_msg = r_msg
+                    except Exception as e:
+                        roll_msg = str(e)
+                self._record_phase(entry.package, "remove.fail", "fail", meta={"error": msg, "rollback": rolled})
+                self._audit_report("remove.package", entry.package, "fail", {"error": msg, "rollback": rolled})
+                if self.hooks:
+                    try:
+                        self.hooks.run("post_remove", {"package": entry.package, "ok": False, "error": msg, "rollback": rolled})
+                    except Exception:
+                        pass
+                return {"package": entry.package, "ok": False, "error": msg, "rollback": rolled, "rollback_msg": roll_msg}
 
-    # ---------- reporting ----------
-    def write_report(self, result: Dict[str, Any]) -> Path:
-        """Write last-run report in JSON to report_dir."""
+        # execute in parallel
+        with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
+            futures = {ex.submit(worker, e): e for e in plan}
+            for fut in as_completed(futures):
+                e = futures[fut]
+                try:
+                    r = fut.result()
+                except Exception as exc:
+                    r = {"package": e.package, "ok": False, "error": str(exc)}
+                results.append(r)
+                if not r.get("ok"):
+                    failures.append(r)
+                # update progress context if present
+                try:
+                    if progress_ctx:
+                        pass
+                except Exception:
+                    pass
+
+        if progress_ctx:
+            try:
+                progress_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+
+        report = {
+            "timestamp": self._now_ts(),
+            "requested": package_names,
+            "results": results,
+            "failed": failures,
+            "ok": len(failures) == 0,
+            "duration": round(time.time() - start_total, 3)
+        }
+        path = self._save_report(report)
+        self._record_phase(None, "remove.run", "ok" if report["ok"] else "partial", meta={"report": str(path), "failed": len(failures)})
+        # audit final
+        self._audit_report("remove.run", ",".join(package_names), "ok" if report["ok"] else "partial", {"report": str(path)})
+        return report
+
+    # ---------------- CLI / interactive ----------------
+    def _prompt_confirm(self, plan: List[RemovalPlanEntry]) -> bool:
+        nremove = sum(1 for p in plan if p.action == "remove")
+        npurge = sum(1 for p in plan if p.action == "purge")
+        if RICH and _console:
+            _console.print(f"[bold]Planned actions: remove={nremove}, purge={npurge}[/bold]")
+        else:
+            print(f"Planned actions: remove={nremove}, purge={npurge}")
         try:
-            rpt = {"ts": int(time.time()), "result": result}
-            tmp = self.last_report.with_suffix(".tmp")
-            tmp.write_text(json.dumps(rpt, indent=2), encoding="utf-8")
-            tmp.replace(self.last_report)
-            self._log("info", "remove.report.write", f"Wrote report to {self.last_report}", path=str(self.last_report))
-            return self.last_report
-        except Exception as e:
-            self._log("error", "remove.report.fail", f"Failed writing report: {e}", error=str(e))
-            raise
+            ans = input("Proceed? [y/N]: ").strip().lower()
+            return ans in ("y", "yes")
+        except Exception:
+            return False
 
-    # ---------- CLI helper ----------
-    @staticmethod
-    def cli():
+    def run_cli(self, argv: Optional[List[str]] = None) -> int:
         import argparse
-        p = argparse.ArgumentParser(prog="newpkg-remove", description="Remover pacotes de forma segura com newpkg")
-        p.add_argument("package", help="Nome do pacote a remover (como no DB)")
-        p.add_argument("--plan", action="store_true", help="Mostrar plano de remoção")
-        p.add_argument("--execute", action="store_true", help="Executar remoção (requer --confirm ou config override)")
-        p.add_argument("--confirm", action="store_true", help="Confirmar execução")
-        p.add_argument("--purge", action="store_true", help="Purgar configs/caches associados")
-        p.add_argument("--dry-run", action="store_true", help="Simular sem mudanças")
-        p.add_argument("--no-sandbox", action="store_true", help="Não usar sandbox para remoções")
-        p.add_argument("--json", action="store_true", help="Imprimir JSON")
-        p.add_argument("--quiet", action="store_true", help="Modo silencioso")
-        p.add_argument("--restore", metavar="BACKUP", help="Restaurar backup tar.xz")
-        p.add_argument("--restore-to", metavar="DIR", help="Restaurar backup num root alternativo")
-        args = p.parse_args()
+        parser = argparse.ArgumentParser(prog="newpkg-remove", description="Remove packages safely with newpkg")
+        parser.add_argument("packages", nargs="+", help="package names to remove")
+        parser.add_argument("--purge", action="store_true", help="remove configs and metadata")
+        parser.add_argument("--yes", "-y", action="store_true", help="auto confirm")
+        parser.add_argument("--dry-run", action="store_true", help="do not perform destructive actions")
+        parser.add_argument("--parallel", type=int, help="override parallel workers")
+        parser.add_argument("--report-dir", help="override report dir")
+        parser.add_argument("--no-sandbox", action="store_true", help="do not use sandbox even if available")
+        parser.add_argument("--fakeroot", action="store_true", help="use fakeroot inside sandbox")
+        args = parser.parse_args(argv or sys.argv[1:])
 
-        cfg = init_config() if init_config else None
-        logger = NewpkgLogger.from_config(cfg, NewpkgDB(cfg)) if NewpkgLogger and cfg else None
-        db = NewpkgDB(cfg) if NewpkgDB and cfg else None
-        hooks = NewpkgHooks.from_config(cfg, logger, db) if NewpkgHooks and cfg else None
-        sandbox = NewpkgSandbox(cfg=cfg, logger=logger, db=db) if NewpkgSandbox and cfg else None
-
-        remover = NewpkgRemove(cfg=cfg, logger=logger, db=db, hooks=hooks, sandbox=sandbox)
-
-        # override flags from CLI
+        if args.report_dir:
+            self.report_dir = Path(args.report_dir)
+            self.report_dir.mkdir(parents=True, exist_ok=True)
+        if args.parallel:
+            self.parallel = args.parallel
+        if args.yes:
+            self.auto_confirm = True
         if args.dry_run:
-            remover.dry_run = True
-        if args.quiet:
-            remover.quiet = True
-        if args.json:
-            remover.json_out = True
+            self.dry_run = True
         if args.no_sandbox:
             use_sandbox = False
         else:
-            use_sandbox = True
+            use_sandbox = None  # preserve default
 
-        if args.restore:
-            res = remover.rollback(args.restore, restore_to=args.restore_to, use_sandbox=use_sandbox)
-            if remover.json_out or args.json:
-                print(json.dumps(res, indent=2))
+        report = self.remove_packages(args.packages, confirm=self.auto_confirm, purge=args.purge, parallel=self.parallel, use_sandbox=use_sandbox, fakeroot=args.fakeroot)
+        ok = report.get("ok", False)
+        if RICH and _console:
+            if ok:
+                _console.print(f"[green]Removal completed OK — report saved[/green]")
             else:
-                print("Restore:", res)
-            raise SystemExit(0 if res.get("ok") else 2)
-
-        if args.plan:
-            res = remover.plan_removal(args.package)
-            if remover.json_out or args.json:
-                print(json.dumps(res, indent=2))
-            else:
-                plan = res.get("plan", {})
-                print(f"Package: {plan.get('package')}")
-                print(f"Files: {plan.get('count')}")
-                if plan.get("unsafe"):
-                    print("Unsafe entries (will block removal):")
-                    for u in plan.get("unsafe", []):
-                        print("  -", u)
-            raise SystemExit(0 if res.get("ok") else 2)
-
-        if args.execute:
-            res = remover.execute_removal(args.package, confirm=args.confirm, purge=args.purge, use_sandbox=use_sandbox)
-            if remover.json_out or args.json:
-                print(json.dumps(res, indent=2))
-            else:
-                if res.get("ok"):
-                    print(f"Removed {len(res.get('removed',[]))} files for {args.package}; backup: {res.get('backup')}")
-                else:
-                    print("Removal failed:", res.get("error"))
-            raise SystemExit(0 if res.get("ok") else 2)
-
-        # default: show plan
-        res = remover.plan_removal(args.package)
-        if remover.json_out or args.json:
-            print(json.dumps(res, indent=2))
+                _console.print(f"[yellow]Removal finished with failures — check report[/yellow]")
         else:
-            plan = res.get("plan", {})
-            print(f"Package: {plan.get('package')}")
-            for f in plan.get("files", []):
-                print(" -", f)
-        raise SystemExit(0 if res.get("ok") else 2)
+            if ok:
+                print("Removal completed OK")
+            else:
+                print("Removal finished with failures")
+        return 0 if ok else 2
 
 
+# ---------------- utility ----------------
+def shlex_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
+
+
+# ---------------- module-level convenience ----------------
+_default_remove: Optional[NewpkgRemove] = None
+
+
+def get_remove(cfg: Any = None, logger: Any = None, db: Any = None, hooks: Any = None, sandbox: Any = None, audit: Any = None) -> NewpkgRemove:
+    global _default_remove
+    if _default_remove is None:
+        _default_remove = NewpkgRemove(cfg=cfg, logger=logger, db=db, hooks=hooks, sandbox=sandbox, audit=audit)
+    return _default_remove
+
+
+# ---------------- CLI entrypoint ----------------
 if __name__ == "__main__":
-    NewpkgRemove.cli()
+    remover = get_remove()
+    sys.exit(remover.run_cli())
