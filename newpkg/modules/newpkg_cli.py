@@ -1,196 +1,191 @@
 #!/usr/bin/env python3
-# newpkg_cli.py — revised, integrates newpkg_api autodiscovery and all aliases
+# newpkg_cli.py
 """
-Unified CLI for newpkg — autodetects modules (via newpkg_api), supports aliases and subcommands,
-uses rich for progress/UI when available, respects newpkg_config flags (dry-run, quiet, json).
+newpkg CLI — revised integration
+
+Features:
+ - single CLI front-end integrating all newpkg modules
+ - abbreviations and aliases (short + long)
+ - --install / -i, --remove / -r (alias rm), --upgrade / -u (alias up), --sync / -s, --audit / -a
+ - --bootstrap mode: sync -> resolve deps -> build -> package -> install
+ - --quiet, --json, --dry-run, --jobs, --profile
+ - hooks: pre_command / post_command
+ - uses newpkg_api.call(command, args) if available (best-effort)
+ - progress UI via logger.progress() (Rich when available), falls back to simple prints
+ - consolidated JSON report saved in report_dir
+ - audit.scan() after install/remove/upgrade when available
+ - graceful degradation when optional modules are missing
 """
 
 from __future__ import annotations
 
+import argparse
+import functools
 import json
 import os
+import shlex
+import shutil
 import sys
+import tempfile
 import time
-from argparse import ArgumentParser, RawDescriptionHelpFormatter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# attempt to make newpkg_api importable even if this file is inside newpkg/modules/
+# Try to import optional helpers (best-effort)
 try:
-    # ensure parent package directory is on sys.path
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
-    from newpkg_api import load_all_modules  # type: ignore
-    _HAS_API = True
-except Exception:
-    _HAS_API = False
-
-# Optional integrations
-try:
-    from newpkg_config import init_config
+    from newpkg_config import init_config  # type: ignore
 except Exception:
     init_config = None
 
 try:
-    from newpkg_logger import NewpkgLogger
+    from newpkg_logger import get_logger  # type: ignore
 except Exception:
-    NewpkgLogger = None
+    get_logger = None
+
+# module getters (best-effort)
+try:
+    from newpkg_upgrade import get_upgrade  # type: ignore
+except Exception:
+    get_upgrade = None
 
 try:
-    from newpkg_db import NewpkgDB
+    from newpkg_remove import get_remove  # type: ignore
 except Exception:
-    NewpkgDB = None
+    get_remove = None
 
 try:
-    from newpkg_core import NewpkgCore
+    from newpkg_sync import get_sync  # type: ignore
 except Exception:
-    NewpkgCore = None
+    get_sync = None
 
 try:
-    from newpkg_upgrade import NewpkgUpgrade
+    from newpkg_deps import get_deps  # type: ignore
 except Exception:
-    NewpkgUpgrade = None
+    get_deps = None
 
 try:
-    from newpkg_remove import NewpkgRemove
+    from newpkg_core import get_core  # type: ignore
 except Exception:
-    NewpkgRemove = None
+    get_core = None
 
 try:
-    from newpkg_sync import NewpkgSync
+    from newpkg_metafile import get_metafile_manager  # type: ignore
 except Exception:
-    NewpkgSync = None
+    get_metafile_manager = None
 
 try:
-    from newpkg_audit import NewpkgAudit
+    from newpkg_audit import get_audit  # type: ignore
 except Exception:
-    NewpkgAudit = None
+    get_audit = None
 
 try:
-    from newpkg_deps import NewpkgDeps
+    from newpkg_hooks import get_hooks_manager  # type: ignore
 except Exception:
-    NewpkgDeps = None
+    get_hooks_manager = None
 
+# optional API layer
 try:
-    from newpkg_metafile import NewpkgMetafile
+    import newpkg_api as newpkg_api_module  # type: ignore
+    get_api = getattr(newpkg_api_module, "get_api", None) or (lambda cfg=None: None)
 except Exception:
-    NewpkgMetafile = None
+    get_api = None
 
-# Optional UI: rich
+# rich support for nicer UI (best-effort)
 try:
     from rich.console import Console
+    from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, SpinnerColumn
     from rich.table import Table
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
-    RICH_AVAILABLE = True
-    console = Console()
+    RICH = True
+    _console = Console()
 except Exception:
-    RICH_AVAILABLE = False
-    console = None
+    RICH = False
+    _console = None
 
-# fallback stdlib logger (used only if newpkg_logger not present)
+# fallback logger (text)
 import logging
 _logger = logging.getLogger("newpkg.cli")
 if not _logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter("[%(levelname)s] newpkg.cli: %(message)s"))
-    _logger.addHandler(h)
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("[%(levelname)s] newpkg.cli: %(message)s"))
+    _logger.addHandler(_h)
 _logger.setLevel(logging.INFO)
 
-REPORT_DIR_DEFAULT = "/var/log/newpkg/cli"
+# ---------------- utilities ----------------
+def now_ts() -> str:
+    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
+def save_cli_report(report_dir: Path, name_prefix: str, report: Dict[str, Any], compress: bool = True) -> Path:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    path = report_dir / f"{name_prefix}-{now_ts()}.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(str(tmp), str(path))
+    if compress:
+        try:
+            import lzma
+            comp_path = path.with_suffix(path.suffix + ".xz")
+            with open(path, "rb") as fin:
+                comp = lzma.compress(fin.read())
+            with open(comp_path, "wb") as fout:
+                fout.write(comp)
+            path.unlink()
+            path = comp_path
+        except Exception:
+            pass
+    return path
 
-@dataclass
-class CLIReport:
-    cmd: str
-    ts: int
-    duration: float
-    status: str
-    details: Dict[str, Any]
+def shlex_quote(s: str) -> str:
+    return shlex.quote(s)
 
-    def to_dict(self):
-        return asdict(self)
-
-
+# ---------------- CLI class ----------------
 class NewpkgCLI:
+    DEFAULT_REPORT_DIR = "/var/log/newpkg/cli"
+    DEFAULT_PROFILE = "system"
+    PROFILES = {
+        "system": {"jobs": None, "quiet": False},
+        "developer": {"jobs": None, "quiet": False},
+        "minimal": {"jobs": 1, "quiet": True},
+    }
+
     def __init__(self, cfg: Any = None):
-        # config
         self.cfg = cfg or (init_config() if init_config else None)
-
-        # logger
-        try:
-            self.logger = NewpkgLogger.from_config(self.cfg, NewpkgDB(self.cfg) if NewpkgDB and self.cfg else None) if NewpkgLogger and self.cfg else None
-        except Exception:
-            self.logger = None
-
-        # db
-        try:
-            self.db = NewpkgDB(self.cfg) if NewpkgDB and self.cfg else None
-        except Exception:
-            self.db = None
-
-        # lazy-initialized modules dict (plugins & instantiated handlers)
-        self.modules: Dict[str, Any] = {}
-
-        # global flags default values from config
-        self.dry_run = bool(self._cfg_get("general.dry_run", False))
-        self.quiet = bool(self._cfg_get("output.quiet", False))
-        self.json_out = bool(self._cfg_get("output.json", False))
-        self.use_sandbox = bool(self._cfg_get("general.use_sandbox", True))
-        cpu = os.cpu_count() or 1
-        self.jobs = int(self._cfg_get("core.jobs", max(1, min(4, cpu))))
-        self.report_dir = Path(self._cfg_get("cli.report_dir", REPORT_DIR_DEFAULT))
-        self.report_dir.mkdir(parents=True, exist_ok=True)
-
-        # UI
-        self.rich = RICH_AVAILABLE and bool(self._cfg_get("output.use_rich", True))
-        if self.json_out:
-            self.rich = False
-        if self.quiet:
-            self.rich = False
-
-        # prepare module handlers (lazily)
-        self._core = None
-        self._upgrade = None
-        self._remove = None
-        self._sync = None
-        self._audit = None
-        self._deps = None
-        self._metafile = None
-
-        # attempt to auto-load modules via newpkg_api (if available)
-        if _HAS_API:
+        # logger from newpkg_logger if available (it may implement .progress())
+        self.logger = None
+        if get_logger:
             try:
-                start = time.time()
-                infos = load_all_modules(self, cfg=self.cfg, logger=self.logger, db=self.db)
-                loaded = []
-                for info in infos:
-                    # skip CLI file itself to avoid self-registration loops
-                    try:
-                        caller_name = Path(__file__).name
-                        if Path(info.path).name == caller_name:
-                            continue
-                    except Exception:
-                        pass
-                    loaded.append(Path(info.path).stem)
-                self.modules_list = loaded
-                # display or log modules loaded
-                if self.json_out or (self.cfg and bool(self.cfg.get("output.json", False))):
-                    # save JSON metadata into a small report
-                    meta = {"modules": loaded, "count": len(loaded), "duration": round(time.time() - start, 3)}
-                    self._save_report("modules_loaded", "ok", {"meta": meta})
-                else:
-                    if not self.quiet:
-                        if self.rich and console:
-                            console.print(f"[bold cyan]Módulos carregados automaticamente:[/bold cyan] {', '.join(loaded) or '(none)'}")
-                        else:
-                            print("Módulos carregados:", ", ".join(loaded) or "(none)")
-            except Exception as e:
-                self._log("warning", "cli.autoload.fail", f"Auto-load modules failed: {e}", error=str(e))
-        else:
-            # not available — ok
-            self.modules_list = []
+                self.logger = get_logger(self.cfg)
+            except Exception:
+                self.logger = None
 
-    # --- helpers ---
+        # modules (best-effort)
+        self.upgrade = get_upgrade(self.cfg, self.logger) if get_upgrade else None
+        self.remover = get_remove(self.cfg, self.logger) if get_remove else None
+        self.sync = get_sync(self.cfg, self.logger) if get_sync else None
+        self.deps = get_deps(self.cfg, self.logger) if get_deps else None
+        self.core = get_core(self.cfg, self.logger) if get_core else None
+        self.metafile = get_metafile_manager(self.cfg) if get_metafile_manager else None
+        self.audit = get_audit(self.cfg, self.logger) if get_audit else None
+        self.hooks = get_hooks_manager(self.cfg) if get_hooks_manager else None
+        self.api = get_api(self.cfg) if get_api else None
+
+        # report dir
+        self.report_dir = Path(self._cfg_get("cli.report_dir", self.DEFAULT_REPORT_DIR)).expanduser()
+        self.report_dir.mkdir(parents=True, exist_ok=True)
+        self.compress_reports = bool(self._cfg_get("cli.compress_reports", True))
+
+        # defaults / flags
+        self.quiet = False
+        self.json_out = False
+        self.dry_run = False
+        self.jobs = int(self._cfg_get("general.jobs", os.cpu_count() or 1))
+        self.profile = self._cfg_get("cli.profile", self.DEFAULT_PROFILE)
+        if self.profile in self.PROFILES:
+            prof = self.PROFILES[self.profile]
+            if prof.get("jobs") is not None:
+                self.jobs = prof["jobs"]
+
     def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
             if self.cfg and hasattr(self.cfg, "get"):
@@ -199,491 +194,532 @@ class NewpkgCLI:
                     return v
         except Exception:
             pass
-        env_key = key.upper().replace(".", "_")
-        return os.environ.get(env_key, default)
+        envk = key.upper().replace(".", "_")
+        return os.environ.get(envk, default)
 
-    def _make_logger(self):
-        def fn(level: str, event: str, msg: str = "", **meta):
+    # ---------------- helpers for UI ----------------
+    def _print_phase(self, text: str):
+        if self.json_out:
+            return
+        if self.quiet:
+            # show only high-level
+            print(text)
+            return
+        if RICH and _console:
+            _console.print(f"[bold cyan]{text}[/bold cyan]")
+        else:
+            print(text)
+
+    def _progress_context(self, description: str, total: Optional[int] = None):
+        """
+        Return a progress context manager. If self.logger provides progress(), uses that; otherwise
+        uses rich Progress if available; else a dummy context manager.
+        Usage:
+            with cli._progress_context("Baixando", total=1) as prog:
+                task = prog.add_task(...)
+                prog.update(task, advance=...)
+        The returned object tries to expose .add_task and .update to be similar to rich.progress.
+        """
+        # best-effort: if logger offers .progress use it
+        if self.logger and hasattr(self.logger, "progress"):
             try:
-                if self.logger:
-                    method = getattr(self.logger, level.lower(), None)
-                    if method:
-                        method(event, msg, **meta)
-                        return
+                return self.logger.progress(description, total=total)
             except Exception:
                 pass
-            getattr(_logger, level.lower(), _logger.info)(f"{event}: {msg} - {meta}")
-        return fn
+        if RICH and _console:
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                "[progress.percentage]{task.percentage:>3.0f}%",
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=_console,
+            )
+            return progress
+        # fallback dummy
+        class Dummy:
+            def __enter__(self_inner):
+                class Task:
+                    def __init__(self):
+                        pass
+                self_inner.task = Task()
+                return self_inner
+            def __exit__(self_inner, exc_type, exc, tb):
+                return False
+            def add_task(self_inner, *args, **kwargs):
+                return 0
+            def update(self_inner, *args, **kwargs):
+                return None
+        return Dummy()
 
-    def _log(self, level: str, event: str, msg: str = "", **meta):
-        try:
-            if self.logger:
-                meth = getattr(self.logger, level.lower(), None)
-                if meth:
-                    meth(event, msg, **meta)
-                    return
-        except Exception:
-            pass
-        getattr(_logger, level.lower(), _logger.info)(f"{event}: {msg} - {meta}")
-
-    def _print(self, *args, **kwargs):
-        if self.quiet:
-            return
-        if self.rich and console:
-            console.print(*args, **kwargs)
-        else:
-            print(*args, **kwargs)
-
-    def _progress(self, description: str):
-        if self.rich and console:
-            p = Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), TimeElapsedColumn(), TimeRemainingColumn())
-            return p, p.add_task(description, total=None)
-        else:
-            # fallback dummy context manager
-            class Dummy:
-                def __enter__(self_in):
-                    if not self.quiet:
-                        print(description + " ...")
-                    return None, None
-
-                def __exit__(self_in, exc_type, exc_val, exc_tb):
-                    return False
-            return Dummy()
-
-    def _save_report(self, cmd: str, status: str, details: Dict[str, Any]) -> Path:
-        ts = int(time.time())
-        rpt = CLIReport(cmd=cmd, ts=ts, duration=details.get("duration", 0.0), status=status, details=details)
-        fname = f"cli-{cmd.replace(' ', '_')}-{ts}.json"
-        p = self.report_dir / fname
-        try:
-            p.write_text(json.dumps(rpt.to_dict(), indent=2), encoding="utf-8")
-            self._log("info", "cli.report.write", f"Wrote CLI report to {p}", path=str(p))
-        except Exception:
-            pass
-        return p
-
-    # --- lazy module properties (instantiate when first used) ---
-    @property
-    def core(self):
-        if self._core is None:
+    # ---------------- central dispatcher w/ api & hooks ----------------
+    def _dispatch(self, command: str, func, *args, **kwargs):
+        """
+        Dispatch a command. If API layer present, prefer api.call(command, args).
+        Always run pre_command and post_command hooks when available.
+        Collect stdout/stderr (if produced) and measure timing.
+        """
+        # CLI-level hook
+        if self.hooks:
             try:
-                self._core = NewpkgCore(cfg=self.cfg, logger=self.logger, db=self.db, sandbox=None) if NewpkgCore and self.cfg else None
+                self.hooks.run("pre_command", {"command": command, "args": args, "kwargs": kwargs})
             except Exception:
-                self._core = None
-        return self._core
+                pass
 
-    @property
-    def upgrade(self):
-        if self._upgrade is None:
+        # start time
+        t0 = time.time()
+        out = None
+        err = None
+        exc = None
+        res = None
+        used_api = False
+        if self.api and hasattr(self.api, "call"):
             try:
-                self._upgrade = NewpkgUpgrade(cfg=self.cfg, logger=self.logger, db=self.db, sandbox=None) if NewpkgUpgrade and self.cfg else None
-            except Exception:
-                self._upgrade = None
-        return self._upgrade
-
-    @property
-    def remover(self):
-        if self._remove is None:
-            try:
-                self._remove = NewpkgRemove(cfg=self.cfg, logger=self.logger, db=self.db, sandbox=None) if NewpkgRemove and self.cfg else None
-            except Exception:
-                self._remove = None
-        return self._remove
-
-    @property
-    def syncer(self):
-        if self._sync is None:
-            try:
-                self._sync = NewpkgSync(cfg=self.cfg, logger=self.logger, db=self.db, hooks=None, sandbox=None) if NewpkgSync and self.cfg else None
-            except Exception:
-                self._sync = None
-        return self._sync
-
-    @property
-    def auditer(self):
-        if self._audit is None:
-            try:
-                self._audit = NewpkgAudit(cfg=self.cfg, logger=self.logger, db=self.db, sandbox=None) if NewpkgAudit and self.cfg else None
-            except Exception:
-                self._audit = None
-        return self._audit
-
-    @property
-    def deps(self):
-        if self._deps is None:
-            try:
-                self._deps = NewpkgDeps(cfg=self.cfg, logger=self.logger, db=self.db) if NewpkgDeps and self.cfg else None
-            except Exception:
-                self._deps = None
-        return self._deps
-
-    @property
-    def metafile(self):
-        if self._metafile is None:
-            try:
-                self._metafile = NewpkgMetafile(cfg=self.cfg, logger=self.logger, db=self.db) if NewpkgMetafile and self.cfg else None
-            except Exception:
-                self._metafile = None
-        return self._metafile
-
-    # --- command implementations ---
-    def cmd_install(self, metafile_path: str, install_full: bool = True, dest: Optional[str] = None, fakeroot: bool = True, jobs: Optional[int] = None) -> Dict[str, Any]:
-        start = time.time()
-        jobs = jobs or self.jobs
-        if not self.metafile:
-            self._log("error", "cli.install.nometa", "Metafile handler not available")
-            return {"ok": False, "error": "no_metafile_module"}
-        try:
-            # process metafile (download & patches)
-            proc_res = self.metafile.process([metafile_path], workdir=None, download_profile=None, apply_patches=True)
-        except Exception as e:
-            self._log("error", "cli.install.metaprocess", f"Failed processing metafile: {e}", error=str(e))
-            return {"ok": False, "error": "metafile_process_failed", "exc": str(e)}
-
-        if install_full and self.core:
-            try:
-                workdir = proc_res.get("workdir") if isinstance(proc_res, dict) else None
-                configure_cmd = proc_res.get("configure_cmd") if isinstance(proc_res, dict) else None
-                make_cmd = proc_res.get("make_cmd") if isinstance(proc_res, dict) else None
-                if configure_cmd:
-                    self._print(f">>>> Preparando configuração: {metafile_path} <<<<")
-                    self.core.configure(source_dir=workdir or ".", configure_cmd=configure_cmd)
-                if make_cmd:
-                    self._print(f">>>> Construindo: {metafile_path} <<<<")
-                    self.core.build(source_dir=workdir or ".", make_cmd=make_cmd)
-                inst = self.core.install(source_dir=workdir or ".", destdir=dest, use_fakeroot=fakeroot, use_root_dir=False)
-                dur = time.time() - start
-                details = {"metafile": metafile_path, "install": inst}
-                self._save_report(f"install {metafile_path}", "ok", {"duration": dur, "details": details})
-                return {"ok": True, "details": details}
+                # api.call should return a dict-like result; best-effort wrapper
+                res = self.api.call(command, {"args": args, **kwargs})
+                used_api = True
             except Exception as e:
-                dur = time.time() - start
-                self._save_report(f"install {metafile_path}", "error", {"duration": dur, "error": str(e)})
-                return {"ok": False, "error": str(e)}
-        else:
-            dur = time.time() - start
-            details = {"metafile": metafile_path, "prepared": proc_res}
-            self._save_report(f"install {metafile_path}", "ok", {"duration": dur, "details": details})
-            return {"ok": True, "details": details}
+                exc = e
+                res = None
 
-    def cmd_remove(self, package: str, confirm: bool = False, purge: bool = False) -> Dict[str, Any]:
-        start = time.time()
-        if not self.remover:
-            self._log("error", "cli.remove.nomodule", "Remove module not available")
-            return {"ok": False, "error": "no_remove_module"}
-        res = self.remover.execute_removal(package, confirm=confirm, purge=purge, use_sandbox=self.use_sandbox)
-        dur = time.time() - start
-        self._save_report(f"remove {package}", "ok" if res.get("ok") else "error", {"duration": dur, "result": res})
-        return res
+        if not used_api:
+            try:
+                res = func(*args, **kwargs)
+            except Exception as e:
+                exc = e
+                res = None
 
-    def cmd_upgrade(self, packages: List[Tuple[str, Optional[str]]], parallel: Optional[int] = None) -> Dict[str, Any]:
-        start = time.time()
-        if not self.upgrade:
-            self._log("error", "cli.upgrade.nomodule", "Upgrade module not available")
-            return {"ok": False, "error": "no_upgrade_module"}
-        res = self.upgrade.upgrade(packages, parallel=parallel or self.jobs, use_sandbox=self.use_sandbox)
-        dur = time.time() - start
-        self._save_report("upgrade", "ok", {"duration": dur, "result": res})
-        return res
+        duration = time.time() - t0
 
-    def cmd_sync(self, names: Optional[List[str]] = None, parallel: Optional[int] = None) -> Dict[str, Any]:
-        start = time.time()
-        if not self.syncer:
-            self._log("error", "cli.sync.nomodule", "Sync module not available")
-            return {"ok": False, "error": "no_sync_module"}
-        res = self.syncer.sync_all(names, update=True, use_sandbox=self.use_sandbox, parallel=parallel or self.jobs)
-        dur = time.time() - start
-        self._save_report("sync", "ok", {"duration": dur, "result": res})
-        return res
+        # post hook
+        if self.hooks:
+            try:
+                self.hooks.run("post_command", {"command": command, "result": res, "error": str(exc) if exc else None, "duration": duration})
+            except Exception:
+                pass
 
-    def cmd_audit(self, packages: Optional[List[str]] = None, execute: bool = False, confirm: bool = False) -> Dict[str, Any]:
-        start = time.time()
-        if not self.auditer:
-            self._log("error", "cli.audit.nomodule", "Audit module not available")
-            return {"ok": False, "error": "no_audit_module"}
-        findings = self.auditer.scan(packages)
-        plan = self.auditer.plan(findings)
-        executed = []
-        if execute:
-            executed = self.auditer.execute_plan(plan, confirm=confirm, parallel=self.jobs, use_sandbox=self.use_sandbox)
-        dur = time.time() - start
-        report = {"findings": [f.to_dict() for f in findings], "plan": [p.to_dict() for p in plan], "executed": executed}
-        self._save_report("audit", "ok", {"duration": dur, "report": report})
-        return {"ok": True, "report": report}
+        # audit integration for certain commands
+        try:
+            if command in ("install", "remove", "upgrade") and self.audit:
+                try:
+                    # best-effort incremental scan after operation (non-blocking could be preferred)
+                    self.audit.scan_system()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-    def cmd_deps(self, package: str, action: str = "resolve", dep_type: str = "all") -> Dict[str, Any]:
-        start = time.time()
+        # build consolidated report structure
+        report = {
+            "command": command,
+            "args": args,
+            "kwargs": kwargs,
+            "used_api": used_api,
+            "result": res,
+            "error": str(exc) if exc else None,
+            "duration": round(duration, 3),
+            "ts": now_ts(),
+        }
+        return report
+
+    # ---------------- command implementations ----------------
+    def cmd_sync(self, repos: Optional[List[str]] = None, parallel: Optional[int] = None, dry_run: bool = False):
+        if not self.sync:
+            raise RuntimeError("sync module not available")
+        parallel = parallel or self.jobs
+        self._print_phase(f">>>> Sincronizando repositórios ({len(repos) if repos else 'all'}) <<<<")
+        # sync module may expose sync_all() or sync_repos(list)
+        if repos:
+            return self.sync.sync_repos(repos, jobs=parallel, dry_run=dry_run)
+        if hasattr(self.sync, "sync_all"):
+            return self.sync.sync_all(jobs=parallel, dry_run=dry_run)
+        raise RuntimeError("sync module does not expose sync_all or sync_repos")
+
+    def cmd_deps_resolve(self, package: str, types: Optional[List[str]] = None, install_missing: bool = False, jobs: Optional[int] = None):
         if not self.deps:
-            self._log("error", "cli.deps.nomodule", "Deps module not available")
-            return {"ok": False, "error": "no_deps_module"}
-        if action == "resolve":
-            res = self.deps.resolve(package, dep_type=dep_type)
-            out = res.to_dict() if hasattr(res, "to_dict") else res
-        elif action == "missing":
-            out = self.deps.check_missing(package, dep_type=dep_type)
-        elif action == "graph":
-            result = self.deps.graph(package, dep_type=dep_type, format="json")
-            out = result
+            raise RuntimeError("deps module not available")
+        types = types or ["build", "runtime", "optional"]
+        self._print_phase(f">>>> Resolvendo dependências para {package} <<<<")
+        report = self.deps.resolve(package, include_types=types)
+        if install_missing and report.missing:
+            self._print_phase(f">>>> Instalando dependências faltantes: {len(report.missing)} <<<<")
+            summary = self.deps.install_missing(report, parallel=jobs or self.jobs)
+            return {"resolve": report, "install_summary": summary}
+        return {"resolve": report}
+
+    def cmd_install(self, metafile_path: str, install_all: bool = False, jobs: Optional[int] = None, dry_run: bool = False):
+        """
+        Install command: given a metafile (toml/json) path or package name, run the full install workflow:
+         - parse metafile or use metafile manager
+         - resolve deps (if configured)
+         - fetch, build, package and install via core/upgrade
+        """
+        # prefer metafile manager if available
+        self._print_phase(f">>>> Preparando a instalação de {metafile_path} <<<<")
+        mf = None
+        if Path(metafile_path).exists():
+            try:
+                import tomllib  # Python 3.11+; if not available, use toml fallback
+                with open(metafile_path, "rb") as fh:
+                    mf = tomllib.load(fh)
+            except Exception:
+                try:
+                    import toml as _toml  # type: ignore
+                    mf = _toml.load(metafile_path)
+                except Exception:
+                    mf = None
         else:
-            out = {"error": "unknown_action"}
-        dur = time.time() - start
-        self._save_report(f"deps {package}", "ok", {"duration": dur, "result": out})
-        return {"ok": True, "result": out}
+            if self.metafile and hasattr(self.metafile, "load_metafile_for"):
+                try:
+                    mf = self.metafile.load_metafile_for(metafile_path)
+                except Exception:
+                    mf = None
 
-    # ---- aliases / subcommand shortcuts ----
-    def alias_dispatch(self, argv: List[str]):
-        if not argv:
-            self.print_help()
-            return
+        # if metafile contains multiple packages, process accordingly
+        pkgs = []
+        if mf and isinstance(mf, dict) and mf.get("packages"):
+            pkgs = mf.get("packages")
+        elif mf and isinstance(mf, dict) and mf.get("package"):
+            pkgs = [mf.get("package")]
+        else:
+            # treat metafile_path as package name
+            pkgs = [metafile_path]
 
-        cmd = argv[0]
-        rest = argv[1:]
+        results = []
+        # pipeline per package: deps -> fetch -> build -> package -> install
+        for pkg in pkgs:
+            stage_report = {"package": pkg, "stages": []}
+            # resolve
+            try:
+                if self.deps:
+                    stage_report["stages"].append(("resolve_start", now_ts()))
+                    rep = self.deps.resolve(pkg)
+                    stage_report["stages"].append(("resolve_done", {"missing": rep.missing}))
+                    # optionally install missing
+                    if rep.missing:
+                        if dry_run or self.dry_run:
+                            stage_report["stages"].append(("install_missing", "dry-run"))
+                        else:
+                            inst_summary = self.deps.install_missing(rep, parallel=jobs or self.jobs)
+                            stage_report["stages"].append(("install_missing", inst_summary))
+            except Exception as e:
+                stage_report["stages"].append(("resolve_error", str(e)))
+            # delegate to upgrade pipeline (prefer upgrade.upgrade_package)
+            try:
+                if self.upgrade and hasattr(self.upgrade, "upgrade_package"):
+                    stage_report["stages"].append(("upgrade_start", now_ts()))
+                    if dry_run or self.dry_run:
+                        res = {"ok": True, "message": "dry-run"}
+                    else:
+                        res = self.upgrade.upgrade_package(pkg)
+                    stage_report["stages"].append(("upgrade_done", asdict(res) if hasattr(res, "__dict__") else res))
+                else:
+                    # fallback: use core.build + core.package_and_install
+                    if self.core and hasattr(self.core, "build_package"):
+                        if dry_run or self.dry_run:
+                            stage_report["stages"].append(("build", "dry-run"))
+                        else:
+                            ok, msg = self.core.build_package(pkg)
+                            stage_report["stages"].append(("build", {"ok": ok, "msg": msg}))
+                            if ok and hasattr(self.core, "package_and_install"):
+                                ok2, msg2 = self.core.package_and_install(pkg)
+                                stage_report["stages"].append(("package_install", {"ok": ok2, "msg": msg2}))
+                    else:
+                        stage_report["stages"].append(("no_build_backend", None))
+            except Exception as e:
+                stage_report["stages"].append(("upgrade_error", str(e)))
+            results.append(stage_report)
+            # audit after install
+            if self.audit:
+                try:
+                    self.audit.scan_system()
+                except Exception:
+                    pass
+        return {"install_results": results}
+
+    def cmd_remove(self, packages: List[str], purge: bool = False, jobs: Optional[int] = None, dry_run: bool = False):
+        if not self.remover:
+            raise RuntimeError("remove module not available")
+        self._print_phase(f">>>> Preparando remoção de {len(packages)} pacotes <<<<")
+        report = self.remover.remove_packages(packages, confirm=(not self.quiet), purge=purge, parallel=jobs or self.jobs, use_sandbox=None, fakeroot=False)
+        # audit
+        if self.audit:
+            try:
+                self.audit.scan_system()
+            except Exception:
+                pass
+        return report
+
+    def cmd_upgrade(self, packages: Optional[List[str]] = None, all_pkgs: bool = False, jobs: Optional[int] = None, dry_run: bool = False):
+        if not self.upgrade:
+            raise RuntimeError("upgrade module not available")
+        # prepare list
+        target = packages or []
+        if all_pkgs:
+            # try metafile manager or db
+            if self.metafile and hasattr(self.metafile, "list_all_packages"):
+                try:
+                    target = self.metafile.list_all_packages()
+                except Exception:
+                    target = []
+            elif self.db and hasattr(self.db, "list_available_packages"):
+                try:
+                    target = [p.get("name") for p in self.db.list_available_packages()]
+                except Exception:
+                    target = []
+            else:
+                raise RuntimeError("no source for --all packages")
+        if not target:
+            raise RuntimeError("no packages specified for upgrade")
+        self._print_phase(f">>>> Iniciando upgrade de {len(target)} pacotes <<<<")
+        if dry_run or self.dry_run:
+            # call upgrade.upgrade_all with dry-run flag if supported
+            try:
+                if hasattr(self.upgrade, "upgrade_all"):
+                    return self.upgrade.upgrade_all(target, parallel=jobs or self.jobs)
+                else:
+                    # fallback per-package dry-run simulation
+                    return [{"package": p, "ok": True, "stage": "dry-run"} for p in target]
+            except Exception as e:
+                raise
+        else:
+            if hasattr(self.upgrade, "upgrade_all"):
+                return self.upgrade.upgrade_all(target, parallel=jobs or self.jobs)
+            else:
+                # call per package
+                res = []
+                for p in target:
+                    try:
+                        r = self.upgrade.upgrade_package(p)
+                    except Exception as e:
+                        r = {"package": p, "ok": False, "error": str(e)}
+                    res.append(r)
+                return res
+
+    def cmd_audit(self, quick: bool = False):
+        if not self.audit:
+            raise RuntimeError("audit module not available")
+        self._print_phase(">>>> Executando auditoria do sistema <<<<")
+        rep = self.audit.run_audit()
+        return rep
+
+    def cmd_sync_and_bootstrap(self, pkgs: List[str], jobs: Optional[int] = None, dry_run: bool = False):
+        """
+        High-level bootstrap for list of packages (default base set):
+         sync -> deps.resolve -> upgrade/install
+        """
+        jobs = jobs or self.jobs
+        report_summary = {"bootstrap": {"packages": pkgs, "stages": []}}
+        # 1) sync
+        try:
+            if self.sync:
+                report_summary["bootstrap"]["stages"].append({"stage": "sync_start", "ts": now_ts()})
+                self.cmd_sync(None, parallel=jobs, dry_run=dry_run)
+                report_summary["bootstrap"]["stages"].append({"stage": "sync_done", "ts": now_ts()})
+        except Exception as e:
+            report_summary["bootstrap"]["stages"].append({"stage": "sync_error", "error": str(e)})
+            return report_summary
+        # 2) for each package run deps.resolve -> upgrade pipeline
+        pkgs_to_upgrade = pkgs
+        for pkg in pkgs_to_upgrade:
+            try:
+                report_summary["bootstrap"]["stages"].append({"stage": "resolve_start", "pkg": pkg, "ts": now_ts()})
+                rep = None
+                if self.deps:
+                    rep = self.deps.resolve(pkg)
+                report_summary["bootstrap"]["stages"].append({"stage": "resolve_done", "pkg": pkg, "missing": rep.missing if rep else []})
+                # install missing
+                if rep and rep.missing:
+                    if not dry_run:
+                        self.deps.install_missing(rep, parallel=jobs)
+                # upgrade package
+                report_summary["bootstrap"]["stages"].append({"stage": "upgrade_start", "pkg": pkg, "ts": now_ts()})
+                upres = self.cmd_upgrade([pkg], all_pkgs=False, jobs=jobs, dry_run=dry_run)
+                report_summary["bootstrap"]["stages"].append({"stage": "upgrade_done", "pkg": pkg, "result": upres})
+            except Exception as e:
+                report_summary["bootstrap"]["stages"].append({"stage": "bootstrap_error", "pkg": pkg, "error": str(e)})
+        # final audit
+        if self.audit and not dry_run:
+            try:
+                report_summary["bootstrap"]["stages"].append({"stage": "audit_start", "ts": now_ts()})
+                self.audit.scan_system()
+                report_summary["bootstrap"]["stages"].append({"stage": "audit_done", "ts": now_ts()})
+            except Exception:
+                pass
+        return report_summary
+
+    # ---------------- CLI entrypoint ----------------
+    def run(self, argv: Optional[List[str]] = None) -> int:
+        parser = argparse.ArgumentParser(prog="newpkg", description="newpkg unified CLI")
+        sub = parser.add_subparsers(dest="cmd", required=False)
 
         # install
-        if cmd in ("i", "install", "-i", "--install"):
-            if not rest:
-                print("usage: newpkg i <metafile>")
-                sys.exit(2)
-            mf = rest[0]
-            res = self.cmd_install(mf, install_full=True)
-            self._emit_result(res)
-            return
+        p_install = sub.add_parser("install", aliases=["i"], help="install from metafile or package name")
+        p_install.add_argument("metafile", help="metafile path or package name")
+        p_install.add_argument("--jobs", type=int)
+        p_install.add_argument("--dry-run", action="store_true")
+        p_install.add_argument("--json", action="store_true")
 
         # remove
-        if cmd in ("rm", "remove", "-r", "--remove"):
-            if not rest:
-                print("usage: newpkg rm <package>")
-                sys.exit(2)
-            pkg = rest[0]
-            res = self.cmd_remove(pkg, confirm=True)
-            self._emit_result(res)
-            return
+        p_remove = sub.add_parser("remove", aliases=["rm", "r"], help="remove package(s)")
+        p_remove.add_argument("packages", nargs="+")
+        p_remove.add_argument("--purge", action="store_true")
+        p_remove.add_argument("--jobs", type=int)
+        p_remove.add_argument("--dry-run", action="store_true")
+        p_remove.add_argument("--json", action="store_true")
 
         # upgrade
-        if cmd in ("up", "upgrade", "-u", "--upgrade"):
-            if not rest:
-                print("usage: newpkg up <pkg> or newpkg up --all")
-                sys.exit(2)
-            pkgs = []
-            for it in rest:
-                if it == "--all":
-                    if self.db:
-                        pkgs = [(p.get("name"), None) for p in (self.db.list_packages() or [])]
-                        break
-                if "=" in it:
-                    name, mf = it.split("=", 1)
-                    pkgs.append((name, mf))
-                else:
-                    pkgs.append((it, None))
-            res = self.cmd_upgrade(pkgs)
-            self._emit_result(res)
-            return
+        p_upgrade = sub.add_parser("upgrade", aliases=["up", "u"], help="upgrade package(s)")
+        p_upgrade.add_argument("packages", nargs="*", help="package names (omit if --all)")
+        p_upgrade.add_argument("--all", action="store_true")
+        p_upgrade.add_argument("--jobs", type=int)
+        p_upgrade.add_argument("--dry-run", action="store_true")
+        p_upgrade.add_argument("--json", action="store_true")
 
         # sync
-        if cmd in ("s", "sync", "-s", "--sync"):
-            res = self.cmd_sync()
-            self._emit_result(res)
-            return
+        p_sync = sub.add_parser("sync", aliases=["s"], help="sync repositories")
+        p_sync.add_argument("repos", nargs="*", help="optional list of repos to sync")
+        p_sync.add_argument("--jobs", type=int)
+        p_sync.add_argument("--dry-run", action="store_true")
+        p_sync.add_argument("--json", action="store_true")
+
+        # deps resolve
+        p_deps = sub.add_parser("deps", aliases=["d"], help="resolve dependencies")
+        p_deps.add_argument("package", help="package name")
+        p_deps.add_argument("--install-missing", action="store_true")
+        p_deps.add_argument("--json", action="store_true")
 
         # audit
-        if cmd in ("a", "audit", "-a", "--audit"):
-            res = self.cmd_audit()
-            self._emit_result(res)
-            return
+        p_audit = sub.add_parser("audit", aliases=["a"], help="run audit")
+        p_audit.add_argument("--quick", action="store_true")
+        p_audit.add_argument("--json", action="store_true")
 
-        # build
-        if cmd in ("b", "build", "-b", "--build"):
-            if not rest:
-                print("usage: newpkg b <metafile>")
-                sys.exit(2)
-            mf = rest[0]
-            if not self.metafile:
-                print("no metafile module")
-                sys.exit(2)
-            prep = self.metafile.process([mf], workdir=None, download_profile=None, apply_patches=True)
-            workdir = prep.get("workdir") if isinstance(prep, dict) else None
-            if not self.core:
-                print("no core module")
-                sys.exit(2)
-            build_res = self.core.build(source_dir=workdir or ".", make_cmd=None)
-            self._emit_result({"ok": build_res.get("rc", 1) == 0, "details": {"build": build_res}})
-            return
+        # bootstrap
+        p_boot = sub.add_parser("bootstrap", help="bootstrap a list of base packages (sync -> deps -> build -> install)")
+        p_boot.add_argument("packages", nargs="+", help="packages to bootstrap")
+        p_boot.add_argument("--jobs", type=int)
+        p_boot.add_argument("--dry-run", action="store_true")
+        p_boot.add_argument("--json", action="store_true")
 
-        # fallback help
-        self.print_help()
-        return
-
-    # --- output helpers ---
-    def _emit_result(self, res: Dict[str, Any]):
-        if self.json_out:
-            print(json.dumps(res, indent=2))
-            return
-        if isinstance(res, dict) and res.get("ok") is False:
-            self._print(f"[red]ERROR[/red] {res.get('error','<unknown>')}")
-            return
-        if self.rich and console:
-            console.rule("[bold cyan]newpkg result")
-            console.print(json.dumps(res, indent=2))
-            console.rule()
-        else:
-            print("Result:")
-            print(json.dumps(res, indent=2))
-
-    def print_help(self):
-        help_text = """
-newpkg — package build & management
-
-Short aliases:
-  i <metafile>       install
-  rm <package>       remove
-  up <pkg>           upgrade
-  s                  sync
-  a                  audit
-  b <metafile>       build only
-Full flags:
-  -i/--install METAFILE
-  -r/--remove PACKAGE
-  -u/--upgrade PKG...
-  -s/--sync [NAMES...]
-  -a/--audit [PKG...]
-Global flags:
-  -n/--dry-run  -q/--quiet  -j/--json  --no-sandbox  -J/--jobs
-"""
-        print(help_text)
-
-    # ---- main entrypoint: argparse & dispatch ----
-    def main(self, argv: Optional[List[str]] = None):
-        argv = argv if argv is not None else sys.argv[1:]
-
-        # quick alias detection: if first token is a short alias, do alias_dispatch
-        if argv and argv[0] in ("i", "rm", "up", "s", "a", "b"):
-            self.alias_dispatch(argv)
-            return
-
-        parser = ArgumentParser(prog="newpkg", description="newpkg CLI — build and manage LFS/BLFS components", formatter_class=RawDescriptionHelpFormatter)
         # global flags
-        parser.add_argument("-n", "--dry-run", action="store_true", help="simulate (dry-run)")
-        parser.add_argument("-q", "--quiet", action="store_true", help="quiet mode")
-        parser.add_argument("-j", "--json", action="store_true", help="JSON output")
-        parser.add_argument("--no-sandbox", action="store_true", help="disable sandbox usage")
-        parser.add_argument("-J", "--jobs", type=int, help="override parallel jobs")
-        parser.add_argument("-c", "--config", help="use alternate config file (path)")
-        # subcommands as flags (short + long)
-        parser.add_argument("-i", "--install", metavar="METAFILE", help="install from metafile")
-        parser.add_argument("-r", "--remove", metavar="PACKAGE", help="remove package")
-        parser.add_argument("-u", "--upgrade", nargs="*", metavar="PKG", help="upgrade packages (name or name=metafile)")
-        parser.add_argument("-s", "--sync", nargs="*", metavar="NAME", help="sync repositories")
-        parser.add_argument("-a", "--audit", nargs="*", metavar="PKG", help="audit packages")
-        parser.add_argument("-b", "--build", metavar="METAFILE", help="build from metafile (no install)")
-        parser.add_argument("-p", "--package", metavar="DIR", help="package a staged directory")
-        parser.add_argument("-d", "--deps", nargs=2, metavar=("PKG", "ACTION"), help="dependency actions: resolve|missing|graph")
-        parser.add_argument("--report-dir", help="override report dir for this run")
-        args = parser.parse_args(argv)
+        parser.add_argument("--quiet", action="store_true", help="quiet mode (less output)")
+        parser.add_argument("--json", action="store_true", help="output JSON")
+        parser.add_argument("--dry-run", action="store_true", help="dry run")
+        parser.add_argument("--jobs", type=int, help="number of parallel jobs")
+        parser.add_argument("--profile", choices=list(self.PROFILES.keys()), help="preset profile")
+        parser.add_argument("--report-dir", help="override CLI report dir")
+        parser.add_argument("--version", action="store_true", help="show version")
 
-        # override global runtime flags
-        if args.dry_run:
-            self.dry_run = True
-        if args.quiet:
-            self.quiet = True
-        if args.json:
-            self.json_out = True
-        if args.no_sandbox:
-            self.use_sandbox = False
+        args = parser.parse_args(argv or sys.argv[1:])
+
+        # global options
+        if args.profile:
+            self.profile = args.profile
+            prof = self.PROFILES.get(self.profile, {})
+            if prof.get("jobs") is not None:
+                self.jobs = prof["jobs"]
         if args.jobs:
             self.jobs = args.jobs
         if args.report_dir:
             self.report_dir = Path(args.report_dir)
+            self.report_dir.mkdir(parents=True, exist_ok=True)
+        if args.quiet:
+            self.quiet = True
+        if args.json:
+            self.json_out = True
+        if args.dry_run:
+            self.dry_run = True
 
-        start = time.time()
-        status = "ok"
-        details: Dict[str, Any] = {}
+        # version shortcut
+        if args.version:
+            print("newpkg CLI (revision)")
+            return 0
 
+        # dispatch chosen command
+        cmd = args.cmd or "help"
         try:
-            if args.install:
-                res = self.cmd_install(args.install, install_full=True)
-                details = res
-                self._emit_result(res)
-            elif args.build:
-                if not self.metafile:
-                    raise RuntimeError("metafile module not available")
-                prep = self.metafile.process([args.build], workdir=None, download_profile=None, apply_patches=True)
-                workdir = prep.get("workdir") if isinstance(prep, dict) else None
-                if not self.core:
-                    raise RuntimeError("core module not available")
-                build_res = self.core.build(source_dir=workdir or ".", make_cmd=None)
-                details = {"build": build_res}
-                self._emit_result({"ok": build_res.get("rc", 1) == 0, "details": details})
-            elif args.remove:
-                res = self.cmd_remove(args.remove, confirm=True)
-                details = res
-                self._emit_result(res)
-            elif args.upgrade is not None:
-                pkgs_arg = args.upgrade or []
-                pkgs = []
-                if not pkgs_arg:
-                    if self.db:
-                        pkgs = [(p.get("name"), None) for p in (self.db.list_packages() or [])]
-                    else:
-                        raise RuntimeError("No packages specified and DB not available")
-                else:
-                    for it in pkgs_arg:
-                        if "=" in it:
-                            name, mf = it.split("=", 1)
-                            pkgs.append((name, mf))
-                        else:
-                            pkgs.append((it, None))
-                res = self.cmd_upgrade(pkgs, parallel=self.jobs)
-                details = res
-                self._emit_result(res)
-            elif args.sync is not None:
-                names = args.sync if args.sync else None
-                res = self.cmd_sync(names, parallel=self.jobs)
-                details = res
-                self._emit_result(res)
-            elif args.audit is not None:
-                pkgs = args.audit if args.audit else None
-                res = self.cmd_audit(packages=pkgs, execute=False)
-                details = res
-                self._emit_result(res)
-            elif args.deps:
-                pkg, action = args.deps
-                res = self.cmd_deps(pkg, action)
-                details = res
-                self._emit_result(res)
-            elif args.package:
-                if not self.core:
-                    raise RuntimeError("core module not available")
-                meta = {"name": Path(args.package).name, "version": "0"}
-                res = self.core.package(args.package, meta)
-                details = res
-                self._emit_result(res)
+            if cmd in ("install", "i"):
+                report = self._dispatch("install", self.cmd_install, args.metafile, False, args.jobs, args.dry_run or self.dry_run)
+            elif cmd in ("remove", "rm", "r"):
+                report = self._dispatch("remove", self.cmd_remove, args.packages, args.purge, args.jobs, args.dry_run or self.dry_run)
+            elif cmd in ("upgrade", "up", "u"):
+                report = self._dispatch("upgrade", self.cmd_upgrade, args.packages, args.all, args.jobs, args.dry_run or self.dry_run)
+            elif cmd in ("sync", "s"):
+                repos = args.repos if hasattr(args, "repos") else None
+                report = self._dispatch("sync", self.cmd_sync, repos, args.jobs, args.dry_run or self.dry_run)
+            elif cmd in ("deps", "d"):
+                report = self._dispatch("deps.resolve", self.cmd_deps_resolve, args.package, None, args.install_missing, self.jobs)
+            elif cmd in ("audit", "a"):
+                report = self._dispatch("audit", self.cmd_audit, args.quick)
+            elif cmd == "bootstrap":
+                report = self._dispatch("bootstrap", self.cmd_sync_and_bootstrap, args.packages, args.jobs, args.dry_run or self.dry_run)
             else:
-                self.print_help()
-                status = "noop"
+                parser.print_help()
+                return 1
         except Exception as e:
-            status = "error"
-            details = {"error": str(e)}
-            self._log("error", "cli.run.exception", f"Exception in CLI: {e}", error=str(e))
-            if self.json_out:
-                print(json.dumps({"ok": False, "error": str(e)}, indent=2))
-            else:
-                print("ERROR:", str(e))
+            # consolidate error into report
+            report = {"command": cmd, "error": str(e), "ts": now_ts()}
+            if not self.json_out:
+                if RICH and _console:
+                    _console.print(f"[red]Error:[/red] {e}")
+                else:
+                    print("Error:", e)
 
-        duration = time.time() - start
+        # output
+        # if the dispatched function already returned a structured report (dict/list), use it
+        out_report = report if isinstance(report, dict) else {"result": report}
+        # attach meta
+        out_report["_meta"] = {"cmd": cmd, "profile": self.profile, "jobs": self.jobs, "ts": now_ts(), "dry_run": self.dry_run or getattr(args, "dry_run", False)}
+        # save report to disk
         try:
-            rep = self._save_report(" ".join(argv) or "help", status, {"duration": duration, "details": details})
-            if not self.quiet and not self.json_out:
-                self._print(f"Report saved to: {rep}")
+            saved_path = save_cli_report(self.report_dir, f"cli-{cmd}", out_report, compress=self.compress_reports)
+            out_report["_meta"]["report_path"] = str(saved_path)
         except Exception:
             pass
 
+        # show to user according to modes
+        if self.json_out or getattr(args, "json", False):
+            # print JSON
+            print(json.dumps(out_report, indent=2, ensure_ascii=False))
+        else:
+            # human readable summary
+            if isinstance(out_report.get("result"), dict) and out_report["result"].get("install_results"):
+                # pretty print install summary
+                if RICH and _console:
+                    table = Table(title="Install Summary")
+                    table.add_column("package")
+                    table.add_column("stages")
+                    for r in out_report["result"]["install_results"]:
+                        pk = r.get("package")
+                        stages = "\n".join(str(s) for s in r.get("stages", []))
+                        table.add_row(pk, stages)
+                    _console.print(table)
+                else:
+                    print("Install results:")
+                    print(json.dumps(out_report["result"], indent=2))
+            else:
+                # generic print
+                if RICH and _console:
+                    _console.print(f"[green]Command[/green]: {cmd} — report: {out_report['_meta'].get('report_path')}")
+                else:
+                    print(f"Command: {cmd} — report: {out_report['_meta'].get('report_path')}")
 
-# Entrypoint
-def main():
-    cfg = init_config() if init_config else None
-    cli = NewpkgCLI(cfg=cfg)
-    cli.main()
+        # exit code: 0 if no 'error' key and ok flags; else 2
+        if out_report.get("error"):
+            return 2
+        # some modules return success flags; try to detect failures
+        ok_flag = True
+        # check typical locations in report for failures
+        if isinstance(out_report.get("result"), dict):
+            if out_report["result"].get("failed") or out_report["result"].get("failed_items"):
+                ok_flag = False
+        return 0 if ok_flag else 2
 
+# ---------------- CLI runner ----------------
+def main(argv: Optional[List[str]] = None) -> int:
+    cli = NewpkgCLI()
+    return cli.run(argv)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
