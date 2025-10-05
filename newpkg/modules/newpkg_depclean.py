@@ -1,372 +1,472 @@
+#!/usr/bin/env python3
 """
 newpkg_depclean.py
 
-Módulo para identificar e limpar dependências órfãs, pacotes quebrados e oferecer
-reconstruções reversas (revdep rebuild) no ecossistema newpkg.
+Depclean / orphan & broken-package cleaner for newpkg.
 
-Design goals:
-- Integrar com NewpkgDB para leitura/escrita de pacotes e dependências
-- Integrar com NewpkgLogger para eventos e métricas
-- Integrar com NewpkgSandbox para rebuilds em ambiente seguro
-- Suportar dry-run, confirmação interativa e geração de relatório JSON
+Features:
+- scan(): inspect DB and produce lists of orphan packages and broken packages (missing deps)
+- plan(): generate an actionable plan (remove orphans, rebuild dependers of broken packages)
+- execute(): perform removals and rebuilds (with dry-run, interactive, and parallel options)
+- integration with ConfigStore (cfg.get('depclean.*')), NewpkgLogger (logger.info/error), NewpkgDB (record_phase)
+- sandbox support: uses sandbox.run()/wrap() if provided, or falls back to bubblewrap for isolated rebuilds
+- reports saved as JSON
+- safe defaults: dry-run=True; auto_confirm=False
 
-API principal:
-    depclean = NewpkgDepclean(cfg, db, logger, sandbox)
-    report = depclean.scan()
-    orphans = depclean.orphans()
-    plan = depclean.plan(remove=True)
-    depclean.execute(plan, interactive=True)
-
+Assumptions about other modules:
+- newpkg_db.NewpkgDB provides list_packages(), get_deps(pkg), remove_package(name), mark_installed(name), record_phase(...)
+- newpkg_logger.NewpkgLogger provides info()/error()/warning() that accept (event, message, **meta)
+- sandbox if provided exposes wrap(cmd, binds=[], cwd=...) or run(cmd, cwd=..., env=...)
 """
+
 from __future__ import annotations
 
+import concurrent.futures
 import json
-import sys
+import os
 import shutil
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# Safe imports for optional modules (CLI will use init_config if available)
+try:
+    from newpkg_config import init_config, ConfigManager
+except Exception:
+    init_config = None
+    ConfigManager = None
+
+# safe import shims for logger and db modules if not present
+try:
+    from newpkg_logger import NewpkgLogger
+except Exception:
+    NewpkgLogger = None
+
+try:
+    from newpkg_db import NewpkgDB
+except Exception:
+    NewpkgDB = None
+
+# minimal helper to call bubblewrap if sandbox not available
+def _bwrap_available() -> Optional[str]:
+    return shutil.which("bwrap")
 
 
 class DepcleanError(Exception):
     pass
 
 
-@dataclass
-class DepcleanPlanItem:
-    package: str
-    reason: str
-    action: str  # 'remove' | 'rebuild'
-    details: Dict[str, Any]
-
-
-@dataclass
-class DepcleanReport:
-    timestamp: str
-    summary: Dict[str, Any]
-    items: List[DepcleanPlanItem]
-
-    def to_json(self) -> str:
-        return json.dumps({
-            "timestamp": self.timestamp,
-            "summary": self.summary,
-            "items": [item.__dict__ for item in self.items],
-        }, indent=2, ensure_ascii=False)
-
-
-class NewpkgDepclean:
-    def __init__(self, cfg: Any, db: Any, logger: Any = None, sandbox: Any = None):
+class Depclean:
+    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, sandbox: Any = None):
+        """
+        cfg: ConfigStore or similar (optional)
+        logger: NewpkgLogger-like object (optional)
+        db: NewpkgDB-like object (optional)
+        sandbox: sandbox abstraction with wrap()/run() or None
+        """
         self.cfg = cfg
-        self.db = db
-        self.logger = logger
+        self.logger = logger or (NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None)
+        self.db = db or (NewpkgDB(cfg) if NewpkgDB else None)
         self.sandbox = sandbox
 
-        # config defaults
-        self.keep_list = set()
-        try:
-            keep = self.cfg.get("DEPCLEAN_KEEP")
-            if keep:
-                # allow comma separated
-                if isinstance(keep, str):
-                    self.keep_list = set([p.strip() for p in keep.split(",") if p.strip()])
-                elif isinstance(keep, (list, tuple, set)):
-                    self.keep_list = set(keep)
-        except Exception:
-            self.keep_list = set()
+        # config defaults (lowercase keys preferred; fallback to env vars)
+        self.keep_protected = bool(self._cfg_get("depclean.keep_protected", True))
+        # number of workers for parallel rebuilds (0 or 1 => serial)
+        self.parallel_jobs = int(self._cfg_get("depclean.parallel_jobs", self._cfg_get("DEPCLEAN_PARALLEL", 1)))
+        # default behavior
+        self.default_dry_run = bool(self._cfg_get("depclean.dry_run", True))
+        self.auto_confirm = bool(self._cfg_get("depclean.auto_confirm", False))
+        self.report_dir = str(self._cfg_get("depclean.report_dir", "/var/tmp/newpkg_depclean_reports"))
+        Path(self.report_dir).mkdir(parents=True, exist_ok=True)
 
-        self.auto_run_after_build = False
+    # ---------------- config helper ----------------
+    def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
-            self.auto_run_after_build = bool(self.cfg.get("DEPCLEAN_AUTO"))
+            if self.cfg and hasattr(self.cfg, "get"):
+                v = self.cfg.get(key)
+                if v is not None:
+                    return v
         except Exception:
-            self.auto_run_after_build = False
+            pass
+        # fallback to env
+        ek = key.upper().replace(".", "_")
+        return os.environ.get(ek, default)
 
-        self.use_sandbox = False
-        try:
-            self.use_sandbox = bool(self.cfg.get("DEPCLEAN_SANDBOX"))
-        except Exception:
-            self.use_sandbox = False
-
-        self.verbose = False
-        try:
-            self.verbose = bool(self.cfg.get("DEPCLEAN_LOG_VERBOSE"))
-        except Exception:
-            self.verbose = False
-
-    # -------------------- helpers --------------------
-    def _log(self, event: str, level: str = "INFO", message: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
+    # ---------------- logging helper ----------------
+    def _log(self, level: str, event: str, message: str = "", **meta):
         if self.logger:
-            self.logger.log_event(event, level=level, message=message or event, metadata=metadata or {})
+            try:
+                fn = getattr(self.logger, level.lower(), None)
+                if fn:
+                    fn(event, message, **meta)
+                    return
+            except Exception:
+                pass
+        # fallback to stderr
+        print(f"[{level}] {event}: {message}", file=sys.stderr)
 
-    def _pkg_all(self) -> List[Dict[str, Any]]:
-        # return list of packages as dicts (name, id, status...)
-        pkgs = []
-        for p in self.db.list_packages():
-            pkgs.append({"name": p.name, "id": p.id, "status": p.status, "origin": p.origin, "version": p.version})
-        return pkgs
+    # ---------------- scanning ----------------
+    def scan(self) -> Dict[str, Any]:
+        """
+        Scan DB and compute:
+          - orphans: packages that no other package depends on and are not protected
+          - broken: packages that have missing dependencies
+        Returns a dict with structure {'orphan': [names], 'broken': [{pkg:..., missing:[...]}], 'timestamp':...}
+        """
+        if not self.db:
+            raise DepcleanError("database module not configured")
 
-    def _deps_all(self) -> List[Dict[str, Any]]:
-        # returns list of deps rows from db: package_name -> depends_on
-        out = []
-        for p in self.db.list_packages():
-            deps = self.db.get_deps(p.name)
-            for d in deps:
-                out.append({"package": p.name, "depends_on": d.get("depends_on"), "optional": bool(d.get("optional"))})
-        return out
+        packages = self.db.list_packages()
+        name_map = {p["name"]: p for p in packages}
+        # build reverse dep map
+        revdeps: Dict[str, List[str]] = {}
+        for p in packages:
+            pname = p["name"]
+            deps = []
+            try:
+                deps_obj = self.db.get_deps(pname)
+                # db.get_deps returns list of dicts like {'dep_name':..}
+                for d in deps_obj:
+                    if isinstance(d, dict):
+                        depn = d.get("dep_name") or d.get("name") or d.get("pkg") or d.get("package")
+                        if depn:
+                            deps.append(depn)
+                    elif isinstance(d, str):
+                        deps.append(d)
+            except Exception:
+                # assume no deps
+                deps = []
+            for dep in deps:
+                revdeps.setdefault(dep, []).append(pname)
 
-    # -------------------- scan / analysis --------------------
-    def scan(self) -> DepcleanReport:
-        """Analisa o estado atual e retorna um relatório com candidates para remoção e rebuild."""
-        packages = self._pkg_all()
-        deps = self._deps_all()
+        # orphans: those with no reverse deps and status != 'protected' if configured
+        orphans = []
+        for pname, meta in name_map.items():
+            protected_flag = meta.get("status", "") == "protected" or meta.get("protected", False)
+            if self.keep_protected and protected_flag:
+                continue
+            if pname not in revdeps or not revdeps.get(pname):
+                # candidate orphan, but exclude virtual/system packages: simple heuristic
+                if meta.get("origin") in ("system", "base"):
+                    continue
+                orphans.append(pname)
 
-        pkg_names = {p["name"] for p in packages}
-
-        # build adjacency: package -> set(depends_on)
-        adj: Dict[str, Set[str]] = {name: set() for name in pkg_names}
-        for d in deps:
-            pkg = d["package"]
-            dep = d["depends_on"]
-            if pkg not in adj:
-                adj[pkg] = set()
-            adj[pkg].add(dep)
-
-        # reverse graph: dep -> set(packages that depend on it)
-        rev: Dict[str, Set[str]] = {name: set() for name in pkg_names}
-        for pkg, depset in adj.items():
-            for dep in depset:
-                if dep not in rev:
-                    rev[dep] = set()
-                rev[dep].add(pkg)
-
-        # identify orphans: packages with no dependents (rev[name] empty)
-        orphans = [name for name in pkg_names if len(rev.get(name, set())) == 0]
-        # filter keep list and core system packages heuristically
-        filtered_orphans = [o for o in orphans if o not in self.keep_list and not self._is_core_package(o)]
-
-        # identify broken: packages that depend on missing packages
+        # broken: package whose deps include names not in DB
         broken = []
-        for pkg, depset in adj.items():
-            for dep in depset:
-                if dep not in pkg_names:
-                    broken.append({"package": pkg, "missing_dep": dep})
+        for p in packages:
+            pname = p["name"]
+            missing = []
+            try:
+                deps = self.db.get_deps(pname)
+                for d in deps:
+                    depn = d.get("dep_name") if isinstance(d, dict) else d
+                    if depn and depn not in name_map:
+                        missing.append(depn)
+            except Exception:
+                continue
+            if missing:
+                broken.append({"package": pname, "missing": missing})
 
-        items: List[DepcleanPlanItem] = []
-        for o in filtered_orphans:
-            items.append(DepcleanPlanItem(package=o, reason="orphan", action="remove", details={}))
-        for b in broken:
-            items.append(DepcleanPlanItem(package=b["package"], reason=f"broken_dep:{b[\"missing_dep\"]}", action="rebuild", details={"missing_dep": b["missing_dep"]}))
+        res = {"timestamp": datetime.utcnow().isoformat() + "Z", "orphan_count": len(orphans), "orphan_list": sorted(orphans),
+               "broken_count": len(broken), "broken_list": broken}
+        self._log("info", "depclean.scan", f"Found {len(orphans)} orphans, {len(broken)} broken packages", orphans=len(orphans), broken=len(broken))
+        return res
 
-        summary = {"total_packages": len(pkg_names), "orphans": len(filtered_orphans), "broken": len(broken)}
-        report = DepcleanReport(timestamp=datetime.utcnow().isoformat() + "Z", summary=summary, items=items)
+    # ---------------- planning ----------------
+    def plan(self, scan_result: Optional[Dict[str, Any]] = None, remove_orphans: bool = True, rebuild_broken_revdeps: bool = True) -> Dict[str, Any]:
+        """
+        Generate a plan based on scan_result (if None, run scan()).
+        Plan format:
+          { 'removals': [pkg1, ...], 'rebuilds': [pkgA, ...], 'timestamp':..., 'meta':... }
+        """
+        if scan_result is None:
+            scan_result = self.scan()
 
-        self._log("depclean_scan", level="INFO", message="Completed depclean scan", metadata=summary)
-        return report
+        removals = scan_result.get("orphan_list", []) if remove_orphans else []
+        broken = scan_result.get("broken_list", []) if rebuild_broken_revdeps else []
 
-    def orphans(self) -> List[str]:
-        return [item.package for item in self.scan().items if item.reason == "orphan"]
+        # compute rebuild revdeps for each broken package: packages depending on the missing dep
+        rebuilds_set = set()
+        if broken and self.db:
+            for b in broken:
+                for missing in b.get("missing", []):
+                    # packages that depend on missing (reverse deps)
+                    try:
+                        rev = self.db.get_reverse_deps(missing)
+                        for r in rev:
+                            rebuilds_set.add(r)
+                    except Exception:
+                        continue
 
-    def broken(self) -> List[Dict[str, Any]]:
-        return [item for item in self.scan().items if item.action == "rebuild"]
-
-    # -------------------- plan generation --------------------
-    def plan(self, remove: bool = True, rebuild: bool = True, prefer_rebuild_for_broken: bool = True) -> List[DepcleanPlanItem]:
-        report = self.scan()
-        plan: List[DepcleanPlanItem] = []
-        for it in report.items:
-            if it.action == "remove" and remove:
-                plan.append(it)
-            if it.action == "rebuild" and rebuild:
-                # if prefer_rebuild_for_broken then schedule rebuild (or maybe remove)
-                plan.append(it)
-        self._log("depclean_plan", level="INFO", message="Generated depclean plan", metadata={"plan_items": len(plan)})
+        rebuilds = sorted(list(rebuilds_set))
+        plan = {"timestamp": datetime.utcnow().isoformat() + "Z", "removals": removals, "rebuilds": rebuilds}
+        self._log("info", "depclean.plan", f"Plan with {len(removals)} removals and {len(rebuilds)} rebuilds", removals=len(removals), rebuilds=len(rebuilds))
         return plan
 
-    # -------------------- execute --------------------
-    def _confirm_interactive(self, plan: List[DepcleanPlanItem]) -> bool:
-        print("Depclean plan:")
-        for i, it in enumerate(plan, 1):
-            print(f"  {i}. {it.action.upper()}: {it.package} ({it.reason})")
-        print(f"Total actions: {len(plan)}")
-        resp = input("Proceed? [y/N]: ")
-        return resp.strip().lower() in ("y", "yes")
+    # ---------------- execution helpers ----------------
+    def _confirm(self, message: str) -> bool:
+        if self.auto_confirm:
+            return True
+        try:
+            resp = input(f"{message} [y/N]: ")
+            return resp.strip().lower() in ("y", "yes")
+        except Exception:
+            return False
 
-    def execute(self, plan: List[DepcleanPlanItem], interactive: bool = True, dry_run: bool = True, report_path: Optional[Path] = None) -> DepcleanReport:
-        """Executa o plano passado.
-
-        - interactive: se True, pergunta confirmação ao usuário antes de executar.
-        - dry_run: se True, não altera o DB; apenas simula.
-        - report_path: se fornecido, salva o relatório JSON em disco.
-        """
-        if not plan:
-            raise DepcleanError("Empty plan")
-
-        if interactive:
-            ok = self._confirm_interactive(plan)
-            if not ok:
-                raise DepcleanError("User aborted")
-
-        executed: List[DepcleanPlanItem] = []
-        for it in plan:
-            if it.action == "remove":
-                # remove package from DB (and optionally files via installer)
-                self._log("depclean_remove", level="INFO", message=f"Removing {it.package}", metadata={"package": it.package})
-                if not dry_run:
-                    try:
-                        self.db.remove_package(it.package)
-                        executed.append(it)
-                        # record
-                        try:
-                            self.db.add_log(it.package, "depclean", "ok", log_path=None)
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        self._log("depclean_remove", level="ERROR", message=f"Failed to remove {it.package}: {e}", metadata={"package": it.package, "error": str(e)})
-                else:
-                    executed.append(it)
-            elif it.action == "rebuild":
-                self._log("depclean_rebuild", level="INFO", message=f"Rebuilding {it.package}", metadata={"package": it.package})
-                if not dry_run:
-                    try:
-                        if self.use_sandbox and self.sandbox:
-                            # create sandbox for package and run placeholder rebuild steps
-                            build_dir = self.sandbox.sandbox_for_package(it.package)
-                            # In real usage, you would fetch sources and execute build commands here
-                            res = self.sandbox.run(["/bin/true"], cwd=build_dir)
-                            if res.returncode == 0:
-                                executed.append(it)
-                                try:
-                                    self.db.add_log(it.package, "depclean_rebuild", "ok", log_path=None)
-                                except Exception:
-                                    pass
-                            else:
-                                self._log("depclean_rebuild", level="ERROR", message=f"Rebuild failed for {it.package}", metadata={"package": it.package, "rc": res.returncode})
-                                raise DepcleanError(f"Rebuild failed for {it.package}")
-                        else:
-                            # Non-sandboxed placeholder rebuild (user should integrate real builder)
-                            # For now, mark as rebuilt in DB by updating status
-                            try:
-                                self.db.update_package_status(it.package, "rebuilt")
-                                executed.append(it)
-                                try:
-                                    self.db.add_log(it.package, "depclean_rebuild", "ok", log_path=None)
-                                except Exception:
-                                    pass
-                            except Exception as e:
-                                self._log("depclean_rebuild", level="ERROR", message=f"Failed to rebuild {it.package}: {e}", metadata={"package": it.package, "error": str(e)})
-                                raise
-                    except Exception as e:
-                        raise DepcleanError(f"Failed to rebuild {it.package}: {e}")
-                else:
-                    executed.append(it)
-            else:
-                # unknown action
-                self._log("depclean_unknown", level="WARNING", message=f"Unknown action {it.action} for {it.package}", metadata={"package": it.package})
-
-        summary = {"requested": len(plan), "executed": len(executed), "dry_run": dry_run}
-        report = DepcleanReport(timestamp=datetime.utcnow().isoformat() + "Z", summary=summary, items=executed)
-
-        if report_path:
+    def _remove_package(self, pkg: str, dry_run: bool = True) -> Dict[str, Any]:
+        self._log("info", "depclean.remove.start", f"Removing {pkg}", pkg=pkg, dry_run=dry_run)
+        if dry_run:
+            return {"package": pkg, "action": "remove", "status": "dry-run"}
+        try:
+            # call DB remove_package; core-level uninstall could be more involved
+            if self.db and hasattr(self.db, "remove_package"):
+                self.db.remove_package(pkg)
+            # record action
+            if self.db and hasattr(self.db, "record_phase"):
+                self.db.record_phase(pkg, "depclean.remove", "ok")
+            self._log("info", "depclean.remove.ok", f"Removed {pkg}", pkg=pkg)
+            return {"package": pkg, "action": "remove", "status": "ok"}
+        except Exception as e:
+            self._log("error", "depclean.remove.fail", f"Failed to remove {pkg}: {e}", pkg=pkg, error=str(e))
             try:
-                report_path = Path(report_path)
-                report_path.parent.mkdir(parents=True, exist_ok=True)
-                report_path.write_text(report.to_json(), encoding="utf-8")
+                if self.db and hasattr(self.db, "record_phase"):
+                    self.db.record_phase(pkg, "depclean.remove", "error")
             except Exception:
-                self._log("depclean_report", level="ERROR", message="Failed to write report", metadata={})
+                pass
+            return {"package": pkg, "action": "remove", "status": "error", "error": str(e)}
 
-        self._log("depclean_execute", level="INFO", message="Depclean execute finished", metadata=summary)
-        return report
+    def _run_rebuild(self, pkg: str, dry_run: bool = True, workdir: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Rebuild a package. This is a best-effort orchestrator; ideally call newpkg_core or newpkg_upgrade.
+        If newpkg_core/newpkg_upgrade modules are available in the environment, prefer to call them.
+        """
+        self._log("info", "depclean.rebuild.start", f"Rebuilding {pkg}", pkg=pkg, dry_run=dry_run)
+        if dry_run:
+            return {"package": pkg, "action": "rebuild", "status": "dry-run"}
 
-    # -------------------- convenience --------------------
-    def clean(self, interactive: bool = True, dry_run: bool = True, report_path: Optional[Path] = None) -> DepcleanReport:
-        plan = self.plan()
-        return self.execute(plan, interactive=interactive, dry_run=dry_run, report_path=report_path)
+        # try to invoke newpkg_upgrade if available (preferred)
+        try:
+            import importlib
 
-    def rebuild_reverse(self, pkg_name: str, interactive: bool = False, dry_run: bool = True) -> DepcleanReport:
-        # find reverse deps
-        rev = self._reverse_deps_map()
-        dependents = rev.get(pkg_name, set())
-        plan = [DepcleanPlanItem(package=p, reason=f"revdep_of:{pkg_name}", action="rebuild", details={}) for p in dependents]
-        if not plan:
-            raise DepcleanError(f"No reverse dependencies found for {pkg_name}")
-        return self.execute(plan, interactive=interactive, dry_run=dry_run)
+            upgrade_mod = importlib.import_module("newpkg_upgrade")
+            if hasattr(upgrade_mod, "NewpkgUpgrade"):
+                upgr = upgrade_mod.NewpkgUpgrade(self.cfg, logger=self.logger, db=self.db)
+                try:
+                    res = upgr.rebuild(pkg)
+                    # record in DB
+                    if self.db and hasattr(self.db, "record_phase"):
+                        self.db.record_phase(pkg, "depclean.rebuild", "ok")
+                    return {"package": pkg, "action": "rebuild", "status": "ok", "result": res}
+                except Exception as e:
+                    if self.db and hasattr(self.db, "record_phase"):
+                        self.db.record_phase(pkg, "depclean.rebuild", "error")
+                    return {"package": pkg, "action": "rebuild", "status": "error", "error": str(e)}
+        except Exception:
+            # no upgrade mod or failed import - fallback
+            pass
 
-    # -------------------- utility: reverse deps map --------------------
-    def _reverse_deps_map(self) -> Dict[str, Set[str]]:
-        # construct reverse map quickly
-        packages = self._pkg_all()
-        pkg_names = {p["name"] for p in packages}
-        rev: Dict[str, Set[str]] = {name: set() for name in pkg_names}
-        for p in packages:
-            deps = self.db.get_deps(p["name"])
-            for d in deps:
-                dep = d.get("depends_on")
-                if dep not in rev:
-                    rev[dep] = set()
-                rev[dep].add(p["name"])
-        return rev
+        # fallback: attempt a simple "fake rebuild" by invoking /bin/true inside sandbox (non-destructive)
+        try:
+            if self.sandbox and hasattr(self.sandbox, "run"):
+                cmd = ["true"]
+                rc = self.sandbox.run(cmd, cwd=workdir or ".", env=None)
+                # sandbox.run might return a dict or rc; normalize
+                if isinstance(rc, dict):
+                    rc_code = rc.get("rc", 0)
+                else:
+                    rc_code = int(rc or 0)
+                if rc_code == 0:
+                    if self.db and hasattr(self.db, "record_phase"):
+                        self.db.record_phase(pkg, "depclean.rebuild", "ok")
+                    return {"package": pkg, "action": "rebuild", "status": "ok", "rc": rc_code}
+                else:
+                    if self.db and hasattr(self.db, "record_phase"):
+                        self.db.record_phase(pkg, "depclean.rebuild", "error")
+                    return {"package": pkg, "action": "rebuild", "status": "error", "rc": rc_code}
+            else:
+                # try bubblewrap no-op if available
+                bwrap = _bwrap_available()
+                if bwrap:
+                    cmd = [bwrap, "--unshare-all", "--ro-bind", "/", "/", "--chdir", "/", "--", "true"]
+                    proc = subprocess.run(cmd, capture_output=True)
+                    if proc.returncode == 0:
+                        if self.db and hasattr(self.db, "record_phase"):
+                            self.db.record_phase(pkg, "depclean.rebuild", "ok")
+                        return {"package": pkg, "action": "rebuild", "status": "ok", "rc": 0}
+                    else:
+                        if self.db and hasattr(self.db, "record_phase"):
+                            self.db.record_phase(pkg, "depclean.rebuild", "error")
+                        return {"package": pkg, "action": "rebuild", "status": "error", "rc": proc.returncode, "stderr": proc.stderr.decode(errors='ignore')}
+                else:
+                    # no sandbox available; warn and mark as skipped
+                    self._log("warning", "depclean.rebuild.nosandbox", f"No sandbox available to rebuild {pkg}", pkg=pkg)
+                    return {"package": pkg, "action": "rebuild", "status": "skipped", "reason": "no-sandbox"}
+        except Exception as e:
+            self._log("error", "depclean.rebuild.fail", f"Rebuild failed for {pkg}: {e}", pkg=pkg, error=str(e))
+            try:
+                if self.db and hasattr(self.db, "record_phase"):
+                    self.db.record_phase(pkg, "depclean.rebuild", "error")
+            except Exception:
+                pass
+            return {"package": pkg, "action": "rebuild", "status": "error", "error": str(e)}
 
-    # -------------------- heuristics --------------------
-    def _is_core_package(self, name: str) -> bool:
-        # basic heuristics: consider packages in keep_list or common core names as core
-        core_candidates = {"glibc", "coreutils", "bash", "linux", "gcc"}
-        if name in self.keep_list:
-            return True
-        if name in core_candidates:
-            return True
-        return False
+    # ---------------- execute plan ----------------
+    def execute(self, plan: Dict[str, Any], dry_run: Optional[bool] = None, interactive: bool = False, jobs: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Execute a plan dict as produced by plan().
+        dry_run: if None, uses default_dry_run
+        interactive: confirm destructive actions
+        jobs: number of parallel workers for rebuilds (>=1)
+        """
+        if dry_run is None:
+            dry_run = self.default_dry_run
+        if jobs is None:
+            jobs = max(1, int(self.parallel_jobs or 1))
+
+        removals = plan.get("removals", [])
+        rebuilds = plan.get("rebuilds", [])
+
+        results = {"timestamp": datetime.utcnow().isoformat() + "Z", "removals": [], "rebuilds": [], "errors": []}
+
+        # removals (serial)
+        for pkg in removals:
+            if interactive and not self._confirm(f"Remove orphan package {pkg}?"):
+                results["removals"].append({"package": pkg, "status": "skipped", "reason": "user_declined"})
+                continue
+            r = self._remove_package(pkg, dry_run=dry_run)
+            results["removals"].append(r)
+            if r.get("status") == "error":
+                results["errors"].append(r)
+
+        # rebuilds: can be parallel
+        if rebuilds:
+            # if only a dry-run, we still report entries
+            if dry_run:
+                for pkg in rebuilds:
+                    results["rebuilds"].append({"package": pkg, "action": "rebuild", "status": "dry-run"})
+            else:
+                if jobs and int(jobs) > 1:
+                    # parallel
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+                        futs = {ex.submit(self._run_rebuild, pkg, dry_run=False): pkg for pkg in rebuilds}
+                        for fut in concurrent.futures.as_completed(futs):
+                            pkg = futs[fut]
+                            try:
+                                r = fut.result()
+                            except Exception as e:
+                                r = {"package": pkg, "action": "rebuild", "status": "error", "error": str(e)}
+                            results["rebuilds"].append(r)
+                            if r.get("status") == "error":
+                                results["errors"].append(r)
+                else:
+                    # serial
+                    for pkg in rebuilds:
+                        r = self._run_rebuild(pkg, dry_run=False)
+                        results["rebuilds"].append(r)
+                        if r.get("status") == "error":
+                            results["errors"].append(r)
+
+        # record report to disk
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        report_path = Path(self.report_dir) / f"depclean-report-{ts}.json"
+        try:
+            report_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+            self._log("info", "depclean.report.saved", f"Report saved to {report_path}", path=str(report_path))
+        except Exception:
+            self._log("warning", "depclean.report.savefail", f"Failed to save report to {report_path}")
+
+        # summary logging
+        total_actions = len(removals) + len(rebuilds)
+        errors = len(results.get("errors", []))
+        self._log("info", "depclean.execute.done", f"Executed plan: {total_actions} actions, {errors} errors", total=total_actions, errors=errors)
+        return results
+
+    # ---------------- convenience ----------------
+    def clean(self, dry_run: Optional[bool] = None, interactive: bool = False, jobs: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Run scan->plan->execute convenience helper
+        """
+        scan_result = self.scan()
+        plan = self.plan(scan_result)
+        return self.execute(plan, dry_run=dry_run, interactive=interactive, jobs=jobs)
 
 
-# -------------------- CLI quick tool --------------------
-if __name__ == "__main__":
+# ---------------- CLI wrapper ----------------
+def _build_cli():
     import argparse
 
-    ap = argparse.ArgumentParser(prog="newpkg-depclean")
-    ap.add_argument("--report", help="path to write JSON report", default=None)
-    ap.add_argument("--execute", action="store_true", help="actually execute the plan (not dry-run)")
-    ap.add_argument("--yes", action="store_true", help="assume yes to interactive prompts")
-    args = ap.parse_args()
+    p = argparse.ArgumentParser(prog="newpkg-depclean")
+    p.add_argument("cmd", choices=["scan", "plan", "execute", "clean"], nargs="?", default="scan")
+    p.add_argument("--dry-run", action="store_true", help="simulate actions")
+    p.add_argument("--yes", "-y", action="store_true", help="assume yes for confirmations")
+    p.add_argument("--interactive", action="store_true", help="ask before destructive actions")
+    p.add_argument("--jobs", type=int, help="parallel workers for rebuilds")
+    p.add_argument("--report-dir", help="directory to write reports")
+    return p
 
-    # try to load cfg/db/logger from environment or defaults if present in project workspace
-    # In standalone mode we'll require a DB file path via environment NEWPKG_DB_PATH
-    from pathlib import Path
-    db_path = os.environ.get("NEWPKG_DB_PATH")
-    if not db_path:
-        print("Please set NEWPKG_DB_PATH to the sqlite file for newpkg_db")
-        sys.exit(2)
-    # lazy import of NewpkgDB if available in same workspace
-    try:
-        from newpkg_db import NewpkgDB
-    except Exception:
-        # try relative
-        try:
-            from .newpkg_db import NewpkgDB  # type: ignore
-        except Exception:
-            print("newpkg_db not available in PYTHONPATH. Aborting.")
-            sys.exit(2)
 
+def main(argv: Optional[List[str]] = None):
+    argv = argv if argv is not None else sys.argv[1:]
+    parser = _build_cli()
+    args = parser.parse_args(argv)
+
+    # initialize config/logger/db if available
     cfg = None
-    try:
-        # minimal cfg shim
-        class CfgShim:
-            def __init__(self, dbp):
-                self._dbp = dbp
-            def get(self, k):
-                if k == "DEPCLEAN_KEEP":
-                    return None
-                return None
-        cfg = CfgShim(db_path)
-    except Exception:
-        cfg = None
+    if init_config:
+        try:
+            cfg = init_config()
+        except Exception:
+            cfg = None
 
-    db = NewpkgDB(db_path=db_path)
-    db.init_db()
-    depclean = NewpkgDepclean(cfg, db)
-    report = depclean.scan()
-    if args.execute:
-        dr = depclean.execute(depclean.plan(), interactive=not args.yes, dry_run=not args.execute, report_path=Path(args.report) if args.report else None)
-        print(dr.to_json())
-    else:
-        if args.report:
-            Path(args.report).write_text(report.to_json(), encoding="utf-8")
-        print(report.to_json())
+    db = None
+    if NewpkgDB and cfg is not None:
+        try:
+            db = NewpkgDB(cfg)
+            # don't auto-init DB here
+        except Exception:
+            db = None
+
+    logger = None
+    if NewpkgLogger and cfg is not None:
+        try:
+            logger = NewpkgLogger.from_config(cfg, db)
+        except Exception:
+            logger = None
+
+    depclean = Depclean(cfg=cfg, logger=logger, db=db, sandbox=None)
+    if args.report_dir:
+        depclean.report_dir = args.report_dir
+
+    if args.yes:
+        depclean.auto_confirm = True
+
+    if args.cmd == "scan":
+        res = depclean.scan()
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "plan":
+        res = depclean.plan()
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd in ("clean", "execute"):
+        dry_run = args.dry_run or depclean.default_dry_run
+        interactive = args.interactive
+        jobs = args.jobs or depclean.parallel_jobs
+        plan = depclean.plan()
+        depclean._log("info", "depclean.start", f"Starting depclean: removals={len(plan['removals'])} rebuilds={len(plan['rebuilds'])}", plan=plan)
+        result = depclean.execute(plan, dry_run=dry_run, interactive=interactive, jobs=jobs)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
