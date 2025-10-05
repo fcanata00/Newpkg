@@ -1,527 +1,508 @@
 #!/usr/bin/env python3
+# newpkg_cli.py
 """
-newpkg_cli.py
+newpkg_cli.py -- Unified CLI for the newpkg toolset.
 
-CLI integrador para Newpkg — orquestra modules: deps, download, patcher, core, db, hooks, upgrade, remove, audit, sync
-Provides a rich, animated, colored UX for long-running steps and supports --install full pipeline.
-
-Features implemented here:
- - Subcommands: install (-i/--install), remove, build, upgrade, sync, audit, revdep, info
- - Global flags: --dry-run, --quiet, --yes, --jobs, --sandbox, --destdir, --no-color, --verbose
- - Install pipeline: resolve deps -> download -> extract -> patch -> build -> package -> install
- - Visual UI using rich (fallback gracefully if not installed)
- - Progress bars for downloads and packing; spinners for phases; system metrics shown during build (psutil optional)
- - Module auto-discovery: imports modules if present and falls back to shims
-
-Note: This file assumes the other newpkg modules exist in the PYTHONPATH.
+Features:
+ - Integrates: newpkg_config, newpkg_logger, newpkg_db, newpkg_hooks, newpkg_core,
+   newpkg_upgrade, newpkg_remove, newpkg_sync, newpkg_audit, newpkg_metafile, newpkg_download etc.
+ - Subcommands: install, remove, upgrade, sync, audit, build, package, info
+ - Global flags: --dry-run, --quiet, --json, --jobs, --no-color, --sandbox
+ - Uses `rich` for colored banners and `tqdm` for simple progress bars when available.
+ - Respects dry-run and quiet modes. Outputs JSON if requested.
 """
+
 from __future__ import annotations
 
 import argparse
-import asyncio
-import importlib
 import json
 import os
 import shutil
-import subprocess
 import sys
-import tempfile
+import threading
 import time
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# optional visual libs
+# optional framework modules (project)
+try:
+    from newpkg_config import init_config
+except Exception:
+    init_config = None
+
+try:
+    from newpkg_logger import NewpkgLogger
+except Exception:
+    NewpkgLogger = None
+
+try:
+    from newpkg_db import NewpkgDB
+except Exception:
+    NewpkgDB = None
+
+try:
+    from newpkg_hooks import HooksManager
+except Exception:
+    HooksManager = None
+
+try:
+    from newpkg_core import NewpkgCore
+except Exception:
+    NewpkgCore = None
+
+try:
+    from newpkg_upgrade import NewpkgUpgrade
+except Exception:
+    NewpkgUpgrade = None
+
+try:
+    from newpkg_remove import NewpkgRemover
+except Exception:
+    NewpkgRemover = None
+
+try:
+    from newpkg_sync import NewpkgSync
+except Exception:
+    NewpkgSync = None
+
+try:
+    from newpkg_audit import NewpkgAudit
+except Exception:
+    NewpkgAudit = None
+
+try:
+    from newpkg_metafile import Metafile
+except Exception:
+    Metafile = None
+
+# UI niceties
+_HAS_RICH = False
+_HAS_TQDM = False
 try:
     from rich.console import Console
-    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
-    from rich.spinner import Spinner
     from rich.panel import Panel
-    from rich.table import Table
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
     _HAS_RICH = True
+    console = Console()
 except Exception:
-    Console = None
-    Progress = None
-    Spinner = None
-    Panel = None
-    Table = None
-    _HAS_RICH = False
+    console = None
 
 try:
     from tqdm import tqdm
     _HAS_TQDM = True
 except Exception:
     tqdm = None
-    _HAS_TQDM = False
 
-try:
-    import psutil
-    _HAS_PSUTIL = True
-except Exception:
-    psutil = None
-    _HAS_PSUTIL = False
+# default settings
+DEFAULT_JOBS = int(os.environ.get("NEWPKG_JOBS", "1"))
 
+@dataclass
+class CLIResult:
+    command: str
+    package: Optional[str] = None
+    status: str = "unknown"
+    started_at: str = datetime.utcnow().isoformat() + "Z"
+    finished_at: Optional[str] = None
+    details: Dict[str, Any] = None
 
-# ---------------- utilities ----------------
-console = Console() if _HAS_RICH else None
+    def finish(self, status: str, details: Optional[Dict[str, Any]] = None):
+        self.status = status
+        self.finished_at = datetime.utcnow().isoformat() + "Z"
+        self.details = details or {}
 
-
-def _log(msg: str, level: str = 'INFO'):
-    if console:
-        console.log(f"[{level}] {msg}")
+# CLI utility functions
+def _pretty(msg: str, style: str = "cyan", quiet: bool = False):
+    if quiet:
+        return
+    if _HAS_RICH and console:
+        console.print(Panel(msg, style=style))
     else:
-        print(f"[{level}] {msg}")
+        print(msg)
 
+def _info(msg: str, quiet: bool = False):
+    if quiet:
+        return
+    if _HAS_RICH and console:
+        console.print(f"[bold green][INFO][/bold green] {msg}")
+    else:
+        print(f"[INFO] {msg}")
 
-def _safe_import(module_name: str):
+def _error(msg: str):
+    if _HAS_RICH and console:
+        console.print(f"[bold red][ERROR][/bold red] {msg}")
+    else:
+        print(f"[ERROR] {msg}", file=sys.stderr)
+
+def _maybe_progress(total: int = 0, description: str = ""):
+    """Return a context manager that yields an update function. Works with rich or tqdm or noop."""
+    if _HAS_RICH and console:
+        prog = Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), TimeElapsedColumn(), TimeRemainingColumn())
+        task_id = None
+        class Ctx:
+            def __enter__(self_inner):
+                nonlocal task_id
+                prog.start()
+                task_id = prog.add_task(description, total=total)
+                return lambda n=1, desc=None: prog.update(task_id, advance=n, description=desc or description)
+            def __exit__(self_inner, exc_type, exc, tb):
+                prog.stop()
+        return Ctx()
+    if _HAS_TQDM:
+        pbar = tqdm(total=total, desc=description)
+        class Ctx2:
+            def __enter__(self_inner):
+                return lambda n=1, desc=None: pbar.update(n)
+            def __exit__(self_inner, exc_type, exc, tb):
+                pbar.close()
+        return Ctx2()
+    # noop
+    class Noop:
+        def __enter__(self_inner):
+            return lambda n=1, desc=None: None
+        def __exit__(self_inner, exc_type, exc, tb):
+            return False
+    return Noop()
+
+# Initialize singletons (will be set in main)
+CFG = None
+LOGGER = None
+DB = None
+HOOKS = None
+CORE = None
+UPGRADE = None
+REMOVER = None
+SYNC = None
+AUDIT = None
+
+def init_components(config: Any, use_sandbox: Optional[bool], quiet: bool):
+    """Create module instances and wire them globally (best-effort)."""
+    global CFG, LOGGER, DB, HOOKS, CORE, UPGRADE, REMOVER, SYNC, AUDIT
+    CFG = config
+    DB = NewpkgDB(CFG) if NewpkgDB and CFG is not None else None
+    # logger from config
+    if NewpkgLogger and CFG is not None:
+        try:
+            LOGGER = NewpkgLogger.from_config(CFG, DB)
+        except Exception:
+            LOGGER = None
+    else:
+        LOGGER = None
+    HOOKS = HooksManager(CFG, LOGGER, DB) if HooksManager and CFG is not None else None
+    CORE = NewpkgCore(CFG, LOGGER, DB) if NewpkgCore and CFG is not None else None
+    UPGRADE = NewpkgUpgrade(CFG, LOGGER, DB) if NewpkgUpgrade and CFG is not None else None
+    REMOVER = NewpkgRemover(CFG, LOGGER, DB) if NewpkgRemover and CFG is not None else None
+    SYNC = NewpkgSync(CFG, LOGGER, DB) if NewpkgSync and CFG is not None else None
+    AUDIT = NewpkgAudit(CFG, LOGGER, DB) if NewpkgAudit and CFG is not None else None
+
+def _dispatch_install(pkg: str, metafile: Optional[str], destdir: Optional[str], jobs: int, dry_run: bool, quiet: bool, use_sandbox: Optional[bool], json_out: bool):
+    """Top-level install pipeline. Best-effort wiring among Metafile, Core, Downloader, Patcher, Hooks."""
+    r = CLIResult(command="install", package=pkg)
     try:
-        return importlib.import_module(module_name)
-    except Exception:
-        return None
-
-
-# ---------------- module bootstrap/shims ----------------
-# try to import modules created previously; if missing create minimal shims
-NewpkgDeps = _safe_import('newpkg_deps')
-NewpkgDownload = _safe_import('newpkg_download')
-NewpkgPatcher = _safe_import('newpkg_patcher')
-NewpkgCore = _safe_import('newpkg_core')
-NewpkgDB = _safe_import('newpkg_db')
-NewpkgHooks = _safe_import('newpkg_hooks')
-NewpkgUpgrade = _safe_import('newpkg_upgrade')
-NewpkgRemove = _safe_import('newpkg_remove')
-NewpkgAudit = _safe_import('newpkg_audit')
-NewpkgSync = _safe_import('newpkg_sync')
-NewpkgMetaFile = _safe_import('newpkg_metafile')
-
-
-class Shim:
-    def __init__(self, name):
-        self._name = name
-
-    def __getattr__(self, item):
-        def _missing(*a, **k):
-            raise RuntimeError(f"Module {self._name} not available in this environment: attempted {item}")
-        return _missing
-
-
-if NewpkgDeps is None:
-    NewpkgDeps = Shim('newpkg_deps')
-if NewpkgDownload is None:
-    NewpkgDownload = Shim('newpkg_download')
-if NewpkgPatcher is None:
-    NewpkgPatcher = Shim('newpkg_patcher')
-if NewpkgCore is None:
-    NewpkgCore = Shim('newpkg_core')
-if NewpkgDB is None:
-    NewpkgDB = Shim('newpkg_db')
-if NewpkgHooks is None:
-    NewpkgHooks = Shim('newpkg_hooks')
-if NewpkgUpgrade is None:
-    NewpkgUpgrade = Shim('newpkg_upgrade')
-if NewpkgRemove is None:
-    NewpkgRemove = Shim('newpkg_remove')
-if NewpkgAudit is None:
-    NewpkgAudit = Shim('newpkg_audit')
-if NewpkgSync is None:
-    NewpkgSync = Shim('newpkg_sync')
-if NewpkgMetaFile is None:
-    NewpkgMetaFile = Shim('newpkg_metafile')
-
-
-# ---------------- CLI core ----------------
-
-class NewpkgCLI:
-    def __init__(self):
-        self.parser = self._build_parser()
-        self.args = None
-        self.config = None
-        self.modules = {}
-        # will be initialized at runtime
-
-    def _build_parser(self) -> argparse.ArgumentParser:
-        p = argparse.ArgumentParser(prog='newpkg', description='Newpkg package manager')
-        # global flags
-        p.add_argument('--dry-run', action='store_true', help='simulate actions without performing them')
-        p.add_argument('--quiet', action='store_true', help='show only main phases')
-        p.add_argument('--yes', '-y', action='store_true', help='assume yes for all prompts')
-        p.add_argument('--jobs', type=int, default=4, help='parallel jobs for build/downloads')
-        p.add_argument('--sandbox', action='store_true', help='force sandbox usage')
-        p.add_argument('--destdir', type=str, default='/', help='install destination root')
-        p.add_argument('--no-color', action='store_true', help='disable colors and animations')
-        p.add_argument('--verbose', action='store_true', help='verbose logging')
-
-        # subcommands
-        sub = p.add_subparsers(dest='cmd', required=True)
-
-        # install
-        pi = sub.add_parser('install', aliases=['-i'], help='Resolve deps, build, package and install a package')
-        pi.add_argument('target', help='package name, metafile path, or directory')
-        pi.add_argument('--rebuild', action='store_true', help='force rebuild even if installed')
-        pi.add_argument('--only-deps', action='store_true', help='only resolve & install dependencies')
-        pi.add_argument('--keep-build-dir', action='store_true', help='do not delete build dir after build')
-
-        # other useful subcommands (lightweight)
-        sub.add_parser('remove', aliases=['-r'], help='remove package')
-        sub.add_parser('build', aliases=['-b'], help='build package (prepare/build/package)')
-        sub.add_parser('upgrade', aliases=['-u'], help='upgrade package')
-        sub.add_parser('sync', aliases=['-s'], help='sync repos')
-        sub.add_parser('audit', aliases=['-a'], help='audit system for vulnerabilities')
-        sub.add_parser('revdep', help='compute reverse dependencies')
-        info = sub.add_parser('info', aliases=['-I'], help='show package info')
-        info.add_argument('pkg', nargs='?', help='package name')
-
-        return p
-
-    def _init_modules(self):
-        # instantiate primary modules if available
-        try:
-            cfg = None
-            # config loader could be implemented — use None stub
-            self.modules['db'] = NewpkgDB.NewpkgDB(db_path=os.environ.get('NEWPKG_DB_PATH')) if hasattr(NewpkgDB, 'NewpkgDB') else None
-        except Exception:
-            self.modules['db'] = None
-        try:
-            self.modules['deps'] = NewpkgDeps.NewpkgDeps(cfg, self.modules.get('db')) if hasattr(NewpkgDeps, 'NewpkgDeps') else None
-        except Exception:
-            self.modules['deps'] = None
-        try:
-            self.modules['downloader'] = NewpkgDownload.NewpkgDownloader(cfg, logger=None, db=self.modules.get('db')) if hasattr(NewpkgDownload, 'NewpkgDownloader') else None
-        except Exception:
-            self.modules['downloader'] = None
-        try:
-            self.modules['patcher'] = NewpkgPatcher.NewpkgPatcher(cfg) if hasattr(NewpkgPatcher, 'NewpkgPatcher') else None
-        except Exception:
-            self.modules['patcher'] = None
-        try:
-            self.modules['core'] = NewpkgCore.NewpkgCore(cfg, self.modules.get('db'), logger=None, sandbox=None, deps=self.modules.get('deps')) if hasattr(NewpkgCore, 'NewpkgCore') else None
-        except Exception:
-            self.modules['core'] = None
-        try:
-            self.modules['hooks'] = NewpkgHooks.NewpkgHooks(cfg) if hasattr(NewpkgHooks, 'NewpkgHooks') else None
-        except Exception:
-            self.modules['hooks'] = None
-        try:
-            self.modules['upgrade'] = NewpkgUpgrade.NewpkgUpgrade(cfg, logger=None, db=self.modules.get('db'), downloader=self.modules.get('downloader'), core=self.modules.get('core')) if hasattr(NewpkgUpgrade, 'NewpkgUpgrade') else None
-        except Exception:
-            self.modules['upgrade'] = None
-        try:
-            self.modules['remover'] = NewpkgRemove.NewpkgRemove(cfg, logger=None, db=self.modules.get('db'), sandbox=None, hooks=self.modules.get('hooks')) if hasattr(NewpkgRemove, 'NewpkgRemove') else None
-        except Exception:
-            self.modules['remover'] = None
-        try:
-            self.modules['audit'] = NewpkgAudit.NewpkgAudit(cfg, logger=None, db=self.modules.get('db'), deps=self.modules.get('deps'), upgrade=self.modules.get('upgrade'), core=self.modules.get('core'), patcher=self.modules.get('patcher'), remover=self.modules.get('remover'), hooks=self.modules.get('hooks')) if hasattr(NewpkgAudit, 'NewpkgAudit') else None
-        except Exception:
-            self.modules['audit'] = None
-        try:
-            self.modules['sync'] = NewpkgSync.NewpkgSync(cfg, logger=None, db=self.modules.get('db'), sandbox=None, hooks=self.modules.get('hooks')) if hasattr(NewpkgSync, 'NewpkgSync') else None
-        except Exception:
-            self.modules['sync'] = None
-
-    # ---------- visual helpers ----------
-    def _phase_banner(self, title: str, quiet: bool = False):
-        if quiet:
-            print(f'>>>> {title} <<<<')
-            return
-        if console and not self.args.no_color:
-            console.rule(f"[cyan]>>>> {title} <<<<")
-        else:
-            print(f'>>>> {title} <<<<')
-
-    async def _progress_download(self, tasks: List[Dict[str, Any]], jobs: int = 4):
-        # tasks: each {url, dest, checksum?}
-        downloader = self.modules.get('downloader')
-        if downloader is None:
-            raise RuntimeError('downloader not configured')
-        # prefer downloader.download_many which is async in our implementation
-        coro = downloader.download_many(tasks, parallel=jobs)
-        return await coro
-
-    def _show_build_metrics(self):
-        if not _HAS_PSUTIL:
-            return ''
-        cpu = psutil.cpu_percent(interval=None)
-        mem = psutil.virtual_memory()
-        load = os.getloadavg() if hasattr(os, 'getloadavg') else (0.0, 0.0, 0.0)
-        return f'CPU: {cpu}% | Mem: {mem.used//1024//1024}MB/{mem.total//1024//1024}MB | Load: {load[0]:.2f}'
-
-    # ---------- install pipeline ----------
-    def _resolve_dependencies(self, target: str, only_deps: bool = False, jobs: int = 4, dry_run: bool = True) -> List[str]:
-        deps_mod = self.modules.get('deps')
-        if deps_mod is None:
-            _log('deps module not available; assuming single package', 'WARNING')
-            return [target]
-        try:
-            # deps module expected to expose resolve(package) -> ordered list
-            order = deps_mod.NewpkgDeps.resolve if hasattr(deps_mod.NewpkgDeps, 'resolve') else None
-            if order:
-                # in case module is class-based, instantiate
-                inst = deps_mod.NewpkgDeps(None, self.modules.get('db'))
-                resolved = inst.resolve(target)
-                if dry_run:
-                    return resolved
-                return resolved
-            # fallback: call module-level function
-            if hasattr(deps_mod, 'resolve'):
-                return deps_mod.resolve(target)
-        except Exception as e:
-            _log(f'deps resolution failed: {e}', 'ERROR')
-            return [target]
-        return [target]
-
-    def _download_sources_for_pkg(self, pkg: str, workdir: Path, jobs: int) -> List[Dict[str, Any]]:
-        # try to use metafile to know sources; if metafile module available and path provided, use it
-        mf_mod = NewpkgMetaFile
-        downloader = self.modules.get('downloader')
-        if downloader is None:
-            raise RuntimeError('Downloader not configured')
-        tasks = []
-        # best-effort: if package is a path to a metafile, load it
-        if Path(pkg).exists():
+        _pretty(f">>>> Preparando a construção do {pkg} <<<<", quiet=quiet)
+        # load config components if not already
+        if CORE is None:
+            _info("core module not available; falling back to basic operations", quiet=quiet)
+        # Load metafile if provided
+        mf = None
+        if metafile and Metafile:
             try:
-                mf = NewpkgMetaFile.NewpkgMetaFile(None, logger=None, db=self.modules.get('db'), downloader=downloader, patcher=self.modules.get('patcher'), hooks=self.modules.get('hooks'))
-                meta = mf.load(pkg)
-                # build tasks from meta
-                for s in meta.get('sources', []):
-                    url = s.get('url')
-                    filename = s.get('filename') or Path(url).name
-                    dest = workdir / filename
-                    tasks.append({'url': url, 'dest': str(dest), 'checksum': s.get('sha256'), 'mirrors': s.get('mirrors')})
+                mf = Metafile(cfg=CFG, logger=LOGGER, db=DB)
+                mf.load(metafile)
+            except Exception as e:
+                _error(f"Failed to load metafile: {e}")
+                mf = None
+        # resolve deps
+        if CORE:
+            _info("Resolving build deps...", quiet=quiet)
+            deps_res = CORE.resolve_build_deps(pkg, operate_on_metafile=mf)
+        else:
+            deps_res = {"deps": []}
+        # prepare (download + patch) - CORE.prepare handles metafile downloads if present
+        prep = CORE.prepare(pkg, metafile_path=metafile, profile=None) if CORE else {"workdir": f"/tmp/{pkg}-work", "srcdir": "", "builddir": "", "destdir": destdir or f"/tmp/{pkg}-dest"}
+        _info(f"Prepared workdir {prep.get('workdir')}", quiet=quiet)
+        if dry_run:
+            r.finish("dry-run", {"prep": prep, "deps": deps_res})
+            return r
+        # build + install + package via full pipeline
+        _info("Building and installing...", quiet=quiet)
+        fb = CORE.full_build_cycle(pkg, version=None, metafile_path=metafile, profile=None, install_prefix=destdir or "/", do_package=True, do_deploy=False, strip_before_package=True, dry_run=False) if CORE else None
+        if fb and getattr(fb, "status", "") == "ok":
+            _info(f"Build/install successful for {pkg}", quiet=quiet)
+            r.finish("ok", {"full_build": getattr(fb, "__dict__", fb)})
+        else:
+            # build failed
+            r.finish("build-fail", {"result": getattr(fb, "__dict__", fb) if fb else None})
+        # post hooks
+        if HOOKS:
+            try:
+                HOOKS.execute_safe("post_install", pkg_dir=prep.get("workdir"))
             except Exception:
-                # fallback: treat pkg as URL or file
-                tasks.append({'url': pkg, 'dest': str(workdir / Path(pkg).name), 'checksum': None})
+                pass
+    except Exception as e:
+        _error(f"install pipeline failed: {e}")
+        r.finish("error", {"error": str(e)})
+    # output
+    if json_out:
+        print(json.dumps(asdict(r), indent=2))
+    else:
+        if not quiet:
+            print(f"Install result: status={r.status}, package={pkg}")
+    return r
+
+def _dispatch_remove(pkg: str, purge: bool, simulate: bool, quiet: bool, json_out: bool):
+    r = CLIResult(command="remove", package=pkg)
+    try:
+        _pretty(f">>>> Removendo pacote {pkg} <<<<", quiet=quiet)
+        if REMOVER is None:
+            _error("remove module not available")
+            r.finish("no-remover")
+            return r
+        if simulate:
+            plan = REMOVER.plan_removal(pkg)
+            r.finish("simulated", {"plan": plan})
         else:
-            # unknown package: try to locate metafile in ./packages/<pkg>
-            candidates = [Path('packages') / pkg / f for f in os.listdir('packages') if f.startswith(pkg)] if Path('packages').exists() else []
-            if candidates:
-                # pick first metafile
-                tasks.append({'url': str(candidates[0]), 'dest': str(workdir / candidates[0].name)})
-            else:
-                # treat as URL
-                tasks.append({'url': pkg, 'dest': str(workdir / Path(pkg).name)})
+            res = REMOVER.remove(pkg, purge=purge, simulate=False, backup=True)
+            status = "ok" if not res.get("errors") else "partial"
+            r.finish(status, res)
+    except Exception as e:
+        _error(f"remove failed: {e}")
+        r.finish("error", {"error": str(e)})
+    if json_out:
+        print(json.dumps(asdict(r), indent=2))
+    else:
+        if not quiet:
+            print(f"Remove result: {r.status}")
+    return r
 
-        # run download
-        # adapt tasks for downloader.download_many API
-        loop = asyncio.get_event_loop()
-        try:
-            results = loop.run_until_complete(self.modules['downloader'].download_many(tasks, parallel=jobs))
-        except Exception as e:
-            raise
-        return results
+def _dispatch_upgrade(pkg: str, force: bool, dry_run: bool, quiet: bool, json_out: bool):
+    r = CLIResult(command="upgrade", package=pkg)
+    try:
+        _pretty(f">>>> Upgrade {pkg} <<<<", quiet=quiet)
+        if UPGRADE is None:
+            _error("upgrade module not available")
+            r.finish("no-upgrade")
+            return r
+        res = UPGRADE.upgrade(pkg, force=force, do_package=True, do_deploy=False, dry_run=dry_run)
+        status = getattr(res, "status", "unknown")
+        r.finish(status, {"steps": getattr(res, "steps", None), "error": getattr(res, "error", None)})
+    except Exception as e:
+        _error(f"upgrade failed: {e}")
+        r.finish("error", {"error": str(e)})
+    if json_out:
+        print(json.dumps(asdict(r), indent=2))
+    else:
+        if not quiet:
+            print(f"Upgrade result: {r.status}")
+    return r
 
-    def _extract_archives(self, results: List[Dict[str, Any]], workdir: Path) -> List[Path]:
-        out_dirs = []
-        for r in results:
-            path = Path(r.get('path') or r.get('dest'))
-            if not path.exists():
-                continue
-            # try common archive extract
-            try:
-                if path.suffix in ('.xz', '.gz', '.bz2', '.zip') or path.name.endswith('.tar.xz') or path.name.endswith('.tar.zst'):
-                    d = tempfile.mkdtemp(prefix='newpkg-extract-')
-                    dpath = Path(d)
-                    # attempt to use system tar for robust extraction
-                    cmd = ['tar', '-xf', str(path), '-C', str(dpath)]
-                    proc = subprocess.run(cmd, capture_output=True)
-                    if proc.returncode != 0:
-                        # fallback: try python tarfile/zipfile
-                        try:
-                            import tarfile as _tar
-                            with _tar.open(path) as t:
-                                t.extractall(dpath)
-                        except Exception:
-                            pass
-                    out_dirs.append(dpath)
+def _dispatch_sync(names: Optional[List[str]], parallel: int, dry_run: bool, quiet: bool, json_out: bool):
+    r = CLIResult(command="sync", package=None)
+    try:
+        _pretty(">>>> Sincronizando repositórios <<<<", quiet=quiet)
+        if SYNC is None:
+            _error("sync module not available")
+            r.finish("no-sync")
+            return r
+        res = SYNC.sync_all(dry_run=dry_run, names=names, parallel=parallel)
+        r.finish("ok", {"repos": res})
+    except Exception as e:
+        _error(f"sync failed: {e}")
+        r.finish("error", {"error": str(e)})
+    if json_out:
+        print(json.dumps(asdict(r), indent=2))
+    else:
+        if not quiet:
+            print("Sync finished")
+    return r
+
+def _dispatch_audit(include_unmanaged: bool, severity: Optional[float], dry_run: bool, quiet: bool, json_out: bool, fmt: str):
+    r = CLIResult(command="audit", package=None)
+    try:
+        _pretty(">>>> Escaneando sistema <<<<", quiet=quiet)
+        if AUDIT is None:
+            _error("audit module not available")
+            r.finish("no-audit")
+            return r
+        candidates = AUDIT.scan_system(include_unmanaged=include_unmanaged)
+        findings = AUDIT.check_vulnerabilities(candidates, severity_threshold=severity)
+        plan = AUDIT.plan_remediation(findings)
+        report_text = AUDIT.report(findings, plan_summary=plan.get("summary"), format=fmt)
+        r.finish("ok", {"findings": len(findings), "plan": plan.get("summary")})
+        if json_out:
+            # print structured JSON of findings + plan
+            out = {"findings": [ {"package": f.candidate.name, "vulns": [v.cve for v in f.vulns]} for f in findings ], "plan": plan.get("summary")}
+            print(json.dumps(out, indent=2))
+        else:
+            if not quiet:
+                if _HAS_RICH and console and fmt != "json":
+                    console.print(report_text)
                 else:
-                    # not an archive; leave as-is
-                    out_dirs.append(path)
-            except Exception:
-                continue
-        return out_dirs
+                    print(report_text)
+    except Exception as e:
+        _error(f"audit failed: {e}")
+        r.finish("error", {"error": str(e)})
+    return r
 
-    def _apply_patches(self, workdir: Path, quiet: bool = False) -> None:
-        patcher = self.modules.get('patcher')
-        if not patcher:
-            _log('patcher not available; skipping patches', 'WARNING')
-            return
-        # call patcher to apply patches in workdir
-        try:
-            patch_res = patcher.NewpkgPatcher.apply_all if hasattr(patcher.NewpkgPatcher, 'apply_all') else None
-            if patch_res:
-                inst = patcher.NewpkgPatcher(None)
-                inst.apply_all(str(workdir))
-            else:
-                # if patcher exposes apply_patch per-file, user metafile should handle it
-                pass
-        except Exception as e:
-            _log(f'patch application failed: {e}', 'ERROR')
-
-    def _build_package(self, pkg: str, workdir: Path, jobs: int, quiet: bool, dry_run: bool, keep_build_dir: bool) -> Dict[str, Any]:
-        core = self.modules.get('core')
-        if core is None:
-            raise RuntimeError('core module not configured')
-        # prepare
-        self._phase_banner(f'Preparando a construção do {pkg}', quiet)
+def _dispatch_build(pkg: str, metafile: Optional[str], workdir: Optional[str], dry_run: bool, quiet: bool, json_out: bool):
+    r = CLIResult(command="build", package=pkg)
+    try:
+        _pretty(f">>>> Construindo {pkg} <<<<", quiet=quiet)
+        if CORE is None:
+            _error("core module not available")
+            r.finish("no-core")
+            return r
+        prep = CORE.prepare(pkg, metafile_path=metafile) if CORE else None
         if dry_run:
-            return {'status': 'dry-run'}
+            r.finish("dry-run", {"prep": prep})
+            return r
+        res = CORE.build(pkg, prep.get("workdir") if prep else workdir)
+        status = res.get("status", "error")
+        r.finish(status, {"build": res})
+    except Exception as e:
+        _error(f"build failed: {e}")
+        r.finish("error", {"error": str(e)})
+    if json_out:
+        print(json.dumps(asdict(r), indent=2))
+    else:
+        if not quiet:
+            print(f"Build result: {r.status}")
+    return r
+
+def _dispatch_package(pkg: str, destdir: Optional[str], version: Optional[str], dry_run: bool, quiet: bool, json_out: bool):
+    r = CLIResult(command="package", package=pkg)
+    try:
+        _pretty(f">>>> Empacotando {pkg} <<<<", quiet=quiet)
+        if CORE is None:
+            _error("core module not available")
+            r.finish("no-core")
+            return r
+        if dry_run:
+            r.finish("dry-run")
+            return r
+        res = CORE.package(pkg, version or "0", destdir or str(Path.cwd()), strip_before=True)
+        status = res.get("status", "error")
+        r.finish(status, {"package": res})
+    except Exception as e:
+        _error(f"package failed: {e}")
+        r.finish("error", {"error": str(e)})
+    if json_out:
+        print(json.dumps(asdict(r), indent=2))
+    else:
+        if not quiet:
+            print(f"Package result: {r.status}")
+    return r
+
+def _dispatch_info(pkg: Optional[str], quiet: bool, json_out: bool):
+    r = CLIResult(command="info", package=pkg)
+    try:
+        _pretty(f">>>> Informações {pkg or 'sistema'} <<<<", quiet=quiet)
+        data = {}
+        if DB and pkg:
+            try:
+                data = DB.get_package(pkg) if hasattr(DB, "get_package") else {}
+            except Exception:
+                data = {}
+        elif DB:
+            try:
+                data = {"packages": DB.list_packages() if hasattr(DB, "list_packages") else []}
+            except Exception:
+                data = {}
+        r.finish("ok", {"info": data})
+    except Exception as e:
+        _error(f"info failed: {e}")
+        r.finish("error", {"error": str(e)})
+    if json_out:
+        print(json.dumps(asdict(r), indent=2))
+    else:
+        if not quiet:
+            print(json.dumps(r.details, indent=2))
+    return r
+
+def main(argv: Optional[List[str]] = None):
+    # parse CLI
+    parser = argparse.ArgumentParser(prog="newpkg", description="newpkg unified CLI")
+    parser.add_argument("cmd", choices=["install","remove","upgrade","sync","audit","build","package","info"], help="command")
+    parser.add_argument("--pkg", help="package name")
+    parser.add_argument("--metafile", help="metafile path (toml/json) to use")
+    parser.add_argument("--destdir", help="destination dir (for install/package)")
+    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS, help="parallel jobs or threads")
+    parser.add_argument("--dry-run", action="store_true", help="do not perform destructive actions")
+    parser.add_argument("--quiet", action="store_true", help="minimal output")
+    parser.add_argument("--json", action="store_true", help="output JSON")
+    parser.add_argument("--no-color", action="store_true", help="disable color output")
+    parser.add_argument("--sandbox", dest="use_sandbox", action="store_true", help="use sandbox if configured")
+    parser.add_argument("--no-sandbox", dest="use_sandbox", action="store_false", help="do not use sandbox")
+    parser.add_argument("--purge", action="store_true", help="(remove) purge configs and caches")
+    parser.add_argument("--simulate", action="store_true", help="(remove) simulate removal")
+    parser.add_argument("--force", action="store_true", help="(upgrade) force upgrade")
+    parser.add_argument("--include-unmanaged", action="store_true", help="(audit) scan filesystem for unmanaged binaries")
+    parser.add_argument("--severity", type=float, help="(audit) minimum severity threshold")
+    parser.add_argument("--format", choices=["text","json","markdown"], default="text", help="(audit) report format")
+    args = parser.parse_args(argv)
+
+    # config
+    cfg = None
+    if init_config:
         try:
-            build_dir = core.NewpkgCore.prepare(core.NewpkgCore, pkg, version=None, profile='default', src_dir=str(workdir)) if hasattr(core, 'NewpkgCore') else None
+            cfg = init_config()
         except Exception:
-            # fallback: call module-level prepare
-            try:
-                build_dir = core.prepare(pkg, None, 'default', str(workdir))
-            except Exception:
-                build_dir = str(workdir)
-        # build
-        self._phase_banner(f'Construindo o {pkg}', quiet)
-        # run build and show metrics
-        if _HAS_RICH and console and not quiet and not self.args.no_color:
-            with Progress(SpinnerColumn(), TextColumn('{task.description}'), BarColumn(), TimeElapsedColumn(), TimeRemainingColumn(), transient=True) as progress:
-                task = progress.add_task(f'Building {pkg}', total=None)
-                try:
-                    # call core.build
-                    if hasattr(core, 'NewpkgCore'):
-                        inst = core.NewpkgCore(None, self.modules.get('db'), logger=None, sandbox=None, deps=self.modules.get('deps'))
-                        inst.build(pkg, profile='default', src_dir=str(workdir))
-                    else:
-                        core.build(pkg, profile='default', src_dir=str(workdir))
-                    progress.update(task, advance=1)
-                except Exception as e:
-                    progress.stop()
-                    raise
-        else:
-            # no fancy UI; run build directly
-            if hasattr(core, 'NewpkgCore'):
-                inst = core.NewpkgCore(None, self.modules.get('db'), logger=None, sandbox=None, deps=self.modules.get('deps'))
-                inst.build(pkg, profile='default', src_dir=str(workdir))
-            else:
-                core.build(pkg, profile='default', src_dir=str(workdir))
-        # package
-        self._phase_banner(f'Empacotando o {pkg}', quiet)
-        try:
-            if hasattr(core, 'NewpkgCore'):
-                inst = core.NewpkgCore(None, self.modules.get('db'), logger=None, sandbox=None, deps=self.modules.get('deps'))
-                archive = inst.package(pkg)
-            else:
-                archive = core.package(pkg)
-        except Exception as e:
-            raise
-        # install
-        self._phase_banner(f'Instalando em {self.args.destdir}', quiet)
-        try:
-            if hasattr(core, 'NewpkgCore'):
-                inst = core.NewpkgCore(None, self.modules.get('db'), logger=None, sandbox=None, deps=self.modules.get('deps'))
-                inst.install(pkg, fakeroot=True, destdir=self.args.destdir)
-            else:
-                core.install(pkg, fakeroot=True, destdir=self.args.destdir)
-        except Exception as e:
-            raise
+            cfg = None
 
-        if not keep_build_dir:
-            try:
-                shutil.rmtree(workdir)
-            except Exception:
-                pass
+    init_components(cfg, use_sandbox=getattr(args, "use_sandbox", True), quiet=args.quiet)
 
-        return {'status': 'ok', 'pkg': pkg, 'archive': archive}
+    # decide UI settings
+    if args.no_color and _HAS_RICH and console:
+        console.force_terminal = False
 
-    # ---------- dispatchers for subcommands ----------
-    def cmd_install(self):
-        tgt = self.args.target
-        dry_run = self.args.dry_run or self.args.dry_run
-        quiet = self.args.quiet
-        jobs = max(1, int(self.args.jobs or 1))
+    json_out = args.json
+    quiet = args.quiet
+    dry_run = args.dry_run
+    jobs = args.jobs
 
-        self._phase_banner(f'Preparando a construção do {tgt}', quiet)
+    # dispatch commands
+    cmd = args.cmd
+    if cmd == "install":
+        if not args.pkg:
+            parser.error("--pkg required for install")
+        return _dispatch_install(args.pkg, metafile=args.metafile, destdir=args.destdir, jobs=jobs, dry_run=dry_run, quiet=quiet, use_sandbox=args.use_sandbox, json_out=json_out)
 
-        # resolve dependencies
-        deps_list = self._resolve_dependencies(tgt, only_deps=self.args.only_deps, jobs=jobs, dry_run=dry_run)
-        if self.args.only_deps:
-            _log(f'Dependencies to install: {deps_list}')
-        if dry_run:
-            _log('Dry run enabled — exiting after dependency resolution')
-            print(json.dumps({'deps': deps_list}, indent=2))
-            return
+    if cmd == "remove":
+        if not args.pkg:
+            parser.error("--pkg required for remove")
+        return _dispatch_remove(args.pkg, purge=args.purge, simulate=args.simulate, quiet=quiet, json_out=json_out)
 
-        # iterate through resolution order and build/install each
-        for pkg in deps_list:
-            self._phase_banner(f'Baixando o {pkg}', quiet)
-            # create workdir per pkg
-            workdir = Path(tempfile.mkdtemp(prefix=f'newpkg-build-{pkg}-'))
-            try:
-                dl_results = self._download_sources_for_pkg(pkg, workdir, jobs)
-            except Exception as e:
-                _log(f'Download failed for {pkg}: {e}', 'ERROR')
-                return
-            self._phase_banner(f'Descompactando para {workdir}', quiet)
-            extracted = self._extract_archives(dl_results, workdir)
-            # apply patches
-            self._phase_banner('Aplicando correções (patches)', quiet)
-            try:
-                self._apply_patches(workdir, quiet=quiet)
-            except Exception as e:
-                _log(f'Patching failed for {pkg}: {e}', 'ERROR')
-                return
+    if cmd == "upgrade":
+        if not args.pkg:
+            parser.error("--pkg required for upgrade")
+        return _dispatch_upgrade(args.pkg, force=args.force, dry_run=dry_run, quiet=quiet, json_out=json_out)
 
-            # build/package/install
-            try:
-                res = self._build_package(pkg, workdir, jobs, quiet, dry_run=False, keep_build_dir=self.args.keep_build_dir)
-            except Exception as e:
-                _log(f'Build/package/install failed for {pkg}: {e}', 'ERROR')
-                return
-            _log(f'Package {pkg} installed successfully')
+    if cmd == "sync":
+        # optionally read names from NEWPKG_SYNC_REPOS env or use all configured
+        names = None
+        if os.environ.get("NEWPKG_SYNC_REPOS"):
+            names = [n.strip() for n in os.environ.get("NEWPKG_SYNC_REPOS").split(",") if n.strip()]
+        return _dispatch_sync(names=names, parallel=jobs, dry_run=dry_run, quiet=quiet, json_out=json_out)
 
-    def dispatch(self):
-        self.args = self.parser.parse_args()
-        # early no-color handling
-        if self.args.no_color:
-            global console
-            console = None
-        # init modules
-        self._init_modules()
+    if cmd == "audit":
+        return _dispatch_audit(include_unmanaged=args.include_unmanaged, severity=args.severity, dry_run=dry_run, quiet=quiet, json_out=json_out, fmt=args.format)
 
-        cmd = self.args.cmd
-        if cmd in ('install', '-i'):
-            self.cmd_install()
-        elif cmd in ('remove', '-r'):
-            _log('remove command - not implemented in CLI wrapper (use module)')
-        elif cmd in ('build', '-b'):
-            _log('build wrapper - not implemented here')
-        elif cmd in ('upgrade', '-u'):
-            _log('upgrade wrapper - delegating to module')
-            if self.modules.get('upgrade'):
-                self.modules['upgrade'].upgrade(self.args.target if hasattr(self.args, 'target') else None)
-        elif cmd == 'sync':
-            if self.modules.get('sync'):
-                import asyncio
-                res = asyncio.run(self.modules['sync'].sync_all(dry_run=self.args.dry_run))
-                print(json.dumps(res, indent=2))
-            else:
-                _log('sync module not available', 'ERROR')
-        elif cmd == 'audit':
-            if self.modules.get('audit'):
-                res = self.modules['audit'].scan_system(include_unmanaged=True)
-                print(json.dumps(res, indent=2))
-            else:
-                _log('audit module not available', 'ERROR')
-        elif cmd == 'revdep':
-            if self.modules.get('audit') and hasattr(self.args, 'pkg') and self.args.pkg:
-                res = self.modules['audit'].find_revdeps([self.args.pkg])
-                print(json.dumps(res, indent=2))
-            else:
-                _log('revdep not available', 'ERROR')
-        elif cmd == 'info':
-            if hasattr(self.args, 'pkg') and self.args.pkg:
-                _log(f'info for {self.args.pkg} - not implemented fully')
-            else:
-                _log('no package specified')
-        else:
-            _log('unknown command')
+    if cmd == "build":
+        if not args.pkg:
+            parser.error("--pkg required for build")
+        return _dispatch_build(args.pkg, metafile=args.metafile, workdir=None, dry_run=dry_run, quiet=quiet, json_out=json_out)
 
+    if cmd == "package":
+        if not args.pkg:
+            parser.error("--pkg required for package")
+        return _dispatch_package(args.pkg, destdir=args.destdir, version=None, dry_run=dry_run, quiet=quiet, json_out=json_out)
 
-def main():
-    cli = NewpkgCLI()
-    cli.dispatch()
+    if cmd == "info":
+        return _dispatch_info(args.pkg, quiet=quiet, json_out=json_out)
 
+    parser.print_help()
+    return 1
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
