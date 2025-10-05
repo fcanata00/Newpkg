@@ -1,410 +1,479 @@
+#!/usr/bin/env python3
+# newpkg_patcher.py
 """
-newpkg_patcher.py
+newpkg_patcher.py — robust patch manager for newpkg
 
-Patch management for newpkg
-- Apply/revert individual patches using 'patch' or 'git apply'
-- Apply/revert all detected patches for a package
-- Verify patch integrity (sha256)
-- Marker file: .applied_patches.json stored in target source dir
-- Optional sandbox execution via provided sandbox object or bubblewrap
-- Integration points:
-    - Config keys: patch.dir, patch.tool, patch.flags, patch.verify_hash, patch.sandbox, sandbox.extra_binds
-    - Logger: expects NewpkgLogger (info/warning/error)
-    - DB: will call db.record_phase(package, 'patch', status)
-
-Public API:
-- NewpkgPatcher(cfg=None, logger=None, db=None, sandbox=None)
-- find_patches(pkg_name_or_dir) -> list[Path]
-- apply_patch(patch_path, cwd, strip=1, verify_hash=None) -> dict
-- revert_patch(patch_path, cwd, strip=1) -> dict
-- apply_all(pkg, cwd, stop_on_error=True) -> dict
-- revert_all(pkg, cwd, stop_on_error=True) -> dict
-- status(cwd) -> dict
-- verify_patch(patch_path, expected_sha256) -> bool
-
+Features:
+ - Loads patches from directories or explicit file list
+ - Supports patch application via `git apply` or `patch -p{n}`
+ - Verifies patch checksums when provided
+ - Respects newpkg_config: general.dry_run, output.quiet, output.json, sandbox options
+ - Uses cfg.as_env() for subprocess environments
+ - Integrates with newpkg_logger (perf_timer) and newpkg_db.record_phase
+ - Stores applied patch metadata in .applied_patches.json (reversible)
+ - Can delegate execution to NewpkgSandbox.run_in_sandbox when available
 """
+
 from __future__ import annotations
 
-import hashlib
 import json
+import hashlib
 import os
 import shlex
+import shutil
 import subprocess
-import tempfile
-import time
-from dataclasses import dataclass
+import tarfile
+from contextlib import contextmanager
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+
+# optional project modules (best-effort imports)
+try:
+    from newpkg_config import init_config
+except Exception:
+    init_config = None
+
+try:
+    from newpkg_logger import NewpkgLogger
+except Exception:
+    NewpkgLogger = None
+
+try:
+    from newpkg_db import NewpkgDB
+except Exception:
+    NewpkgDB = None
+
+try:
+    from newpkg_sandbox import NewpkgSandbox
+except Exception:
+    NewpkgSandbox = None
+
+# fallback stdlib logger for internal messages
+import logging
+_logger = logging.getLogger("newpkg.patcher")
+if not _logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[%(levelname)s] newpkg.patcher: %(message)s"))
+    _logger.addHandler(h)
+_logger.setLevel(logging.INFO)
 
 
-class PatchError(Exception):
-    pass
+APPLIED_MARKER = ".applied_patches.json"
 
 
 @dataclass
-class PatchResult:
-    patch: str
-    status: str
-    out: Optional[str] = None
-    err: Optional[str] = None
-    duration: Optional[float] = None
+class PatchEntry:
+    path: str
+    applied_at: Optional[str] = None
+    method: Optional[str] = None
     sha256: Optional[str] = None
+    author: Optional[str] = None
+    description: Optional[str] = None
+    meta: Dict[str, Any] = None
+
+    def to_dict(self):
+        d = asdict(self)
+        d["meta"] = d.get("meta") or {}
+        return d
 
 
 class NewpkgPatcher:
-    MARKER = '.applied_patches.json'
-
     def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, sandbox: Any = None):
-        self.cfg = cfg
-        self.logger = logger
-        self.db = db
-        self.sandbox = sandbox
+        self.cfg = cfg or (init_config() if init_config else None)
+        # logger: prefer provided, else try NewpkgLogger.from_config, else fallback to module logger
+        if logger:
+            self.logger = logger
+        else:
+            try:
+                self.logger = NewpkgLogger.from_config(self.cfg, db) if NewpkgLogger and self.cfg else None
+            except Exception:
+                self.logger = None
+        self._log = self._make_logger()
 
-        # config defaults (compatible with older uppercase keys)
-        self.patch_dir_key = 'patch.dir'
-        self.patch_tool = self._cfg_get('patch.tool', 'patch')
-        self.patch_flags = self._cfg_get('patch.flags', ['-p1', '--forward'])
-        self.verify_hash_default = bool(self._cfg_get('patch.verify_hash', True))
-        self.use_sandbox_default = bool(self._cfg_get('patch.sandbox', True))
-        self.sandbox_extra_binds = self._cfg_get('sandbox.extra_binds', []) or []
+        # db
+        self.db = db or (NewpkgDB(self.cfg) if NewpkgDB and self.cfg else None)
 
-    # ---------------- internal helpers ----------------
+        # sandbox: prefer provided, else try to create one if available
+        if sandbox:
+            self.sandbox = sandbox
+        else:
+            try:
+                self.sandbox = NewpkgSandbox(cfg=self.cfg, logger=self.logger, db=self.db) if NewpkgSandbox and self.cfg else None
+            except Exception:
+                self.sandbox = None
+
+        # settings from config
+        self.dry_run = bool(self._cfg_get("general.dry_run", False))
+        self.quiet = bool(self._cfg_get("output.quiet", False))
+        self.json_out = bool(self._cfg_get("output.json", False))
+        self.default_strip = int(self._cfg_get("patches.default_strip", 1))
+        self.auto_apply = bool(self._cfg_get("patches.auto_apply", True))
+        self.marker_name = self._cfg_get("patches.marker", APPLIED_MARKER)
+
     def _cfg_get(self, key: str, default: Any = None) -> Any:
-        # try hierarchical lowercase key, then legacy uppercase
         try:
-            if self.cfg and hasattr(self.cfg, 'get'):
+            if self.cfg and hasattr(self.cfg, "get"):
                 v = self.cfg.get(key)
                 if v is not None:
                     return v
         except Exception:
             pass
-        # legacy env fallback
-        env_key = key.upper().replace('.', '_')
-        if env_key in os.environ:
-            return os.environ.get(env_key)
-        return default
+        # fallback to environment
+        return os.environ.get(key.upper().replace(".", "_"), default)
 
-    def _log_info(self, event: str, message: str, **meta):
-        if self.logger and hasattr(self.logger, 'info'):
+    def _make_logger(self):
+        def _fn(level: str, event: str, msg: str = "", **meta):
             try:
-                self.logger.info(event, message=message, **meta)
-                return
+                if self.logger:
+                    fn = getattr(self.logger, level.lower(), None)
+                    if fn:
+                        fn(event, msg, **meta)
+                        return
             except Exception:
                 pass
-        # fallback
-        print(f"[INFO] {event}: {message}")
+            getattr(_logger, level.lower(), _logger.info)(f"{event}: {msg} - {meta}")
+        return _fn
 
-    def _log_error(self, event: str, message: str, **meta):
-        if self.logger and hasattr(self.logger, 'error'):
-            try:
-                self.logger.error(event, message=message, **meta)
-                return
-            except Exception:
-                pass
-        print(f"[ERROR] {event}: {message}")
-
-    def _marker_path(self, cwd: Path) -> Path:
-        return cwd / self.MARKER
-
-    def _read_marker(self, cwd: Path) -> Dict[str, Any]:
-        mp = self._marker_path(cwd)
-        if not mp.exists():
-            return {'applied': []}
-        try:
-            return json.loads(mp.read_text(encoding='utf-8'))
-        except Exception:
-            return {'applied': []}
-
-    def _write_marker(self, cwd: Path, data: Dict[str, Any]) -> None:
-        mp = self._marker_path(cwd)
-        try:
-            mp.write_text(json.dumps(data, indent=2), encoding='utf-8')
-        except Exception:
-            pass
-
-    def _sha256(self, path: Path) -> str:
+    # ------------------ utilities ------------------
+    @staticmethod
+    def sha256_of_path(path: Union[str, Path]) -> str:
         h = hashlib.sha256()
-        with path.open('rb') as fh:
-            for chunk in iter(lambda: fh.read(65536), b''):
+        with open(str(path), "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
                 h.update(chunk)
         return h.hexdigest()
 
-    def _run_cmd(self, cmd: List[str], cwd: Optional[Path] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
-        start = time.time()
-        try:
-            proc = subprocess.run(cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True, timeout=timeout)
-            dur = time.time() - start
-            return {'rc': proc.returncode, 'out': proc.stdout, 'err': proc.stderr, 'duration': dur}
-        except subprocess.TimeoutExpired as e:
-            dur = time.time() - start
-            return {'rc': 124, 'out': '', 'err': f'timeout: {e}', 'duration': dur}
-        except Exception as e:
-            dur = time.time() - start
-            return {'rc': 1, 'out': '', 'err': str(e), 'duration': dur}
+    def _marker_path(self, workdir: Union[str, Path]) -> Path:
+        return Path(workdir) / self.marker_name
 
-    def _prepare_sandbox_cmd(self, inner_cmd: List[str], cwd: Path) -> List[str]:
-        # if sandbox provided as object, assume it has .wrap(cmd, binds=[]) method
-        if self.sandbox:
-            try:
-                if hasattr(self.sandbox, 'wrap'):
-                    return self.sandbox.wrap(inner_cmd, binds=self.sandbox_extra_binds, cwd=str(cwd))
-            except Exception:
-                pass
-        # Try bubblewrap default invocation
-        bwrap = shutil.which('bwrap')
-        if not bwrap:
-            return inner_cmd
-        args = [bwrap, '--unshare-all', '--share-net', '--proc', '/proc', '--dev', '/dev']
-        # ro-bind working dir as itself to allow applying patches inside
-        args += ['--bind', str(cwd), str(cwd), '--chdir', str(cwd)]
-        # extra binds
-        for b in self.sandbox_extra_binds:
-            args += ['--ro-bind', str(b), str(b)]
-        args += ['--'] + inner_cmd
-        return args
-
-    # ---------------- public API ----------------
-    def find_patches(self, pkg: str) -> List[Path]:
-        """Find patch files for a package name or directory.
-
-        - If pkg is a directory, scan that directory for *.patch, *.diff
-        - If pkg is a package name, look into configured patch.dir (e.g., patches/<pkg>/)
-        """
-        p = Path(pkg)
-        candidates: List[Path] = []
-        if p.exists() and p.is_dir():
-            for ext in ('*.patch', '*.diff', '*.patch.gz'):
-                for f in p.glob(ext):
-                    candidates.append(f)
-            return sorted(candidates)
-        # treat as package name
-        pd = self._cfg_get(self.patch_dir_key)
-        if pd:
-            base = Path(pd) / pkg
-            if base.exists() and base.is_dir():
-                for ext in ('*.patch', '*.diff'):
-                    for f in base.glob(ext):
-                        candidates.append(f)
-        # fallback - look under ./patches/<pkg>
-        base2 = Path('patches') / pkg
-        if base2.exists() and base2.is_dir():
-            for ext in ('*.patch', '*.diff'):
-                for f in base2.glob(ext):
-                    candidates.append(f)
-        return sorted(candidates)
-
-    def verify_patch(self, patch_path: str, expected_sha256: Optional[str] = None) -> bool:
-        p = Path(patch_path)
+    def load_marker(self, workdir: Union[str, Path]) -> Dict[str, Any]:
+        p = self._marker_path(workdir)
         if not p.exists():
-            return False
-        sha = self._sha256(p)
-        if expected_sha256:
-            return sha.lower() == expected_sha256.lower()
-        # if verification requested but no expected provided, return True but record
-        return True
-
-    def apply_patch(self, patch_path: str, cwd: Optional[str] = None, strip: int = 1, verify_hash: Optional[bool] = None) -> Dict[str, Any]:
-        cwdp = Path(cwd) if cwd else Path('.').resolve()
-        patchf = Path(patch_path)
-        if not patchf.exists():
-            raise PatchError(f'patch not found: {patch_path}')
-        verify_hash = self.verify_hash_default if verify_hash is None else verify_hash
-        sha = None
-        if verify_hash:
-            sha = self._sha256(patchf)
-        cmd = []
-        # prefer git apply if patch looks like git patch
-        use_git = False
+            return {}
         try:
-            first = patchf.read_text(errors='ignore').splitlines()[0]
-            if first.startswith('From ') or 'git' in first[:20].lower():
-                use_git = True
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def save_marker(self, workdir: Union[str, Path], data: Dict[str, Any]):
+        p = self._marker_path(workdir)
+        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self._log("info", "patch.marker.write", f"Wrote marker {p}", path=str(p))
+
+    # ------------------ patch discovery ------------------
+    def discover_patches(self, patch_dirs: Iterable[Union[str, Path]], pattern: Optional[str] = None) -> List[Path]:
+        """
+        Find patch files in given directories. Returns list of Path sorted lexicographically.
+        pattern is optional filter like '*.patch' or 'fix-*.diff'
+        """
+        out: List[Path] = []
+        for d in patch_dirs:
+            p = Path(d)
+            if not p.exists():
+                continue
+            if p.is_file():
+                out.append(p)
+            else:
+                for f in sorted(p.iterdir()):
+                    if f.is_file():
+                        if pattern:
+                            if Path(f.name).match(pattern):
+                                out.append(f)
+                        else:
+                            out.append(f)
+        return out
+
+    # ------------------ apply/revert single patch ------------------
+    def _run_command(self, cmd: Union[str, List[str]], cwd: Optional[Union[str, Path]] = None, env_extra: Optional[Dict[str, str]] = None, use_sandbox: bool = False) -> Tuple[int, str, str]:
+        """
+        Run a command. If sandbox is available and use_sandbox=True, delegate to sandbox.run_in_sandbox().
+        Returns (rc, stdout, stderr).
+        """
+        env = dict(os.environ)
+        try:
+            if self.cfg and hasattr(self.cfg, "as_env"):
+                env.update(self.cfg.as_env())
         except Exception:
             pass
-        if use_git and shutil.which('git'):
-            cmd = ['git', 'apply', f'--directory={cwdp}', str(patchf)]
-        else:
-            # fallback to standard patch utility
-            patch_prog = self.patch_tool or 'patch'
-            flags = list(self.patch_flags) if isinstance(self.patch_flags, (list, tuple)) else [self.patch_flags]
-            cmd = [patch_prog] + flags + ['-i', str(patchf)]
-        # sandbox wrapper
-        if self.sandbox or self.use_sandbox_default:
-            full_cmd = self._prepare_sandbox_cmd(cmd, cwdp)
-        else:
-            full_cmd = cmd
-        self._log_info('patch.apply.start', f'Applying {patchf.name} to {cwdp}', patch=str(patchf), cwd=str(cwdp))
-        start = time.time()
-        res = self._run_cmd(full_cmd, cwd=cwdp)
-        dur = time.time() - start
-        ok = res.get('rc', 1) == 0
-        result = PatchResult(patch=str(patchf), status='ok' if ok else 'error', out=res.get('out'), err=res.get('err'), duration=dur, sha256=sha)
-        # update marker if ok
-        if ok:
-            marker = self._read_marker(cwdp)
-            entry = {'patch': str(patchf.name), 'applied_at': datetime.utcnow().isoformat() + 'Z', 'sha256': sha}
-            marker.setdefault('applied', []).append(entry)
-            self._write_marker(cwdp, marker)
-            self._log_info('patch.apply.ok', f'Applied {patchf.name}', patch=str(patchf), cwd=str(cwdp), duration=dur)
-            # db record
-            try:
-                if self.db and hasattr(self.db, 'record_phase'):
-                    pkgname = cwdp.name
-                    self.db.record_phase(pkgname, 'patch', 'ok', log_path=None)
-            except Exception:
-                pass
-            return dict(result.__dict__)
-        else:
-            self._log_error('patch.apply.fail', f'Failed to apply {patchf.name}', patch=str(patchf), cwd=str(cwdp), stderr=res.get('err'))
-            try:
-                if self.db and hasattr(self.db, 'record_phase'):
-                    pkgname = cwdp.name
-                    self.db.record_phase(pkgname, 'patch', 'error', log_path=None)
-            except Exception:
-                pass
-            return dict(result.__dict__)
+        if env_extra:
+            env.update({k: str(v) for k, v in env_extra.items()})
 
-    def revert_patch(self, patch_path: str, cwd: Optional[str] = None, strip: int = 1) -> Dict[str, Any]:
-        """Attempt to revert a given patch. Uses 'patch -R' or 'git apply -R' if available."""
-        cwdp = Path(cwd) if cwd else Path('.').resolve()
-        patchf = Path(patch_path)
-        if not patchf.exists():
-            raise PatchError(f'patch not found: {patch_path}')
-        # choose tool
-        use_git = False
+        # dry-run simulation
+        if self.dry_run:
+            self._log("info", "patch.cmd.dryrun", f"DRY-RUN: {cmd}", cmd=str(cmd), cwd=str(cwd))
+            return 0, "", ""
+
+        # use sandbox wrapper if requested and available
+        if use_sandbox and self.sandbox:
+            try:
+                res = self.sandbox.run_in_sandbox(cmd, cwd=cwd, captures=True, env=env)
+                return res.rc, res.stdout or "", res.stderr or ""
+            except Exception as e:
+                return 255, "", str(e)
+
+        # otherwise run as subprocess
+        if isinstance(cmd, (list, tuple)):
+            cmd_list = [str(x) for x in cmd]
+            shell = False
+        else:
+            cmd_list = cmd
+            shell = True
+
+        proc = subprocess.run(cmd_list, cwd=str(cwd) if cwd else None, env=env, shell=shell, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+    def _apply_patch_file(self, patch_path: Path, workdir: Union[str, Path], strip: Optional[int] = None, method: Optional[str] = None, use_sandbox: bool = True) -> Tuple[bool, str]:
+        """
+        Try to apply a single patch file. method can be 'git' or 'patch' or None (auto).
+        strip: -p level for patch(1). Returns (ok, message)
+        """
+        workdir = Path(workdir)
+        if strip is None:
+            strip = self.default_strip
+
+        # compute sha if available
         try:
-            first = patchf.read_text(errors='ignore').splitlines()[0]
-            if first.startswith('From ') or 'git' in first[:20].lower():
-                use_git = True
+            sha = self.sha256_of_path(patch_path)
+        except Exception:
+            sha = None
+
+        # choose method
+        method_try = [method] if method else ["git", "patch"]
+        last_err = ""
+        for m in method_try:
+            if m == "git":
+                # try git apply --index --3way
+                git_bin = shutil.which("git") or "git"
+                cmd = [git_bin, "apply", "--index", "--3way", str(patch_path)]
+                rc, out, err = self._run_command(cmd, cwd=workdir, use_sandbox=use_sandbox)
+                if rc == 0:
+                    return True, f"applied via git: {patch_path}"
+                last_err = f"git apply failed: {err.strip()}"
+            elif m == "patch":
+                # patch -p{strip} < file
+                # use shell invocation to redirect stdin
+                cmd = f"patch -p{strip} --forward --input {shlex.quote(str(patch_path))}"
+                rc, out, err = self._run_command(cmd, cwd=workdir, use_sandbox=use_sandbox)
+                if rc == 0:
+                    return True, f"applied via patch: {patch_path}"
+                last_err = f"patch failed: {err.strip()}"
+            else:
+                last_err = f"unknown method {m}"
+        return False, last_err
+
+    def _revert_patch_file(self, patch_path: Path, workdir: Union[str, Path], strip: Optional[int] = None, method: Optional[str] = None, use_sandbox: bool = True) -> Tuple[bool, str]:
+        """
+        Revert a single patch. Tries `git apply -R` then `patch -R`.
+        """
+        workdir = Path(workdir)
+        if strip is None:
+            strip = self.default_strip
+
+        last_err = ""
+        methods = [method] if method else ["git", "patch"]
+        for m in methods:
+            if m == "git":
+                git_bin = shutil.which("git") or "git"
+                cmd = [git_bin, "apply", "-R", "--index", str(patch_path)]
+                rc, out, err = self._run_command(cmd, cwd=workdir, use_sandbox=use_sandbox)
+                if rc == 0:
+                    return True, f"reverted via git: {patch_path}"
+                last_err = f"git revert failed: {err.strip()}"
+            elif m == "patch":
+                cmd = f"patch -p{strip} -R --input {shlex.quote(str(patch_path))}"
+                rc, out, err = self._run_command(cmd, cwd=workdir, use_sandbox=use_sandbox)
+                if rc == 0:
+                    return True, f"reverted via patch: {patch_path}"
+                last_err = f"patch revert failed: {err.strip()}"
+            else:
+                last_err = f"unknown method {m}"
+        return False, last_err
+
+    # ------------------ public apply/revert helpers ------------------
+    def apply_all(self, patch_paths: Iterable[Union[str, Path]], workdir: Union[str, Path], strip: Optional[int] = None, method: Optional[str] = None, use_sandbox: bool = True) -> Dict[str, Any]:
+        """
+        Apply a sequence of patches in order. Returns summary dict with details per patch.
+        Respects dry_run and writes marker file with applied entries.
+        """
+        start = datetime.utcnow()
+        workdir = Path(workdir)
+        applied = self.load_marker(workdir) or {}
+        results = []
+        total_applied = 0
+
+        for p in patch_paths:
+            pth = Path(p)
+            key = str(pth.name)
+            if key in applied:
+                self._log("info", "patch.skip", f"Skipping already applied patch {pth.name}", patch=str(pth))
+                results.append({"patch": str(pth), "status": "skipped"})
+                continue
+
+            # verify optional sha from metafile or similar (caller may pass)
+            # here we will compute actual sha and include in marker
+            try:
+                sha = self.sha256_of_path(pth)
+            except Exception:
+                sha = None
+
+            self._log("info", "patch.apply.start", f"Applying patch {pth.name}", patch=str(pth), sha256=sha)
+            ok, msg = self._apply_patch_file(pth, workdir, strip=strip, method=method, use_sandbox=use_sandbox)
+            if ok:
+                total_applied += 1
+                entry = PatchEntry(path=str(pth.name), applied_at=start.isoformat() + "Z", method=(method or "auto"), sha256=sha, meta={"applied_msg": msg})
+                applied[str(pth.name)] = entry.to_dict()
+                results.append({"patch": str(pth), "status": "applied", "msg": msg})
+                self._log("info", "patch.apply.ok", f"Applied patch {pth.name}: {msg}", patch=str(pth), sha256=sha)
+            else:
+                results.append({"patch": str(pth), "status": "failed", "msg": msg})
+                self._log("error", "patch.apply.fail", f"Failed to apply {pth.name}: {msg}", patch=str(pth), err=msg)
+                # record failure phase to DB
+                if self.db and hasattr(self.db, "record_phase"):
+                    try:
+                        self.db.record_phase(package=self._context_package(), phase="patch.apply", status="error", meta={"patch": str(pth), "error": msg})
+                    except Exception:
+                        pass
+                # stop on first failure (configurable later)
+                break
+
+        # save marker (best-effort)
+        try:
+            self.save_marker(workdir, applied)
         except Exception:
             pass
-        if use_git and shutil.which('git'):
-            cmd = ['git', 'apply', '--reverse', str(patchf)]
+
+        # record overall phase
+        duration = (datetime.utcnow() - start).total_seconds()
+        status = "ok" if total_applied > 0 else "noop"
+        try:
+            if self.db and hasattr(self.db, "record_phase"):
+                self.db.record_phase(package=self._context_package(), phase="patch.apply_all", status=status, meta={"count": total_applied, "duration": duration})
+        except Exception:
+            pass
+
+        return {"status": status, "applied": total_applied, "details": results, "duration": duration}
+
+    def revert_all(self, patch_paths: Iterable[Union[str, Path]], workdir: Union[str, Path], strip: Optional[int] = None, method: Optional[str] = None, use_sandbox: bool = True) -> Dict[str, Any]:
+        """
+        Revert patches in reverse order. Removes them from the marker on success.
+        """
+        start = datetime.utcnow()
+        workdir = Path(workdir)
+        applied = self.load_marker(workdir) or {}
+        results = []
+        reverted = 0
+
+        # reverse iteration
+        for p in reversed(list(patch_paths)):
+            pth = Path(p)
+            key = str(pth.name)
+            if key not in applied:
+                self._log("info", "patch.revert.skip", f"Patch not recorded as applied: {pth.name}", patch=str(pth))
+                results.append({"patch": str(pth), "status": "not_applied"})
+                continue
+
+            self._log("info", "patch.revert.start", f"Reverting patch {pth.name}", patch=str(pth))
+            ok, msg = self._revert_patch_file(pth, workdir, strip=strip, method=method, use_sandbox=use_sandbox)
+            if ok:
+                reverted += 1
+                applied.pop(key, None)
+                results.append({"patch": str(pth), "status": "reverted", "msg": msg})
+                self._log("info", "patch.revert.ok", f"Reverted patch {pth.name}: {msg}", patch=str(pth))
+            else:
+                results.append({"patch": str(pth), "status": "failed", "msg": msg})
+                self._log("error", "patch.revert.fail", f"Failed to revert {pth.name}: {msg}", patch=str(pth), err=msg)
+                # record failure in DB
+                if self.db and hasattr(self.db, "record_phase"):
+                    try:
+                        self.db.record_phase(package=self._context_package(), phase="patch.revert", status="error", meta={"patch": str(pth), "error": msg})
+                    except Exception:
+                        pass
+                break
+
+        # save updated marker
+        try:
+            self.save_marker(workdir, applied)
+        except Exception:
+            pass
+
+        duration = (datetime.utcnow() - start).total_seconds()
+        try:
+            if self.db and hasattr(self.db, "record_phase"):
+                self.db.record_phase(package=self._context_package(), phase="patch.revert_all", status="ok" if reverted > 0 else "noop", meta={"count": reverted, "duration": duration})
+        except Exception:
+            pass
+
+        return {"status": "ok" if reverted > 0 else "noop", "reverted": reverted, "details": results, "duration": duration}
+
+    # ------------------ helpers ------------------
+    def _context_package(self) -> str:
+        # try to get package context from logger context if present
+        try:
+            if self.logger and hasattr(self.logger, "_context"):
+                return getattr(self.logger, "_context", {}).get("package", "global")
+        except Exception:
+            pass
+        try:
+            return str(self._cfg_get("general.default_package") or "global")
+        except Exception:
+            return "global"
+
+    # ------------------ CLI helpers ------------------
+    def cli_apply_from_dir(self, patch_dir: Union[str, Path], workdir: Union[str, Path], pattern: Optional[str] = None, **kwargs) -> int:
+        """
+        Convenience entry: discover patches in directory and apply them.
+        Returns exit code 0 on success; non-zero otherwise.
+        """
+        patch_list = self.discover_patches([patch_dir], pattern=pattern)
+        summary = self.apply_all(patch_list, workdir, **kwargs)
+        if self.json_out:
+            print(json.dumps(summary, indent=2))
         else:
-            patch_prog = self.patch_tool or 'patch'
-            flags = list(self.patch_flags) if isinstance(self.patch_flags, (list, tuple)) else [self.patch_flags]
-            # translate flags: replace -p1 with -p1 for strip; add -R for reverse
-            cmd = [patch_prog] + flags + ['-R', '-i', str(patchf)]
-        if self.sandbox or self.use_sandbox_default:
-            full_cmd = self._prepare_sandbox_cmd(cmd, cwdp)
+            # human friendly summary
+            self._log("info", "patch.summary", f"Applied {summary.get('applied')} patches in {summary.get('duration'):.2f}s", summary=summary)
+        return 0 if summary.get("status") in ("ok", "noop") else 2
+
+    def cli_revert_from_dir(self, patch_dir: Union[str, Path], workdir: Union[str, Path], pattern: Optional[str] = None, **kwargs) -> int:
+        patch_list = self.discover_patches([patch_dir], pattern=pattern)
+        summary = self.revert_all(patch_list, workdir, **kwargs)
+        if self.json_out:
+            print(json.dumps(summary, indent=2))
         else:
-            full_cmd = cmd
-        self._log_info('patch.revert.start', f'Reverting {patchf.name} in {cwdp}', patch=str(patchf), cwd=str(cwdp))
-        start = time.time()
-        res = self._run_cmd(full_cmd, cwd=cwdp)
-        dur = time.time() - start
-        ok = res.get('rc', 1) == 0
-        result = PatchResult(patch=str(patchf), status='ok' if ok else 'error', out=res.get('out'), err=res.get('err'), duration=dur)
-        if ok:
-            # remove from marker
-            marker = self._read_marker(cwdp)
-            newlist = [e for e in marker.get('applied', []) if e.get('patch') != patchf.name]
-            marker['applied'] = newlist
-            self._write_marker(cwdp, marker)
-            self._log_info('patch.revert.ok', f'Reverted {patchf.name}', patch=str(patchf), cwd=str(cwdp), duration=dur)
-            try:
-                if self.db and hasattr(self.db, 'record_phase'):
-                    self.db.record_phase(cwdp.name, 'patch_revert', 'ok')
-            except Exception:
-                pass
-            return dict(result.__dict__)
-        else:
-            self._log_error('patch.revert.fail', f'Failed to revert {patchf.name}', patch=str(patchf), cwd=str(cwdp), stderr=res.get('err'))
-            try:
-                if self.db and hasattr(self.db, 'record_phase'):
-                    self.db.record_phase(cwdp.name, 'patch_revert', 'error')
-            except Exception:
-                pass
-            return dict(result.__dict__)
-
-    def apply_all(self, pkg: str, cwd: Optional[str] = None, stop_on_error: bool = True) -> Dict[str, Any]:
-        cwdp = Path(cwd) if cwd else Path(pkg) if Path(pkg).exists() else Path('.').resolve()
-        patches = self.find_patches(pkg if Path(pkg).is_dir() else pkg)
-        results: List[Dict[str, Any]] = []
-        ok_count = 0
-        for p in patches:
-            try:
-                r = self.apply_patch(str(p), cwd=str(cwdp))
-                results.append(r)
-                if r.get('status') == 'ok':
-                    ok_count += 1
-                else:
-                    if stop_on_error:
-                        break
-            except Exception as e:
-                results.append({'patch': str(p), 'status': 'error', 'err': str(e)})
-                if stop_on_error:
-                    break
-        summary = {'total': len(patches), 'applied': ok_count, 'results': results}
-        self._log_info('patch.apply_all.done', f'Applied {ok_count}/{len(patches)} patches for {pkg}', pkg=pkg, cwd=str(cwdp))
-        return summary
-
-    def revert_all(self, pkg: str, cwd: Optional[str] = None, stop_on_error: bool = True) -> Dict[str, Any]:
-        cwdp = Path(cwd) if cwd else Path(pkg) if Path(pkg).exists() else Path('.').resolve()
-        marker = self._read_marker(cwdp)
-        applied = list(marker.get('applied', []))
-        # revert in reverse order
-        results: List[Dict[str, Any]] = []
-        ok_count = 0
-        for entry in reversed(applied):
-            patchname = entry.get('patch')
-            # try local path resolution
-            candidates = [cwdp / patchname, Path('patches') / cwdp.name / patchname]
-            found = None
-            for c in candidates:
-                if c.exists():
-                    found = c
-                    break
-            if not found:
-                results.append({'patch': patchname, 'status': 'missing'})
-                if stop_on_error:
-                    break
-                else:
-                    continue
-            try:
-                r = self.revert_patch(str(found), cwd=str(cwdp))
-                results.append(r)
-                if r.get('status') == 'ok':
-                    ok_count += 1
-                else:
-                    if stop_on_error:
-                        break
-            except Exception as e:
-                results.append({'patch': patchname, 'status': 'error', 'err': str(e)})
-                if stop_on_error:
-                    break
-        summary = {'total': len(applied), 'reverted': ok_count, 'results': results}
-        self._log_info('patch.revert_all.done', f'Reverted {ok_count}/{len(applied)} patches for {pkg}', pkg=pkg, cwd=str(cwdp))
-        return summary
-
-    def status(self, cwd: Optional[str] = None) -> Dict[str, Any]:
-        cwdp = Path(cwd) if cwd else Path('.').resolve()
-        marker = self._read_marker(cwdp)
-        return {'applied': marker.get('applied', [])}
+            self._log("info", "patch.summary", f"Reverted {summary.get('reverted')} patches in {summary.get('duration'):.2f}s", summary=summary)
+        return 0 if summary.get("status") in ("ok", "noop") else 2
 
 
-# quick CLI for local testing
-if __name__ == '__main__':
+# ---------- top-level helper ----------
+_default_patcher: Optional[NewpkgPatcher] = None
+
+
+def get_patcher(cfg: Any = None, logger: Any = None, db: Any = None, sandbox: Any = None) -> NewpkgPatcher:
+    global _default_patcher
+    if _default_patcher is None:
+        _default_patcher = NewpkgPatcher(cfg=cfg, logger=logger, db=db, sandbox=sandbox)
+    return _default_patcher
+
+
+# CLI entrypoint when run directly
+if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser(prog='newpkg-patcher')
-    ap.add_argument('cmd', choices=['list', 'apply', 'revert', 'apply-all', 'revert-all', 'status'])
-    ap.add_argument('target', nargs='?', help='package name or patch path or directory')
-    ap.add_argument('--cwd', help='working dir to apply in')
-    args = ap.parse_args()
-    patcher = NewpkgPatcher()
-    if args.cmd == 'list':
-        print([str(p) for p in patcher.find_patches(args.target or '.')])
-    elif args.cmd == 'apply':
-        res = patcher.apply_patch(args.target, cwd=args.cwd)
-        print(json.dumps(res, indent=2))
-    elif args.cmd == 'revert':
-        res = patcher.revert_patch(args.target, cwd=args.cwd)
-        print(json.dumps(res, indent=2))
-    elif args.cmd == 'apply-all':
-        res = patcher.apply_all(args.target or '.', cwd=args.cwd)
-        print(json.dumps(res, indent=2))
-    elif args.cmd == 'revert-all':
-        res = patcher.revert_all(args.target or '.', cwd=args.cwd)
-        print(json.dumps(res, indent=2))
-    elif args.cmd == 'status':
-        print(json.dumps(patcher.status(args.cwd), indent=2))
+    p = argparse.ArgumentParser(prog="newpkg-patcher", description="Apply/revert patches for newpkg")
+    p.add_argument("action", choices=["apply", "revert"], help="apply or revert patches")
+    p.add_argument("patch_dir", help="directory or patch file")
+    p.add_argument("--workdir", required=True, help="work directory (where to apply patches)")
+    p.add_argument("--pattern", help="glob pattern to filter patches")
+    p.add_argument("--strip", type=int, default=None, help="strip components (-pN)")
+    p.add_argument("--method", choices=["git", "patch"], default=None, help="force method")
+    p.add_argument("--no-sandbox", action="store_true", help="do not use sandbox even if available")
+    args = p.parse_args()
+
+    cfg = init_config() if init_config else None
+    patcher = get_patcher(cfg=cfg)
+    use_sandbox = not args.no_sandbox
+    if args.action == "apply":
+        rc = patcher.cli_apply_from_dir(args.patch_dir, args.workdir, pattern=args.pattern, strip=args.strip, method=args.method, use_sandbox=use_sandbox)
+    else:
+        rc = patcher.cli_revert_from_dir(args.patch_dir, args.workdir, pattern=args.pattern, strip=args.strip, method=args.method, use_sandbox=use_sandbox)
+    raise SystemExit(rc)
