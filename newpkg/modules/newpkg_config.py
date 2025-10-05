@@ -1,406 +1,348 @@
 """
-newpkg.config
+newpkg_config.py
 
-Módulo de configuração para o projeto `newpkg` (LFS/BLFS builder).
-- Carrega TOML (arquivo único + config.d fragments)
-- Prioridade: defaults < system < user < project < env < cli-overrides
-- Expansão de variáveis com detecção de ciclos
-- Perfis (profiles)
-- Exporta ConfigStore e helpers
-- Autodiscovery minimal de módulos em Newpkg/newpkg/modules (AST-based, sem executar código)
+Config manager for newpkg.
 
-Este arquivo implementa um módulo autônomo. Testes e integração com CLI são esperados separadamente.
+Features:
+- hierarchical loading: defaults -> /etc/newpkg/config.toml -> ~/.config/newpkg/config.toml -> project_dir/newpkg.toml -> environment overrides
+- supports TOML (tomllib/tomli) and YAML (PyYAML optional)
+- variable expansion ${VAR} and nested references with caching
+- convenience helpers: get_path(), as_env(), save_state(), init_config()
+- ModuleRegistry for autodiscovery of newpkg modules
+- alias ConfigManager for compatibility
+
+This module is intentionally defensive: it works even if optional parsers are missing.
 """
-
 from __future__ import annotations
 
 import os
-import sys
 import re
-import tomllib as _tomllib  # Python 3.11+
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Callable, Tuple
 import json
 import shutil
-import textwrap
-import ast
-from dataclasses import dataclass, field
-from string import Template
+import pkgutil
+import importlib
+from pathlib import Path
+from typing import Any, Dict, Optional, List, Tuple
 
-# Fallback for older runtimes: try tomli
+# Try tomllib (py3.11+), fallback to tomli
 try:
-    import tomllib as toml
+    import tomllib as _toml
 except Exception:
     try:
-        import tomli as toml  # type: ignore
+        import tomli as _toml  # type: ignore
     except Exception:
-        raise RuntimeError("tomllib/tomli is required to parse TOML. Install tomli for older Pythons.")
+        _toml = None
 
+# YAML optional
+try:
+    import yaml
+    _HAS_YAML = True
+except Exception:
+    yaml = None
+    _HAS_YAML = False
 
-# -------------------------- Utilities --------------------------
-VAR_PATTERN = re.compile(r"\$(?:\{([^}\s:]+)(?:[:-]([^}]*))?\}|([A-Za-z_][A-Za-z0-9_]*))")
+ENV_RE = re.compile(r"\$\{([^}]+)\}")
 
-
-def _is_truthy(val: Any) -> bool:
-    return bool(val) and val not in ("0", "false", "False", "no", "No")
-
-
-def _read_toml_file(path: Path) -> dict:
-    with path.open("rb") as f:
-        return toml.load(f)
-
-
-def _merge_dict(a: dict, b: dict) -> dict:
-    """Merge b into a (deep), returning new dict."""
-    out = dict(a)
-    for k, v in b.items():
-        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
-            out[k] = _merge_dict(out[k], v)
-        else:
-            out[k] = v
-    return out
-
-
-# ----------------------- ConfigStore ---------------------------
 
 class ConfigError(Exception):
     pass
 
 
-@dataclass
+class ModuleRegistry:
+    """Simple autodiscovery for newpkg modules under package path 'newpkg' or provided paths.
+
+    It scans sys.path for packages named 'newpkg_*' or modules under 'newpkg' package.
+    The registry exposes `discover()` and `get(module_name)`.
+    """
+
+    def __init__(self, search_prefix: str = 'newpkg'):
+        self.search_prefix = search_prefix
+        self.modules: Dict[str, Dict[str, Any]] = {}
+
+    def discover(self) -> Dict[str, Dict[str, Any]]:
+        # scan for top-level packages that start with 'newpkg_'
+        for finder, name, ispkg in pkgutil.iter_modules():
+            if name.startswith(self.search_prefix + '_') or name == self.search_prefix:
+                try:
+                    mod = importlib.import_module(name)
+                    self.modules[name] = {'module': mod, 'is_package': ispkg}
+                except Exception:
+                    # best-effort: record name only
+                    self.modules[name] = {'module': None, 'is_package': ispkg}
+        # also try submodules under 'newpkg' package
+        try:
+            pkg = importlib.import_module(self.search_prefix)
+            prefix = getattr(pkg, '__path__', None)
+            if prefix:
+                for finder, subname, ispkg in pkgutil.iter_modules(prefix):
+                    full = f'{self.search_prefix}.{subname}'
+                    try:
+                        mod = importlib.import_module(full)
+                        self.modules[full] = {'module': mod, 'is_package': ispkg}
+                    except Exception:
+                        self.modules[full] = {'module': None, 'is_package': ispkg}
+        except Exception:
+            # package not present, that's fine
+            pass
+        return self.modules
+
+    def get(self, module_name: str) -> Optional[Dict[str, Any]]:
+        return self.modules.get(module_name)
+
+
 class ConfigStore:
-    _raw: Dict[str, Any] = field(default_factory=dict)
-    _expanded_cache: Dict[str, Any] = field(default_factory=dict)
-    schema_version: int = 1
-    fail_on_missing: bool = True
+    DEFAULT_FILES = [
+        '/etc/newpkg/config.toml',
+        str(Path.home() / '.config' / 'newpkg' / 'config.toml')
+    ]
 
-    # ---------------------------------
-    # Construction / loading helpers
-    # ---------------------------------
+    def __init__(self, data: Optional[Dict[str, Any]] = None, sources: Optional[List[str]] = None):
+        self._raw: Dict[str, Any] = data or {}
+        self._sources: List[str] = sources or []
+        self._expand_cache: Dict[str, str] = {}
+
+    # ---------------- load/save ----------------
     @classmethod
-    def load(
-        cls,
-        project_dir: Optional[Path] = None,
-        extra_paths: Optional[List[Path]] = None,
-        env_prefix: str = "NEWPKG_",
-        strict: bool = True,
-    ) -> "ConfigStore":
-        """Load config following priorities and merge into a ConfigStore.
+    def load(cls, project_dir: Optional[str] = None, extra_paths: Optional[List[str]] = None) -> 'ConfigStore':
+        """Load configuration from defaults, system, user, project and environment.
 
-        Defaults (internal) < /etc/newpkg/config.toml < ~/.config/newpkg/config.toml < project_dir/newpkg.toml & config.d/* < extra_paths (ordered) < ENV vars
+        Precedence (low -> high):
+          - built-in defaults (empty)
+          - /etc/newpkg/config.toml
+          - ~/.config/newpkg/config.toml
+          - extra_paths (in listed order)
+          - project_dir/newpkg.toml
+          - environment variables (NEWPKG_<SECTION>__<KEY> style) override
         """
-        store = cls()
-        # 1) defaults
-        defaults = {
-            "general": {
-                "LFS": "/mnt/lfs",
-                "BUILD_DIR": "${LFS}/build",
-                "SRC_DIR": "${LFS}/sources",
-                "PKG_DIR": "${LFS}/pkgs",
-                "DESTDIR": "${LFS}/dest",
-                "JOBS": 4,
-                "MAKEFLAGS": "-j${JOBS}",
-            },
-            "sandbox": {"backend": "bubblewrap"},
-            "packaging": {"format": "tar.xz", "compress_level": 6},
-            "logging": {"level": "INFO", "log_dir": "./logs"},
-        }
-        store._raw = defaults
+        data: Dict[str, Any] = {}
+        sources: List[str] = []
 
-        # 2) system
-        sys_conf = Path("/etc/newpkg/config.toml")
-        if sys_conf.exists():
-            store._raw = _merge_dict(store._raw, _read_toml_file(sys_conf))
+        # load defaults (none for now)
+        # load default files
+        for p in cls.DEFAULT_FILES:
+            fp = Path(p)
+            if fp.exists():
+                try:
+                    d = cls._read_file(fp)
+                    ConfigStore._deep_update(data, d)
+                    sources.append(str(fp))
+                except Exception:
+                    pass
 
-        # 3) user
-        user_conf = Path.home() / ".config" / "newpkg" / "config.toml"
-        if user_conf.exists():
-            store._raw = _merge_dict(store._raw, _read_toml_file(user_conf))
-
-        # 4) project
-        if project_dir:
-            project_main = Path(project_dir) / "newpkg.toml"
-            if project_main.exists():
-                store._raw = _merge_dict(store._raw, _read_toml_file(project_main))
-            configd = Path(project_dir) / "config.d"
-            if configd.exists() and configd.is_dir():
-                for p in sorted(configd.iterdir()):
-                    if p.suffix in (".toml",) and p.is_file():
-                        store._raw = _merge_dict(store._raw, _read_toml_file(p))
-
-        # 5) extra_paths
+        # extra paths
         if extra_paths:
             for p in extra_paths:
-                if p.exists():
-                    store._raw = _merge_dict(store._raw, _read_toml_file(p))
+                fp = Path(p)
+                if fp.exists():
+                    try:
+                        d = cls._read_file(fp)
+                        ConfigStore._deep_update(data, d)
+                        sources.append(str(fp))
+                    except Exception:
+                        pass
 
-        # 6) env overrides
+        # project dir override
+        if project_dir:
+            projf = Path(project_dir) / 'newpkg.toml'
+            if projf.exists():
+                try:
+                    d = cls._read_file(projf)
+                    ConfigStore._deep_update(data, d)
+                    sources.append(str(projf))
+                except Exception:
+                    pass
+
+        # environment overrides: NEWPKG_SECTION__KEY=value  (double underscore between section and key)
         for k, v in os.environ.items():
-            if k.startswith(env_prefix):
-                key = k[len(env_prefix) :]
-                # simple mapping: NEWPKG_LFS -> general.LFS
-                parts = key.split("__")
-                dest = store._raw
-                for part in parts[:-1]:
-                    dest = dest.setdefault(part.lower(), {})
-                dest[parts[-1].lower()] = v
+            if not k.startswith('NEWPKG_'):
+                continue
+            # strip prefix
+            tail = k[len('NEWPKG_'):]
+            # SECTION__KEY__SUBKEY
+            parts = tail.split('__')
+            if not parts:
+                continue
+            target = data
+            for part in parts[:-1]:
+                target = target.setdefault(part.lower(), {})
+            target[parts[-1].lower()] = ConfigStore._coerce_env_value(v)
+            sources.append(f'env:{k}')
 
-        store.fail_on_missing = strict
-        return store
-
-    # -------------------------------
-    # Accessors
-    # -------------------------------
-    def get(self, key: str, default: Any = None) -> Any:
-        """Get a dotted key, expanded.
-        Example: get('general.LFS')
-        """
-        parts = key.split(".")
-        node = self._raw
-        for p in parts:
-            if isinstance(node, dict) and p in node:
-                node = node[p]
-            else:
-                return default
-        return self._expand_value(node)
-
-    def set(self, key: str, value: Any) -> None:
-        parts = key.split(".")
-        node = self._raw
-        for p in parts[:-1]:
-            node = node.setdefault(p, {})
-        node[parts[-1]] = value
-        # invalidate cache
-        self._expanded_cache.clear()
-
-    def as_dict(self, expanded: bool = True) -> Dict[str, Any]:
-        if not expanded:
-            return dict(self._raw)
-        # naive expansion for mapping
-        def _expand_node(v):
-            if isinstance(v, dict):
-                return {k: _expand_node(vv) for k, vv in v.items()}
-            return self._expand_value(v)
-
-        return _expand_node(self._raw)
-
-    # -------------------------------
-    # Expansion logic
-    # -------------------------------
-    def _expand_value(self, value: Any, _stack: Optional[List[str]] = None) -> Any:
-        if isinstance(value, str):
-            return self._expand_str(value, _stack=_stack)
-        if isinstance(value, dict):
-            return {k: self._expand_value(v, _stack=_stack) for k, v in value.items()}
-        if isinstance(value, list):
-            return [self._expand_value(v, _stack=_stack) for v in value]
-        return value
-
-    def _expand_str(self, s: str, _stack: Optional[List[str]] = None) -> str:
-        if _stack is None:
-            _stack = []
-
-        # handle escaped \${...}
-        s = s.replace("\\${", "__ESCAPED_DOLLAR__{")
-
-        def _repl(m: re.Match) -> str:
-            var_name = m.group(1) or m.group(3)
-            default = m.group(2)
-            if var_name in _stack:
-                chain = " -> ".join(_stack + [var_name])
-                raise ConfigError(f"Cycle detected when expanding variables: {chain}")
-            _stack.append(var_name)
-            # try dotted lookup first
-            val = self._lookup_variable(var_name)
-            if val is None:
-                if default is not None:
-                    res = default
-                else:
-                    if self.fail_on_missing:
-                        raise ConfigError(f"Variable '{var_name}' not found during expansion and no default provided")
-                    res = ""
-            else:
-                res = str(self._expand_value(val, _stack=_stack))
-            _stack.pop()
-            return res
-
-        out = VAR_PATTERN.sub(_repl, s)
-        out = out.replace("__ESCAPED_DOLLAR__{", "${")
-        return out
-
-    def _lookup_variable(self, name: str) -> Optional[Any]:
-        # support dotted names on lookup: e.g. 'general.LFS'
-        if "." in name:
-            parts = name.split(".")
-            node = self._raw
-            for p in parts:
-                if isinstance(node, dict) and p in node:
-                    node = node[p]
-                else:
-                    return None
-            return node
-        # try top-level keys and env var fallbacks
-        low = name.lower()
-        if low in self._raw:
-            return self._raw[low]
-        # try common sections
-        for sec in ("general", "sandbox", "packaging", "logging"):
-            secd = self._raw.get(sec)
-            if isinstance(secd, dict) and name in secd:
-                return secd[name]
-            if isinstance(secd, dict) and low in secd:
-                return secd[low]
-        # environment variables as last resort
-        if name in os.environ:
-            return os.environ[name]
-        if low in os.environ:
-            return os.environ[low]
-        return None
-
-    # -------------------------------
-    # Template rendering
-    # -------------------------------
-    def render_template(self, template_str: str) -> str:
-        # Using string.Template for simplicity; user can plug jinja externally.
-        mapping = self.as_dict(expanded=True)
-
-        # flattened mapping with dotted keys for convenience
-        flat = {}
-
-        def _flatten(prefix: str, node: Any):
-            if isinstance(node, dict):
-                for k, v in node.items():
-                    _flatten(f"{prefix}.{k}" if prefix else k, v)
-            else:
-                flat[prefix] = node
-
-        _flatten("", mapping)
-        # string.Template expects mapping with simple keys
-        safe_map = {k.replace(".", "_"): v for k, v in flat.items()}
-        t = Template(template_str)
-        return t.safe_substitute(safe_map)
-
-    # -------------------------------
-    # Profiles
-    # -------------------------------
-    def profile(self, name: str) -> "ConfigStore":
-        # returns a new ConfigStore with profile overrides applied (does not mutate self)
-        profs = self._raw.get("profiles") or {}
-        p = profs.get(name) or {}
-        new_raw = _merge_dict(self._raw, p)
-        return ConfigStore(_raw=new_raw, schema_version=self.schema_version, fail_on_missing=self.fail_on_missing)
-
-    # -------------------------------
-    # Save
-    # -------------------------------
-    def save(self, path: Path) -> None:
-        try:
-            import tomli_w  # type: ignore
-
-            out = tomli_w.dumps(self._raw)
-            path.write_text(out, encoding="utf-8")
-        except Exception:
-            # fallback: json pretty print for portability
-            path.write_text(json.dumps(self._raw, indent=2), encoding="utf-8")
-
-
-# ----------------------- Module autodiscovery ------------------------
-# Minimal AST based metadata extractor; DOES NOT execute module code.
-
-MODULE_SEARCH_DIR = Path("Newpkg") / "newpkg" / "modules"
-
-
-@dataclass
-class ModuleMeta:
-    name: str
-    version: Optional[str] = None
-    description: Optional[str] = None
-    requires: List[str] = field(default_factory=list)
-    path: Optional[Path] = None
-
-
-class ModuleRegistry:
-    def __init__(self):
-        self._modules: Dict[str, ModuleMeta] = {}
-
-    def discover(self, base: Optional[Path] = None) -> None:
-        base = base or MODULE_SEARCH_DIR
-        if not base.exists():
-            return
-        for p in sorted(base.rglob("*.py")):
-            try:
-                meta = self._extract_meta_from_file(p)
-                if meta:
-                    meta.path = p
-                    self._modules[meta.name] = meta
-            except Exception as e:
-                # don't raise: keep discovery robust
-                print(f"[newpkg.config] warning: failed to parse module {p}: {e}", file=sys.stderr)
-
-    def list(self) -> List[ModuleMeta]:
-        return list(self._modules.values())
-
-    def get(self, name: str) -> Optional[ModuleMeta]:
-        return self._modules.get(name)
+        cfg = cls(data, sources)
+        return cfg
 
     @staticmethod
-    def _extract_meta_from_file(path: Path) -> Optional[ModuleMeta]:
-        src = path.read_text(encoding="utf-8")
-        tree = ast.parse(src, filename=str(path))
-        name = None
-        version = None
-        descr = None
-        requires = []
-        for node in tree.body:
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        if target.id == "NAME" and isinstance(node.value, (ast.Constant, ast.Str)):
-                            name = getattr(node.value, "s", None) or getattr(node.value, "value", None)
-                        if target.id == "VERSION" and isinstance(node.value, (ast.Constant, ast.Str)):
-                            version = getattr(node.value, "s", None) or getattr(node.value, "value", None)
-                        if target.id == "DESCRIPTION" and isinstance(node.value, (ast.Constant, ast.Str)):
-                            descr = getattr(node.value, "s", None) or getattr(node.value, "value", None)
-                        if target.id == "REQUIRES":
-                            # try to extract list of strings
-                            if isinstance(node.value, (ast.List, ast.Tuple)):
-                                reqs = []
-                                for el in node.value.elts:
-                                    if isinstance(el, ast.Constant):
-                                        reqs.append(el.value)
-                                requires = reqs
-        if name:
-            return ModuleMeta(name=name, version=version, description=descr, requires=requires, path=path)
-        return None
+    def _read_file(path: Path) -> Dict[str, Any]:
+        content = path.read_bytes()
+        if path.suffix in ('.toml', '.tml') and _toml:
+            try:
+                return _toml.loads(content.decode('utf-8'))
+            except Exception:
+                # try binary toml loader if available
+                try:
+                    return _toml.loads(content)
+                except Exception:
+                    return {}
+        if path.suffix in ('.yaml', '.yml') and _HAS_YAML:
+            try:
+                return yaml.safe_load(content.decode('utf-8'))
+            except Exception:
+                return {}
+        # try json
+        try:
+            return json.loads(content.decode('utf-8'))
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _coerce_env_value(v: str) -> Any:
+        # basic coercion for booleans and ints
+        if v.lower() in ('true', 'yes', 'on'):
+            return True
+        if v.lower() in ('false', 'no', 'off'):
+            return False
+        try:
+            if '.' in v:
+                f = float(v)
+                return f
+            i = int(v)
+            return i
+        except Exception:
+            return v
+
+    @staticmethod
+    def _deep_update(base: Dict[str, Any], new: Dict[str, Any]) -> None:
+        for k, v in (new or {}).items():
+            if isinstance(v, dict) and isinstance(base.get(k), dict):
+                ConfigStore._deep_update(base[k], v)
+            else:
+                base[k] = v
+
+    def save_state(self, path: str) -> None:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({'config': self._raw, 'sources': self._sources}, indent=2), encoding='utf-8')
+
+    # ---------------- accessors ----------------
+    def get(self, key: str, default: Any = None) -> Any:
+        """Get configuration value by dotted key: section.key.subkey"""
+        parts = key.split('.') if key else []
+        cur = self._raw
+        for p in parts:
+            if isinstance(cur, dict) and p in cur:
+                cur = cur[p]
+            else:
+                return default
+        return cur
+
+    def set(self, key: str, value: Any) -> None:
+        parts = key.split('.')
+        cur = self._raw
+        for p in parts[:-1]:
+            cur = cur.setdefault(p, {})
+        cur[parts[-1]] = value
+
+    def get_path(self, key: str, default: Optional[str] = None) -> Optional[Path]:
+        v = self.get(key, default)
+        if v is None:
+            return None
+        try:
+            return Path(str(v)).expanduser().resolve()
+        except Exception:
+            return Path(str(v)).expanduser()
+
+    def as_env(self) -> Dict[str, str]:
+        """Return flattened config suitable for passing to environment of subprocesses."""
+        out: Dict[str, str] = {}
+        def _flatten(prefix: str, d: Any):
+            if isinstance(d, dict):
+                for k, vv in d.items():
+                    _flatten(f'{prefix}_{k.upper()}' if prefix else k.upper(), vv)
+            else:
+                out[prefix] = str(d)
+        _flatten('NEWPKG', self._raw)
+        return out
+
+    # ---------------- expansion ----------------
+    def _expand_str(self, s: str) -> str:
+        # cache hits
+        if s in self._expand_cache:
+            return self._expand_cache[s]
+
+        def repl(m):
+            key = m.group(1)
+            # support dotted keys
+            val = self.get(key) if '.' in key else self._raw.get(key)
+            if val is None:
+                # fallback to env var
+                val = os.environ.get(key, '')
+            if isinstance(val, (dict, list)):
+                return json.dumps(val)
+            return str(val)
+
+        res = ENV_RE.sub(repl, s)
+        self._expand_cache[s] = res
+        return res
+
+    def expand_all(self) -> None:
+        # walk config and expand strings
+        def walk(obj: Any):
+            if isinstance(obj, dict):
+                for k, v in list(obj.items()):
+                    if isinstance(v, str):
+                        obj[k] = self._expand_str(v)
+                    else:
+                        walk(v)
+            elif isinstance(obj, list):
+                for i, v in enumerate(obj):
+                    if isinstance(v, str):
+                        obj[i] = self._expand_str(v)
+                    else:
+                        walk(v)
+        walk(self._raw)
+
+    # ---------------- utility / validation ----------------
+    def validate(self) -> Tuple[bool, List[str]]:
+        errs: List[str] = []
+        # example checks
+        if not self.get('general.src_dir'):
+            errs.append('general.src_dir is not set')
+        if not self.get('general.build_dir'):
+            errs.append('general.build_dir is not set')
+        return (len(errs) == 0, errs)
+
+    def autodiscover_modules(self) -> ModuleRegistry:
+        mr = ModuleRegistry()
+        mr.discover()
+        return mr
 
 
-# ----------------------- CLI utility (minimal) ------------------------
-
-def _dump_cli(project_dir: Optional[str] = None, extra: Optional[List[str]] = None) -> int:
-    p = Path(project_dir) if project_dir else None
-    cfg = ConfigStore.load(project_dir=p, extra_paths=[Path(x) for x in (extra or [])])
-    print("# newpkg: resolved config (expanded)\n")
-    print(json.dumps(cfg.as_dict(expanded=True), indent=2, ensure_ascii=False))
-    # module discovery demo
-    mr = ModuleRegistry()
-    mr.discover()
-    mods = [dict(name=m.name, version=m.version or "", path=str(m.path)) for m in mr.list()]
-    print("\n# discovered modules:\n")
-    print(json.dumps(mods, indent=2, ensure_ascii=False))
-    return 0
+# compatibility aliases
+ConfigManager = ConfigStore
 
 
-# ------------------------------ Demo / Entrypoint ------------------------------
-if __name__ == "__main__":
+# convenience initializer used by CLI and modules
+def init_config(project_dir: Optional[str] = None, extra_paths: Optional[List[str]] = None) -> ConfigStore:
+    cfg = ConfigStore.load(project_dir=project_dir, extra_paths=extra_paths)
+    cfg.expand_all()
+    return cfg
+
+
+# small CLI for debugging/loading the config
+if __name__ == '__main__':
     import argparse
-
-    ap = argparse.ArgumentParser(prog="newpkg-config")
-    ap.add_argument("--project-dir", help="project dir to load project-level config from", default=None)
-    ap.add_argument("--extra", help="extra toml paths (comma separated)", default=None)
-    ap.add_argument("--dump", help="dump resolved config", action="store_true")
+    ap = argparse.ArgumentParser(prog='newpkg-config')
+    ap.add_argument('--project', help='project dir to load config from')
+    ap.add_argument('--dump', action='store_true', help='dump resolved config')
     args = ap.parse_args()
-    extra = args.extra.split(",") if args.extra else None
+    cfg = init_config(project_dir=args.project)
     if args.dump:
-        sys.exit(_dump_cli(args.project_dir, extra))
-
-    print("newpkg config module loaded. Use --dump to print resolved config.")
+        print(json.dumps(cfg._raw, indent=2))
+    else:
+        ok, errs = cfg.validate()
+        if not ok:
+            print('Config validation errors:')
+            for e in errs:
+                print(' -', e)
+        else:
+            print('Config loaded OK')
