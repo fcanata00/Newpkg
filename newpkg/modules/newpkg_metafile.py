@@ -1,494 +1,530 @@
+#!/usr/bin/env python3
 """
 newpkg_metafile.py
 
-Gerencia metafiles (TOML/YAML) que descrevem pacotes para newpkg.
-Suporta:
- - TOML (tomllib / tomli), YAML (PyYAML optional)
- - múltiplas sources (mirrors), múltiplos patches
- - checksum + optional GPG verify
- - environment expansion (${VAR})
- - merge of pass1 metafile with main metafile (e.g. gcc-13.2.0-pass1.toml)
- - integration hooks for newpkg_download, newpkg_patcher, newpkg_db, newpkg_hooks
- - generate_manifest -> JSON normalized output
+Metafile manager for newpkg: load/merge/validate/resolve/apply/prepare
+Integrations:
+ - newpkg_config (init_config)
+ - newpkg_logger (NewpkgLogger)
+ - newpkg_db (NewpkgDB)
+ - newpkg_download (NewpkgDownloader.batch_download)
+ - newpkg_patcher (NewpkgPatcher.apply_all)
+ - newpkg_hooks (HooksManager.execute_safe)
 
-The class is intentionally defensive (best-effort integration when helper modules are missing).
+Public API (class Metafile):
+ - load(path)
+ - merge(other_path)
+ - validate()
+ - expand_env(extra_env)
+ - resolve_sources(download_dir, parallel)
+ - verify_sources()
+ - apply_patches(workdir)
+ - prepare_environment(destdir, builddir)
+ - export_to_db()
+ - generate_manifest()
+ - summary()
 
-Example usage:
-    mf = NewpkgMetaFile(cfg, logger=logger, db=db, downloader=dl, patcher=patcher)
-    mf.load('packages/gcc/gcc-13.2.0-pass1.toml')
-    mf.merge_metafile('packages/gcc/gcc-13.2.0.toml')
-    mf.validate()
-    mf.expand_env(extra_env={'LFS_TGT':'x86_64-lfs-linux-gnu'})
-    mf.resolve_sources()
-    mf.apply_patches()
-    manifest = mf.generate_manifest()
-    mf.export_to_db()
-
+This implementation is defensive: optional dependencies are handled gracefully and operations fall back to best-effort behavior.
 """
 from __future__ import annotations
 
-import os
-import re
 import json
+import os
 import shutil
 import hashlib
-import tempfile
-import tarfile
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# toml loader
+# optional internal modules
 try:
-    import tomllib as _toml
+    from newpkg_config import init_config
 except Exception:
-    try:
-        import tomli as _toml  # type: ignore
-    except Exception:
-        _toml = None
+    init_config = None
 
-# yaml optional
 try:
-    import yaml
-    _HAS_YAML = True
+    from newpkg_logger import NewpkgLogger
 except Exception:
-    yaml = None
-    _HAS_YAML = False
+    NewpkgLogger = None
 
-# gpg optional
 try:
-    import gnupg
-    _HAS_GNUPG = True
+    from newpkg_db import NewpkgDB
 except Exception:
-    gnupg = None
-    _HAS_GNUPG = False
+    NewpkgDB = None
+
+try:
+    from newpkg_download import NewpkgDownloader
+except Exception:
+    NewpkgDownloader = None
+
+try:
+    from newpkg_patcher import NewpkgPatcher
+except Exception:
+    NewpkgPatcher = None
+
+try:
+    from newpkg_hooks import HooksManager
+except Exception:
+    HooksManager = None
+
+CACHE_DIR = Path.home() / '.cache' / 'newpkg' / 'metafiles'
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-class MetaFileError(Exception):
-    pass
+@dataclass
+class Metafile:
+    raw: Dict[str, Any] = field(default_factory=dict)
+    path: Optional[Path] = None
+    cfg: Any = None
+    logger: Any = None
+    db: Any = None
+    downloader: Any = None
+    patcher: Any = None
+    hooks: Any = None
 
+    def __post_init__(self):
+        if not self.logger and NewpkgLogger and self.cfg is not None:
+            try:
+                self.logger = NewpkgLogger.from_config(self.cfg, self.db)
+            except Exception:
+                self.logger = None
+        if not self.db and NewpkgDB and self.cfg is not None:
+            try:
+                self.db = NewpkgDB(self.cfg)
+            except Exception:
+                self.db = None
+        if not self.downloader and NewpkgDownloader and self.cfg is not None:
+            try:
+                self.downloader = NewpkgDownloader(self.cfg, self.logger, self.db)
+            except Exception:
+                self.downloader = None
+        if not self.patcher and NewpkgPatcher and self.cfg is not None:
+            try:
+                self.patcher = NewpkgPatcher(self.cfg, self.logger, self.db)
+            except Exception:
+                self.patcher = None
+        if not self.hooks and HooksManager and self.cfg is not None:
+            try:
+                self.hooks = HooksManager(self.cfg, self.logger, self.db)
+            except Exception:
+                self.hooks = None
 
-ENV_VAR_RE = re.compile(r"\$\{([^}]+)\}")
-
-
-class NewpkgMetaFile:
-    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, downloader: Any = None, patcher: Any = None, hooks: Any = None):
-        self.cfg = cfg
-        self.logger = logger
-        self.db = db
-        self.downloader = downloader
-        self.patcher = patcher
-        self.hooks = hooks
-
-        # loaded data
-        self.raw: Dict[str, Any] = {}
-        self.meta: Dict[str, Any] = {}
-
-        # resolved paths for downloaded sources/patches
-        self._resolved_sources: List[Dict[str, Any]] = []
-        self._resolved_patches: List[Dict[str, Any]] = []
-
-        # config defaults
-        try:
-            self.search_paths = self.cfg.get('metafile.search_paths') or []
-        except Exception:
-            self.search_paths = []
-        try:
-            self.validate_hash = bool(self.cfg.get('metafile.validate_hash'))
-        except Exception:
-            self.validate_hash = True
-        try:
-            self.gpg_verify = bool(self.cfg.get('metafile.gpg_verify'))
-        except Exception:
-            self.gpg_verify = True
-        try:
-            self.apply_patches_by_default = bool(self.cfg.get('metafile.apply_patches'))
-        except Exception:
-            self.apply_patches_by_default = True
-        try:
-            self.safe_mode = bool(self.cfg.get('metafile.safe_mode'))
-        except Exception:
-            self.safe_mode = True
-
-        # gpg
-        self._gpg = gnupg.GPG() if _HAS_GNUPG else None
-
-    # ---------------- logging ----------------
-    def _log(self, event: str, level: str = 'INFO', message: Optional[str] = None, meta: Optional[Dict[str, Any]] = None) -> None:
+    # ---------------- utils ----------------
+    def _log(self, level: str, event: str, message: str = '', **meta):
         if self.logger:
             try:
-                self.logger.log_event(event, level=level, message=message or event, metadata=meta or {})
+                fn = getattr(self.logger, level.lower(), None)
+                if fn:
+                    fn(event, message, **meta)
+                    return
             except Exception:
                 pass
+        print(f'[{level}] {event}: {message}')
 
-    # ---------------- load ----------------
-    def load(self, path: str) -> Dict[str, Any]:
+    def _cache_path(self) -> Path:
+        if not self.path:
+            return CACHE_DIR / 'unnamed.json'
+        key = f"{self.path.name}.json"
+        return CACHE_DIR / key
+
+    # ---------------- load / merge ----------------
+    def load(self, path: str) -> None:
         p = Path(path)
         if not p.exists():
-            # try search paths
-            for sp in self.search_paths:
-                spath = Path(sp) / p
-                if spath.exists():
-                    p = spath
-                    break
+            raise FileNotFoundError(path)
+        self.path = p
+        try:
+            text = p.read_text(encoding='utf-8')
+            # try json first, then toml if available
+            if p.suffix in ('.json',):
+                self.raw = json.loads(text)
             else:
-                raise MetaFileError(f'Metafile not found: {path}')
-
-        text = p.read_bytes()
-        data: Dict[str, Any] = {}
-        if p.suffix in ('.toml', '.tml') and _toml is not None:
-            try:
-                data = _toml.loads(text.decode('utf-8'))
-            except Exception as e:
-                raise MetaFileError(f'Failed to parse TOML: {e}')
-        elif p.suffix in ('.yaml', '.yml') and _HAS_YAML:
-            try:
-                data = yaml.safe_load(text)
-            except Exception as e:
-                raise MetaFileError(f'Failed to parse YAML: {e}')
-        elif p.suffix == '.json':
-            try:
-                data = json.loads(text.decode('utf-8'))
-            except Exception as e:
-                raise MetaFileError(f'Failed to parse JSON: {e}')
-        else:
-            # try toml fallback
-            if _toml is not None:
+                # try to parse as toml if lib available
                 try:
-                    data = _toml.loads(text.decode('utf-8'))
+                    import tomllib as _toml
+                    self.raw = _toml.loads(text)
                 except Exception:
-                    raise MetaFileError('Unsupported metafile format or missing parser')
-            else:
-                raise MetaFileError('No TOML/YAML parser available')
+                    try:
+                        import tomli as _tomli
+                        self.raw = _tomli.loads(text)
+                    except Exception:
+                        # fallback: attempt json parse
+                        self.raw = json.loads(text)
+            self._log('info', 'metafile.load', f'Loaded metafile {path}', path=str(p))
+            # write cache
+            try:
+                self._cache_write()
+            except Exception:
+                pass
+        except Exception as e:
+            self._log('error', 'metafile.load.fail', f'Failed to load {path}: {e}', path=str(p))
+            raise
 
-        # normalize keys to lower-case top-level
-        data = {k: v for k, v in data.items()}
-        self.raw = data
-        self.meta = self._normalize(data)
-        self._log('metafile.load', level='INFO', message=f'Loaded metafile {p}', meta={'path': str(p)})
-        return self.meta
+    def merge(self, other_path: str) -> None:
+        # load other and shallow-merge arrays and dicts
+        p = Path(other_path)
+        if not p.exists():
+            raise FileNotFoundError(other_path)
+        try:
+            other = Metafile(cfg=self.cfg, logger=self.logger, db=self.db)
+            other.load(other_path)
+            # merge simple: combine lists for keys: sources, patches, env, phases
+            for key in ('sources', 'patches'):
+                a = self.raw.get(key, [])
+                b = other.raw.get(key, [])
+                merged = list(a) + [x for x in b if x not in a]
+                if merged:
+                    self.raw[key] = merged
+            # merge env/phases as dicts (other overrides base)
+            for key in ('env', 'phases', 'build', 'meta'):
+                base = dict(self.raw.get(key, {}) or {})
+                otherd = dict(other.raw.get(key, {}) or {})
+                base.update(otherd)
+                if base:
+                    self.raw[key] = base
+            self._log('info', 'metafile.merge', f'Merged {other_path} into {self.path or "<in-memory>"}', other=str(other_path))
+        except Exception as e:
+            self._log('error', 'metafile.merge.fail', f'Failed to merge {other_path}: {e}', other=str(other_path))
+            raise
 
-    def _normalize(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        # create a normalized meta structure with defaults
-        m: Dict[str, Any] = {}
-        m['name'] = data.get('name') or data.get('pkg') or data.get('package')
-        m['version'] = data.get('version')
-        m['release'] = data.get('release')
-        m['description'] = data.get('description')
+    # ---------------- cache helpers ----------------
+    def _cache_write(self) -> None:
+        p = self._cache_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            p.write_text(json.dumps({'loaded_at': datetime.utcnow().isoformat() + 'Z', 'raw': self.raw}, indent=2), encoding='utf-8')
+        except Exception:
+            pass
 
-        # sources: allow list of strings or list of dicts
-        sources_raw = data.get('sources') or data.get('source') or []
-        sources: List[Dict[str, Any]] = []
-        if isinstance(sources_raw, (list, tuple)):
-            for s in sources_raw:
-                if isinstance(s, str):
-                    sources.append({'url': s})
-                elif isinstance(s, dict):
-                    sources.append(dict(s))
-        elif isinstance(sources_raw, str):
-            sources.append({'url': sources_raw})
-        m['sources'] = sources
-
-        # patches
-        patches_raw = data.get('patches') or []
-        patches: List[Dict[str, Any]] = []
-        if isinstance(patches_raw, (list, tuple)):
-            for p in patches_raw:
-                if isinstance(p, str):
-                    patches.append({'url': p, 'apply': True})
-                elif isinstance(p, dict):
-                    patches.append(dict(p))
-        m['patches'] = patches
-
-        # dependencies
-        deps = data.get('dependencies') or data.get('depends') or {}
-        m['dependencies'] = deps
-
-        # env
-        env = data.get('env') or {}
-        m['env'] = env
-
-        # checks
-        checks = data.get('checks') or data.get('verify') or {}
-        m['checks'] = checks
-
-        # phases
-        phases = data.get('phases') or {}
-        m['phases'] = phases
-
-        # meta: source metadata like type, mirrors
-        m['meta'] = data.get('meta') or {}
-
-        # file origin for reference
-        return m
-
-    # ---------------- merge pass1 with main metafile ----------------
-    def merge_metafile(self, other_path: str) -> Dict[str, Any]:
-        """Merge another metafile into the currently loaded one. Values from other override when appropriate.
-
-        Use case: load gcc-13.2.0-pass1.toml then merge gcc-13.2.0.toml to compose full build.
-        """
-        other = NewpkgMetaFile(self.cfg, logger=self.logger, db=self.db, downloader=self.downloader, patcher=self.patcher, hooks=self.hooks)
-        other.load(other_path)
-        # merge simple strategy: combine sources/patches and override top-level keys when present in other
-        merged = dict(self.meta)
-        for k in ('sources', 'patches'):
-            merged[k] = list({json.dumps(x, sort_keys=True): x for x in (merged.get(k, []) + other.meta.get(k, []))}.values())
-        # override fields
-        for key in ('name', 'version', 'release', 'description', 'env', 'phases', 'dependencies', 'checks'):
-            if other.meta.get(key) is not None:
-                if isinstance(merged.get(key), dict) and isinstance(other.meta.get(key), dict):
-                    # merge dicts
-                    merged[key] = dict(merged.get(key) or {})
-                    merged[key].update(other.meta.get(key) or {})
-                else:
-                    merged[key] = other.meta.get(key)
-        self.meta = merged
-        self._log('metafile.merge', level='INFO', message=f'Merged metafile {other_path}', meta={'merged_keys': list(merged.keys())})
-        return self.meta
+    def _cache_read(self) -> Optional[Dict[str, Any]]:
+        p = self._cache_path()
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text(encoding='utf-8'))
+        except Exception:
+            return None
 
     # ---------------- validation ----------------
     def validate(self) -> Tuple[bool, List[str]]:
-        errs: List[str] = []
-        if not self.meta.get('name'):
-            errs.append('missing name')
-        if not self.meta.get('version'):
-            errs.append('missing version')
-        if not self.meta.get('sources'):
-            errs.append('no sources defined')
-        # check source urls
-        for s in self.meta.get('sources', []):
-            if 'url' not in s:
-                errs.append(f'source missing url: {s}')
-        # patches sanity
-        for p in self.meta.get('patches', []):
-            if 'url' not in p and 'file' not in p:
-                errs.append(f'patch missing url/file: {p}')
-        # phases allowed
-        if self.safe_mode:
-            for name, cmd in (self.meta.get('phases') or {}).items():
-                if isinstance(cmd, str) and any(tok in cmd for tok in ('&&', ';', '|', '>', '<')):
-                    errs.append(f'unsafe token in phase {name}')
-        ok = not errs
-        self._log('metafile.validate', level='INFO' if ok else 'ERROR', message='Validated metafile', meta={'ok': ok, 'errors': errs})
-        return ok, errs
-
-    # ---------------- env expansion ----------------
-    def expand_env(self, extra_env: Optional[Dict[str, str]] = None) -> None:
-        env = dict(os.environ)
-        env.update(self.meta.get('env') or {})
-        if extra_env:
-            env.update(extra_env)
-        # perform ${VAR} substitution in phases, env values
-        def _expand_text(s: str) -> str:
-            def repl(m):
-                key = m.group(1)
-                return env.get(key, '')
-            return ENV_VAR_RE.sub(repl, s)
-
-        # expand env values
-        newenv = {}
-        for k, v in (self.meta.get('env') or {}).items():
-            if isinstance(v, str):
-                newenv[k] = _expand_text(v)
-            else:
-                newenv[k] = v
-        self.meta['env'] = newenv
-
-        # expand phases
-        phases = {}
-        for name, cmd in (self.meta.get('phases') or {}).items():
-            if isinstance(cmd, str):
-                phases[name] = _expand_text(cmd)
-            else:
-                phases[name] = cmd
-        self.meta['phases'] = phases
-        self._log('metafile.expand', level='INFO', message='Expanded environment variables', meta={'env_keys': list(newenv.keys())})
-
-    # ---------------- resolve sources (download) ----------------
-    def resolve_sources(self, download_dir: Optional[str] = None, parallel: int = 4, resume: bool = True) -> List[Dict[str, Any]]:
-        if not self.downloader:
-            raise MetaFileError('downloader not configured')
-        dd = Path(download_dir) if download_dir else Path(tempfile.mkdtemp(prefix=f'newpkg-src-{self.meta.get("name")}-'))
-        dd.mkdir(parents=True, exist_ok=True)
-        tasks: List[Dict[str, Any]] = []
-        for src in self.meta.get('sources', []):
-            url = src.get('url')
-            filename = src.get('filename') or Path(url).name
-            dest = dd / filename
-            task = {'url': url, 'dest': str(dest), 'checksum': src.get('sha256') or src.get('sha1') or src.get('md5'), 'checksum_type': 'sha256' if src.get('sha256') else ('sha1' if src.get('sha1') else ('md5' if src.get('md5') else None)), 'mirrors': src.get('mirrors'), 'resume': resume}
-            tasks.append(task)
-        # run downloader.download_many
-        import asyncio
-        coro = self.downloader.download_many(tasks, parallel=parallel)
-        try:
-            results = asyncio.run(coro)
-        except Exception as e:
-            raise MetaFileError(f'download failed: {e}')
-        resolved = []
-        for i, r in enumerate(results):
-            entry = dict(self.meta.get('sources')[i])
-            entry['download'] = r
-            resolved.append(entry)
-        self._resolved_sources = resolved
-        self._log('metafile.resolve_sources', level='INFO', message=f'Downloaded sources to {str(dd)}', meta={'count': len(resolved), 'dir': str(dd)})
-        return resolved
-
-    # ---------------- apply patches ----------------
-    def apply_patches(self, workdir: Optional[str] = None, strip: int = 1) -> List[Dict[str, Any]]:
-        if not self.patcher:
-            raise MetaFileError('patcher not configured')
-        wd = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix=f'newpkg-patch-{self.meta.get("name")}-'))
-        wd.mkdir(parents=True, exist_ok=True)
-        results: List[Dict[str, Any]] = []
-        for p in self.meta.get('patches', []):
-            # patch may be local file or URL
-            if 'file' in p:
-                src = Path(p.get('file'))
-                if not src.exists():
-                    results.append({'patch': str(src), 'status': 'missing'})
-                    continue
-                res = self.patcher.apply_patch(str(src), cwd=str(wd), strip=strip)
-                results.append({'patch': str(src), 'result': res})
-            else:
-                url = p.get('url')
-                filename = Path(url).name
-                dest = wd / filename
-                # download patch using downloader if available
-                if self.downloader:
-                    import asyncio
-                    coro = self.downloader.download([url], dest)
-                    try:
-                        dres = asyncio.run(coro)
-                    except Exception as e:
-                        results.append({'patch': url, 'status': 'download-fail', 'error': str(e)})
-                        continue
-                    if dres.get('status') != 'ok':
-                        results.append({'patch': url, 'status': 'download-fail', 'error': dres})
-                        continue
-                    res = self.patcher.apply_patch(str(dest), cwd=str(wd), strip=strip)
-                    results.append({'patch': url, 'result': res})
+        errors: List[str] = []
+        # basic required fields
+        name = self.raw.get('name') or (self.path.name if self.path else None)
+        if not name:
+            errors.append('missing name')
+        sources = self.raw.get('sources', [])
+        if not isinstance(sources, list):
+            errors.append('sources must be a list')
+        else:
+            for s in sources:
+                if not isinstance(s, dict) and not isinstance(s, str):
+                    errors.append(f'invalid source entry: {s}')
                 else:
-                    results.append({'patch': url, 'status': 'no-downloader'})
-        self._resolved_patches = results
-        self._log('metafile.apply_patches', level='INFO', message='Applied patches', meta={'count': len(results)})
-        return results
+                    # if dict, expect url and optional sha256
+                    if isinstance(s, dict):
+                        if 'url' not in s:
+                            errors.append(f'source missing url: {s}')
+                        if 'sha256' in s and len(str(s.get('sha256'))) not in (64,):
+                            errors.append(f'invalid sha256 for {s.get("url")}')
+        patches = self.raw.get('patches', [])
+        if patches and not isinstance(patches, list):
+            errors.append('patches must be a list')
+        # optional consistency checks
+        # detect duplicate URLs
+        urls = []
+        for s in sources:
+            u = s['url'] if isinstance(s, dict) else s
+            if u in urls:
+                errors.append(f'duplicate source URL {u}')
+            urls.append(u)
+        ok = len(errors) == 0
+        if ok:
+            self._log('info', 'metafile.validate.ok', f'Metafile validated: {name}', name=name)
+        else:
+            self._log('error', 'metafile.validate.fail', f'Metafile validation failed: {errors}', errors=errors)
+        return ok, errors
 
-    # ---------------- checks: checksum + gpg ----------------
-    def _check_file_checksum(self, path: Path, checksum: str, ctype: str = 'sha256') -> bool:
-        if not path.exists():
-            return False
-        try:
-            h = getattr(__import__('hashlib'), ctype)()
-        except Exception:
-            # fallback mapping
-            if ctype == 'sha256':
-                h = __import__('hashlib').sha256()
-            elif ctype == 'sha1':
-                h = __import__('hashlib').sha1()
+    # ---------------- environment expansion ----------------
+    def expand_env(self, extra_env: Optional[Dict[str, str]] = None) -> None:
+        env = dict(self.raw.get('env', {}) or {})
+        env.update(extra_env or {})
+        # simple ${VAR} expansion for strings in env and phases
+        def expand_value(v: Any) -> Any:
+            if isinstance(v, str):
+                try:
+                    return os.path.expandvars(v.format(**env))
+                except Exception:
+                    return os.path.expandvars(v)
+            return v
+
+        self.raw['env'] = {k: expand_value(v) for k, v in env.items()}
+        phases = self.raw.get('phases', {}) or {}
+        for phase, cmds in phases.items():
+            if isinstance(cmds, list):
+                phases[phase] = [expand_value(c) for c in cmds]
+        self.raw['phases'] = phases
+        self._log('info', 'metafile.expand', 'Expanded environment and phases', env_keys=list(self.raw['env'].keys()))
+
+    # ---------------- sources resolution ----------------
+    def resolve_sources(self, download_dir: Optional[str] = None, parallel: Optional[int] = None) -> List[Dict[str, Any]]:
+        tasks: List[Dict[str, Any]] = []
+        download_dir = download_dir or str(Path('.').resolve() / 'sources')
+        ddir = Path(download_dir)
+        ddir.mkdir(parents=True, exist_ok=True)
+        for s in self.raw.get('sources', []) or []:
+            if isinstance(s, str):
+                url = s
+                fname = None
+                sha = None
             else:
-                h = __import__('hashlib').md5()
-        with path.open('rb') as fh:
-            for chunk in iter(lambda: fh.read(65536), b''):
-                h.update(chunk)
-        return h.hexdigest().lower() == checksum.lower().replace('0x', '')
+                url = s.get('url')
+                fname = s.get('filename')
+                sha = s.get('sha256') or s.get('checksum')
+            dest = str(ddir / (fname or Path(url).name))
+            tasks.append({'url': url, 'dest': dest, 'checksum': sha})
+        if not tasks:
+            return []
+        # call downloader.batch_download if available
+        if self.downloader and hasattr(self.downloader, 'batch_download'):
+            try:
+                res = self.downloader.batch_download(self.raw.get('name', 'pkg'), tasks, parallel=parallel)
+                self._log('info', 'metafile.resolve', f'Downloaded {len(res)} sources', package=self.raw.get('name'))
+                return res
+            except Exception as e:
+                self._log('error', 'metafile.resolve.fail', f'Download failed: {e}')
+                raise
+        # fallback: attempt simple sync downloads via downloader.download_sync if present
+        results = []
+        for t in tasks:
+            try:
+                if self.downloader and hasattr(self.downloader, 'download_sync'):
+                    r = self.downloader.download_sync(t['url'], dest=t['dest'], checksum=t.get('checksum'))
+                    results.append(r)
+                else:
+                    # best-effort using curl/wget
+                    from subprocess import run
+                    cmd = ['curl', '-L', '-o', t['dest'], t['url']]
+                    proc = run(cmd)
+                    results.append({'rc': proc.returncode, 'out': t['dest'], 'err': '' if proc.returncode == 0 else 'curl failed'})
+            except Exception as e:
+                results.append({'rc': 1, 'out': '', 'err': str(e)})
+        return results
 
     def verify_sources(self) -> List[Dict[str, Any]]:
-        results = []
-        for src in self._resolved_sources:
-            d = src.get('download') or {}
-            path = Path(d.get('path')) if d.get('path') else None
-            ok = True
-            reason = None
-            if self.validate_hash and path and src.get('sha256'):
-                ok = self._check_file_checksum(path, src.get('sha256'), 'sha256')
-                if not ok:
-                    reason = 'checksum-mismatch'
-            # optional GPG
-            if ok and self.gpg_verify and src.get('gpg_sig') and _HAS_GNUPG:
+        ok_list: List[Dict[str, Any]] = []
+        for s in self.raw.get('sources', []) or []:
+            if isinstance(s, str):
+                url = s
+                sha = None
+                dest = None
+            else:
+                url = s.get('url')
+                sha = s.get('sha256') or s.get('checksum')
+                dest = s.get('filename') or Path(url).name
+            # locate file under cached sources directory
+            cached = Path('.').resolve() / 'sources' / (Path(url).name)
+            if not cached.exists():
+                ok_list.append({'url': url, 'status': 'missing'})
+                continue
+            if sha:
+                # compute hash
+                h = hashlib.sha256()
                 try:
-                    sig = Path(src.get('gpg_sig'))
-                    res = self._gpg.verify_file(sig.open('rb'), str(path))
-                    ok = bool(getattr(res, 'valid', False))
-                    if not ok:
-                        reason = 'gpg-fail'
-                except Exception:
-                    ok = False
-                    reason = 'gpg-exception'
-            results.append({'source': src, 'ok': ok, 'reason': reason})
-        self._log('metafile.verify_sources', level='INFO', message='Verified sources', meta={'results': len(results)})
-        return results
+                    with cached.open('rb') as fh:
+                        for chunk in iter(lambda: fh.read(65536), b''):
+                            h.update(chunk)
+                    got = h.hexdigest()
+                    ok = got.lower() == sha.lower()
+                    ok_list.append({'url': url, 'status': 'ok' if ok else 'mismatch', 'sha_expected': sha, 'sha_got': got})
+                except Exception as e:
+                    ok_list.append({'url': url, 'status': 'error', 'error': str(e)})
+            else:
+                ok_list.append({'url': url, 'status': 'ok', 'note': 'no-checksum'})
+        self._log('info', 'metafile.verify', f'Verified {len(ok_list)} sources', package=self.raw.get('name'))
+        return ok_list
 
-    # ---------------- generate manifest ----------------
-    def generate_manifest(self) -> Dict[str, Any]:
-        manifest: Dict[str, Any] = {}
-        manifest['name'] = self.meta.get('name')
-        manifest['version'] = self.meta.get('version')
-        manifest['release'] = self.meta.get('release')
-        manifest['description'] = self.meta.get('description')
-        manifest['env'] = self.meta.get('env')
-        manifest['phases'] = self.meta.get('phases')
-        manifest['dependencies'] = self.meta.get('dependencies')
-        manifest['sources'] = []
-        for s in self._resolved_sources:
-            entry = dict(s)
-            # compute size and sha256 if available
-            d = entry.get('download') or {}
-            path = Path(d.get('path')) if d.get('path') else None
-            if path and path.exists():
-                entry['size'] = path.stat().st_size
-                entry['sha256_computed'] = hashlib.sha256(path.read_bytes()).hexdigest()
-            manifest['sources'].append(entry)
-        manifest['patches'] = self._resolved_patches
-        manifest['generated_at'] = datetime.utcnow().isoformat() + 'Z'
-        self._log('metafile.manifest', level='INFO', message='Generated manifest', meta={'name': manifest.get('name')})
-        return manifest
+    # ---------------- patch application ----------------
+    def apply_patches(self, workdir: Optional[str] = None, stop_on_error: bool = True) -> Dict[str, Any]:
+        # workdir defaults to the source directory root
+        workdir = workdir or str(Path('.').resolve())
+        if not self.patcher or not hasattr(self.patcher, 'apply_all'):
+            self._log('warning', 'metafile.patcher.missing', 'Patcher module not available; skipping patches')
+            return {'applied': 0, 'total': 0}
+        patches = self.raw.get('patches', []) or []
+        # if patches are dicts with path, use that; otherwise look for patch files under patches/<pkg>
+        patch_paths = []
+        for p in patches:
+            if isinstance(p, str):
+                patch_paths.append(p)
+            elif isinstance(p, dict):
+                if 'path' in p:
+                    patch_paths.append(p['path'])
+                elif 'file' in p:
+                    patch_paths.append(p['file'])
+        # if no explicit patch list, let patcher discover
+        if not patch_paths:
+            res = self.patcher.apply_all(self.raw.get('name', 'pkg'), cwd=workdir, stop_on_error=stop_on_error)
+            return res
+        # otherwise apply each explicitly
+        results = []
+        applied = 0
+        for pp in patch_paths:
+            try:
+                r = self.patcher.apply_patch(pp, cwd=workdir)
+                results.append(r)
+                if r.get('status') == 'ok':
+                    applied += 1
+            except Exception as e:
+                results.append({'patch': pp, 'status': 'error', 'err': str(e)})
+                if stop_on_error:
+                    break
+        summary = {'total': len(patch_paths), 'applied': applied, 'results': results}
+        self._log('info', 'metafile.patches.done', f'Applied {applied}/{len(patch_paths)} patches', package=self.raw.get('name'))
+        return summary
 
-    # ---------------- export to DB ----------------
+    # ---------------- hooks ----------------
+    def run_hooks(self, hook_type: str, pkg_dir: Optional[str] = None) -> Dict[str, Any]:
+        if not self.hooks or not hasattr(self.hooks, 'execute_safe'):
+            self._log('warning', 'metafile.hooks.missing', f'Hook manager not available for {hook_type}')
+            return {'total': 0, 'ok': 0, 'failed': 0}
+        return self.hooks.execute_safe(hook_type, pkg_dir=pkg_dir)
+
+    # ---------------- environment / prepare ----------------
+    def prepare_environment(self, destdir: Optional[str] = None, builddir: Optional[str] = None) -> Dict[str, Any]:
+        name = self.raw.get('name') or (self.path.name if self.path else 'pkg')
+        destdir = destdir or str(Path('.').resolve() / 'destdir' / name)
+        builddir = builddir or str(Path('.').resolve() / 'build' / name)
+        Path(destdir).mkdir(parents=True, exist_ok=True)
+        Path(builddir).mkdir(parents=True, exist_ok=True)
+        # write env.json with expanded env
+        env = dict(self.raw.get('env', {}) or {})
+        env_out = {'env': env, 'phases': self.raw.get('phases', {})}
+        envfile = Path(builddir) / 'env.json'
+        try:
+            envfile.write_text(json.dumps(env_out, indent=2), encoding='utf-8')
+        except Exception:
+            pass
+        self._log('info', 'metafile.prepare', f'Prepared build env for {name}', builddir=builddir, destdir=destdir)
+        return {'builddir': builddir, 'destdir': destdir, 'envfile': str(envfile)}
+
+    # ---------------- DB export ----------------
     def export_to_db(self) -> bool:
         if not self.db:
+            self._log('warning', 'metafile.db.missing', 'NewpkgDB not configured; skipping export')
             return False
         try:
-            manifest = self.generate_manifest()
-            if hasattr(self.db, 'store_manifest'):
-                self.db.store_manifest(manifest)
-            elif hasattr(self.db, 'add_package'):
-                # best-effort add package metadata
-                try:
-                    self.db.add_package(manifest.get('name'), manifest.get('version'), 1, origin='metafile', status='staged')
-                except Exception:
-                    pass
-            self._log('metafile.export', level='INFO', message='Exported manifest to DB', meta={'name': manifest.get('name')})
+            name = self.raw.get('name') or (self.path.name if self.path else 'pkg')
+            version = self.raw.get('version')
+            origin = self.raw.get('origin')
+            pid = self.db.add_package(name, version=version, origin=origin, status='metafile')
+            # add sources as deps? store in meta
+            self.db.set_meta(f'metafile:{name}', self.raw)
+            self._log('info', 'metafile.db.export', f'Exported {name} to DB', package=name, pid=pid)
             return True
         except Exception as e:
-            self._log('metafile.export.fail', level='ERROR', message=str(e), meta={})
+            self._log('error', 'metafile.db.fail', f'Failed to export to DB: {e}')
             return False
 
-    # ---------------- prepare environment for build ----------------
-    def prepare_environment(self, base_dir: Optional[str] = None) -> Dict[str, Any]:
-        work = Path(base_dir) if base_dir else Path(tempfile.mkdtemp(prefix=f'newpkg-work-{self.meta.get("name")}-'))
-        env = dict(os.environ)
-        env.update(self.meta.get('env') or {})
-        # ensure common dirs
-        (work / 'build').mkdir(parents=True, exist_ok=True)
-        (work / 'destdir').mkdir(parents=True, exist_ok=True)
-        # write an env file for reference
-        (work / 'env.json').write_text(json.dumps(env, indent=2), encoding='utf-8')
-        self._log('metafile.prepare', level='INFO', message='Prepared build environment', meta={'workdir': str(work)})
-        return {'workdir': str(work), 'env': env}
-
-    # ---------------- list phases and summary ----------------
-    def list_phases(self) -> List[str]:
-        return list((self.meta.get('phases') or {}).keys())
+    # ---------------- manifest / summary ----------------
+    def generate_manifest(self) -> Dict[str, Any]:
+        manifest = {
+            'name': self.raw.get('name'),
+            'version': self.raw.get('version'),
+            'sources': self.raw.get('sources', []),
+            'patches': self.raw.get('patches', []),
+            'env': self.raw.get('env', {}),
+            'phases': self.raw.get('phases', {}),
+            'generated_at': datetime.utcnow().isoformat() + 'Z'
+        }
+        # try to estimate sizes if sources available locally
+        total_size = 0
+        sizes = []
+        for s in manifest['sources']:
+            url = s if isinstance(s, str) else s.get('url')
+            local = Path('sources') / Path(url).name
+            if local.exists():
+                try:
+                    sz = local.stat().st_size
+                    total_size += sz
+                    sizes.append({'file': str(local), 'size': sz})
+                except Exception:
+                    continue
+        manifest['size_total'] = total_size
+        manifest['filesizes'] = sizes
+        return manifest
 
     def summary(self) -> Dict[str, Any]:
+        name = self.raw.get('name') or (self.path.name if self.path else 'pkg')
+        manifest = self.generate_manifest()
+        ok, errors = self.validate()
         return {
-            'name': self.meta.get('name'),
-            'version': self.meta.get('version'),
-            'release': self.meta.get('release'),
-            'sources': [s.get('url') for s in (self.meta.get('sources') or [])],
-            'patches': [p.get('url') or p.get('file') for p in (self.meta.get('patches') or [])],
-            'phases': self.list_phases(),
+            'name': name,
+            'valid': ok,
+            'errors': errors,
+            'manifest': manifest,
         }
 
 
-# EOF
+# CLI convenience
+if __name__ == '__main__':
+    import argparse
+    p = argparse.ArgumentParser(prog='newpkg-metafile')
+    p.add_argument('cmd', choices=['load', 'merge', 'validate', 'resolve', 'verify', 'apply', 'prepare', 'export', 'summary'])
+    p.add_argument('path', nargs='?', help='metafile path or package name')
+    p.add_argument('--workdir', help='working dir / builddir')
+    args = p.parse_args()
+
+    cfg = None
+    if init_config:
+        try:
+            cfg = init_config()
+        except Exception:
+            cfg = None
+
+    db = NewpkgDB(cfg) if NewpkgDB and cfg is not None else None
+    logger = NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None
+    mf = Metafile(cfg=cfg, logger=logger, db=db)
+
+    if args.cmd == 'load' and args.path:
+        mf.load(args.path)
+        print('loaded')
+    elif args.cmd == 'merge' and args.path:
+        mf.load(args.path)
+        # expect second path via env NEWPKG_MERGE or ask
+        other = os.environ.get('NEWPKG_MERGE')
+        if other:
+            mf.merge(other)
+            print('merged')
+        else:
+            print('please set NEWPKG_MERGE env or use programmatically')
+    elif args.cmd == 'validate':
+        ok, errs = mf.validate()
+        print('ok' if ok else 'failed', errs)
+    elif args.cmd == 'resolve':
+        mf.load(args.path)
+        res = mf.resolve_sources()
+        print(json.dumps(res, indent=2))
+    elif args.cmd == 'verify':
+        mf.load(args.path)
+        res = mf.verify_sources()
+        print(json.dumps(res, indent=2))
+    elif args.cmd == 'apply':
+        mf.load(args.path)
+        res = mf.apply_patches(workdir=args.workdir)
+        print(json.dumps(res, indent=2))
+    elif args.cmd == 'prepare':
+        mf.load(args.path)
+        res = mf.prepare_environment()
+        print(json.dumps(res, indent=2))
+    elif args.cmd == 'export':
+        mf.load(args.path)
+        ok = mf.export_to_db()
+        print('exported' if ok else 'failed')
+    elif args.cmd == 'summary':
+        if args.path:
+            mf.load(args.path)
+        print(json.dumps(mf.summary(), indent=2))
+    else:
+        p.print_help()
