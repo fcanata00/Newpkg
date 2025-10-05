@@ -1,53 +1,35 @@
 #!/usr/bin/env python3
+# newpkg_download.py
 """
-newpkg_download.py
+newpkg_download.py — robust downloader for newpkg
 
-Robust downloader for Newpkg with integrations:
- - Config keys: download.cache_dir, download.parallel, download.timeout, download.user_agent, download.format
- - Integrates with newpkg_config (init_config), newpkg_logger (NewpkgLogger), newpkg_db (record_phase)
- - Async downloading (aiohttp if available) with fallback to requests/curl/wget
- - download_many(tasks, parallel) where tasks = [{"url":..., "dest":..., "checksum":..., "mirrors": [...]}, ...]
- - download_sync wrapper
- - batch_download(pkg_name, sources) returns standardized results for core
- - clone_git, rsync (best-effort wrappers)
- - verify(path, checksum) and verify_gpg(path, sig)
- - extract_archive(path, dest)
- - cache management (clear_cache older than TTL)
-
-This module is defensive: optional libs are handled gracefully and functions attempt best-effort fallbacks.
+Features:
+ - Reads settings from newpkg_config (downloads.*), supports profiles
+ - Async downloads via aiohttp when available, fallback to requests/curl/wget/aria2c
+ - download_sync() and download_async() interfaces
+ - clone_git() with shallow/depth/submodule options and profile-aware config
+ - extract_archive() with path traversal protection
+ - respects cfg.get('general.dry_run'), cfg.get('output.quiet'), cfg.get('output.json')
+ - propagates cfg.as_env() into subprocess calls
+ - integrates with newpkg_logger and newpkg_db if available
 """
+
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import shutil
-import stat
 import subprocess
-import sys
-import time
-from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+import tarfile
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
-# optional libraries
-try:
-    import aiohttp
-    _HAS_AIOHTTP = True
-except Exception:
-    aiohttp = None
-    _HAS_AIOHTTP = False
-
-try:
-    import requests
-    _HAS_REQUESTS = True
-except Exception:
-    requests = None
-    _HAS_REQUESTS = False
-
-# imports from our workspace (may be unavailable at import time)
+# optional project imports
 try:
     from newpkg_config import init_config
 except Exception:
@@ -63,37 +45,121 @@ try:
 except Exception:
     NewpkgDB = None
 
+# optional third-party libs
+try:
+    import aiohttp  # type: ignore
+    _HAS_AIOHTTP = True
+except Exception:
+    aiohttp = None
+    _HAS_AIOHTTP = False
 
-DEFAULT_CACHE_TTL = 7 * 24 * 3600  # seconds
-DEFAULT_PARALLEL = 4
+try:
+    import requests  # type: ignore
+    _HAS_REQUESTS = True
+except Exception:
+    requests = None
+    _HAS_REQUESTS = False
 
+# module logger (fallback to std logging)
+_logger = logging.getLogger("newpkg.download")
+if not _logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[%(levelname)s] newpkg.download: %(message)s"))
+    _logger.addHandler(h)
+_logger.setLevel(logging.INFO)
 
-class DownloadError(Exception):
-    pass
+# dataclasses
+@dataclass
+class DownloadResult:
+    url: str
+    dest: str
+    ok: bool
+    sha256: Optional[str] = None
+    used_mirror: Optional[str] = None
+    error: Optional[str] = None
+    dry_run: bool = False
 
+# helper functions
+def _sha256_of_path(p: Union[str, Path]) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
+def _safe_extract_tar(tar_path: Union[str, Path], dest: Union[str, Path]) -> None:
+    """
+    Extract tar file but prevent path traversal (no member escaping dest).
+    Supports gz/xz/bz2 as handled by tarfile.
+    """
+    dest = Path(dest).resolve()
+    with tarfile.open(tar_path, "r:*") as tf:
+        for member in tf.getmembers():
+            member_path = dest.joinpath(member.name).resolve()
+            if not str(member_path).startswith(str(dest)):
+                raise RuntimeError(f"Unsafe path in tar archive: {member.name}")
+        tf.extractall(path=str(dest))
+
+# Main class
 class NewpkgDownloader:
     def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None):
-        self.cfg = cfg
-        self.logger = logger or (NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None)
-        self.db = db or (NewpkgDB(cfg) if NewpkgDB and cfg is not None else None)
+        # load config
+        self.cfg = cfg or (init_config() if init_config else None)
+        # prefer project's logger if given
+        if logger:
+            self.logger = logger
+        else:
+            if NewpkgLogger and self.cfg is not None:
+                try:
+                    self.logger = NewpkgLogger.from_config(self.cfg, db)
+                except Exception:
+                    self.logger = None
+            else:
+                self.logger = None
+        self.db = db or (NewpkgDB(self.cfg) if NewpkgDB and self.cfg is not None else None)
 
-        # configuration
-        self.cache_dir = Path(self._cfg_get('download.cache_dir', os.environ.get('NEWPKG_DL_CACHE', '.cache/newpkg')))
-        self.cache_ttl = int(self._cfg_get('download.cache_ttl', os.environ.get('NEWPKG_DL_CACHE_TTL', DEFAULT_CACHE_TTL)))
-        self.parallel = int(self._cfg_get('download.parallel', os.environ.get('NEWPKG_DL_PARALLEL', DEFAULT_PARALLEL)))
-        self.timeout = int(self._cfg_get('download.timeout', os.environ.get('NEWPKG_DL_TIMEOUT', 3600)))
-        self.user_agent = self._cfg_get('download.user_agent', 'newpkg-downloader/1.0')
+        # profile handling
+        self.profiles: Dict[str, Any] = {}
+        if self.cfg:
+            self.profiles = self.cfg.get("downloads.profiles") or {}
+        # default settings
+        self.cache_dir = Path(self._cfg_get("downloads.cache_dir", "/var/cache/newpkg")).expanduser()
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.parallel = int(self._cfg_get("downloads.parallel_downloads", 4))
+        self.timeout = int(self._cfg_get("downloads.timeout", 300))
+        self.verify_checksums = bool(self._cfg_get("downloads.verify_checksums", True))
+        self.gpg_verify = bool(self._cfg_get("downloads.gpg_verify", True))
+        self.mirrors = list(self._cfg_get("downloads.mirrors", []) or [])
+        self.metafile_repos = list(self._cfg_get("downloads.metafile_repos", []) or [])
+        self.quiet = bool(self._cfg_get("output.quiet", False))
+        self.json_out = bool(self._cfg_get("output.json", False))
+        self.dry_run = bool(self._cfg_get("general.dry_run", False))
+        # external command preferences
+        self._curl_cmd = shutil.which("curl") or shutil.which("http")
+        self._wget_cmd = shutil.which("wget")
+        self._aria2c_cmd = shutil.which("aria2c")
 
-        # ensure cache dir exists
-        try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        # attach small logger wrapper
+        self._log = self._make_logger()
+
+    def _make_logger(self):
+        # unify logging: prefer self.logger, fallback to module logger
+        def _fn(level: str, event: str, msg: str = "", **meta):
+            try:
+                if self.logger:
+                    fn = getattr(self.logger, level.lower(), None)
+                    if fn:
+                        fn(event, msg, **meta)
+                        return
+            except Exception:
+                pass
+            # fallback
+            getattr(_logger, level.lower(), _logger.info)(f"{event}: {msg} - {meta}")
+        return _fn
 
     def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
-            if self.cfg and hasattr(self.cfg, 'get'):
+            if self.cfg and hasattr(self.cfg, "get"):
                 v = self.cfg.get(key)
                 if v is not None:
                     return v
@@ -101,337 +167,342 @@ class NewpkgDownloader:
             pass
         return default
 
-    def _log(self, level: str, event: str, message: str = '', **meta):
-        if self.logger:
-            try:
-                fn = getattr(self.logger, level.lower(), None)
-                if fn:
-                    fn(event, message, **meta)
-                    return
-            except Exception:
-                pass
-        # fallback
-        print(f'[{level}] {event}: {message}', file=sys.stderr)
-
-    # ---------------- verification helpers ----------------
-    def _sha256(self, path: Path) -> str:
-        h = hashlib.sha256()
-        with path.open('rb') as fh:
-            for chunk in iter(lambda: fh.read(65536), b''):
-                h.update(chunk)
-        return h.hexdigest()
-
-    def verify(self, path: str, checksum: Optional[str] = None) -> bool:
-        p = Path(path)
-        if not p.exists():
-            return False
-        if not checksum:
-            return True
-        try:
-            got = self._sha256(p)
-            return got.lower() == checksum.lower()
-        except Exception:
-            return False
-
-    def verify_gpg(self, path: str, sig_path: str) -> bool:
-        # best-effort: use gpg --verify
-        try:
-            gpg = shutil.which('gpg') or shutil.which('gpg2')
-            if not gpg:
-                return False
-            proc = subprocess.run([gpg, '--verify', sig_path, path], capture_output=True)
-            return proc.returncode == 0
-        except Exception:
-            return False
-
-    # ---------------- extraction helper ----------------
-    def extract_archive(self, archive: str, dest: Optional[str] = None) -> bool:
-        p = Path(archive)
-        d = Path(dest) if dest else p.parent / (p.stem + '-extracted')
-        d.mkdir(parents=True, exist_ok=True)
-        try:
-            # try system tar for reliability
-            if any(str(p.name).endswith(s) for s in ('.tar.gz', '.tgz', '.tar.xz', '.tar.bz2', '.tar')):
-                cmd = ['tar', '-xf', str(p), '-C', str(d)]
-                proc = subprocess.run(cmd, capture_output=True)
-                return proc.returncode == 0
-            if p.suffix == '.zip':
-                import zipfile
-                with zipfile.ZipFile(p) as z:
-                    z.extractall(d)
-                return True
-            # fallback: try tarfile
-            import tarfile
-            with tarfile.open(p) as t:
-                t.extractall(d)
-            return True
-        except Exception as e:
-            self._log('error', 'download.extract_fail', f'Failed to extract {archive}: {e}', archive=str(archive))
-            return False
-
-    # ---------------- low level fetchers ----------------
-    def _wget_fallback(self, url: str, dest: Path, timeout: int) -> Dict[str, Any]:
-        # try aria2c, then wget, then curl
-        for prog in ('aria2c', 'wget', 'curl'):
-            exe = shutil.which(prog)
-            if not exe:
-                continue
-            try:
-                if prog == 'aria2c':
-                    cmd = [exe, '-x', '4', '-s', '4', '-o', str(dest), url]
-                elif prog == 'wget':
-                    cmd = [exe, '-O', str(dest), url]
-                else:  # curl
-                    cmd = [exe, '-L', '-o', str(dest), url]
-                proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
-                return {'rc': proc.returncode, 'out': proc.stdout.decode(errors='ignore'), 'err': proc.stderr.decode(errors='ignore')}
-            except Exception as e:
-                continue
-        return {'rc': 1, 'out': '', 'err': 'no-fallback'}
-
-    async def _aio_fetch(self, session: 'aiohttp.ClientSession', url: str, dest: Path, timeout: int, headers: Dict[str, str]) -> Dict[str, Any]:
-        start = time.time()
-        try:
-            async with session.get(url, timeout=timeout, headers=headers) as resp:
-                if resp.status >= 400:
-                    txt = await resp.text()
-                    return {'rc': resp.status, 'out': '', 'err': f'HTTP {resp.status}: {txt[:200]}'}
-                # stream to file
-                with dest.open('wb') as fh:
-                    async for chunk in resp.content.iter_chunked(65536):
-                        fh.write(chunk)
-            dur = time.time() - start
-            return {'rc': 0, 'out': str(dest), 'err': '', 'duration': dur}
-        except Exception as e:
-            dur = time.time() - start
-            return {'rc': 1, 'out': '', 'err': str(e), 'duration': dur}
-
-    def _sync_fetch_requests(self, url: str, dest: Path, timeout: int, headers: Dict[str, str]) -> Dict[str, Any]:
-        try:
-            if _HAS_REQUESTS:
-                r = requests.get(url, timeout=timeout, headers=headers, stream=True)
-                if r.status_code >= 400:
-                    return {'rc': r.status_code, 'out': '', 'err': f'HTTP {r.status_code}'}
-                with dest.open('wb') as fh:
-                    for chunk in r.iter_content(65536):
-                        fh.write(chunk)
-                return {'rc': 0, 'out': str(dest), 'err': ''}
-        except Exception:
-            pass
-        # fallback to external programs
-        return self._wget_fallback(url, dest, timeout)
-
-    # ---------------- public download API ----------------
-    async def download(self, url: str, dest: Optional[str] = None, checksum: Optional[str] = None, timeout: Optional[int] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-        """Asynchronously download a single URL to dest. Returns dict with rc/out/err/duration."""
-        timeout = int(timeout or self.timeout)
-        headers = headers or {'User-Agent': self.user_agent}
-        # dest resolution
-        destp = Path(dest) if dest else self.cache_dir / Path(url).name
-        destp.parent.mkdir(parents=True, exist_ok=True)
-
-        # if file exists and checksum matches, skip
-        if destp.exists() and checksum:
-            try:
-                if self.verify(str(destp), checksum):
-                    self._log('info', 'download.skip', f'Using cached {destp}', url=url, dest=str(destp))
-                    return {'rc': 0, 'out': str(destp), 'cached': True}
-            except Exception:
-                pass
-
-        # prefer aiohttp path when available
-        if _HAS_AIOHTTP:
-            try:
-                timeout_cfg = aiohttp.ClientTimeout(total=timeout)
-                async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
-                    res = await self._aio_fetch(session, url, destp, timeout, headers)
-            except Exception as e:
-                res = {'rc': 1, 'out': '', 'err': str(e)}
-        else:
-            # run sync fetch in thread exec to avoid blocking
-            loop = asyncio.get_event_loop()
-            res = await loop.run_in_executor(None, lambda: self._sync_fetch_requests(url, destp, timeout, headers))
-
-        # verify checksum if provided
-        if res.get('rc') == 0 and checksum:
-            try:
-                ok = self.verify(str(destp), checksum)
-                if not ok:
-                    self._log('warning', 'download.verify_fail', f'Checksum mismatch for {destp}', url=url)
-                    # attempt fallback redownload via wget/curl
-                    fb = self._wget_fallback(url, destp, timeout)
-                    res = fb
-            except Exception:
-                pass
-
-        # DB: record phase
-        try:
-            if self.db and hasattr(self.db, 'record_phase'):
-                pkg = os.environ.get('NEWPKG_CURRENT_PKG') or None
-                self.db.record_phase(pkg or Path(destp).stem, 'download', 'ok' if res.get('rc') == 0 else 'error', log_path=str(destp) if res.get('rc') == 0 else None)
-        except Exception:
-            pass
-
-        # logging
-        if res.get('rc') == 0:
-            self._log('info', 'download.ok', f'Downloaded {url} -> {destp}', url=url, dest=str(destp), duration=res.get('duration'))
-        else:
-            self._log('error', 'download.fail', f'Failed to download {url}: {res.get("err")}', url=url, dest=str(destp))
-        return res
-
-    async def download_many(self, tasks: Iterable[Dict[str, Any]], parallel: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Download multiple tasks in parallel. Task format: {url, dest, checksum, mirrors}
-        Returns list of results matching tasks order where each result contains rc/out/err.
+    def apply_profile(self, profile: Optional[str] = None) -> Dict[str, Any]:
         """
-        parallel = int(parallel or self.parallel or DEFAULT_PARALLEL)
-        tasks_list = list(tasks)
-        sem = asyncio.Semaphore(parallel)
-
-        async def _do_task(t):
-            async with sem:
-                url = t.get('url')
-                dest = t.get('dest') or str(self.cache_dir / Path(url).name)
-                checksum = t.get('checksum') or t.get('sha256')
-                headers = t.get('headers') or None
-                # try primary then mirrors
-                urls = [url] + (t.get('mirrors') or [])
-                last_res = None
-                for u in urls:
-                    res = await self.download(u, dest=dest, checksum=checksum, headers=headers)
-                    last_res = res
-                    if res.get('rc') == 0:
-                        break
-                return {'task': t, 'result': last_res}
-
-        coros = [_do_task(t) for t in tasks_list]
-        results = await asyncio.gather(*coros, return_exceptions=False)
-        return results
-
-    def download_sync(self, url: str, dest: Optional[str] = None, checksum: Optional[str] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
-        """Synchronous wrapper for download (runs the async download on event loop).
-        Falls back to running in new event loop if none running.
+        Return combined settings for a given downloads profile (merges with global).
         """
+        base = {
+            "mirrors": list(self.mirrors),
+            "timeout": self.timeout,
+            "verify_checksums": self.verify_checksums,
+            "gpg_verify": self.gpg_verify,
+        }
+        if profile:
+            pconf = self.profiles.get(profile) or {}
+            # merge arrays and keys
+            if "mirrors" in pconf:
+                base["mirrors"] = list(pconf.get("mirrors", [])) + base["mirrors"]
+            for k, v in pconf.items():
+                if k != "mirrors":
+                    base[k] = v
+        return base
+
+    # ----------------- download APIs -----------------
+    def download_sync(self, url: str, dest: Optional[Union[str, Path]] = None,
+                      sha256: Optional[str] = None, profile: Optional[str] = None) -> DownloadResult:
+        """
+        Synchronous download wrapper. Respects dry-run. Tries async path if aiohttp available.
+        Returns DownloadResult.
+        """
+        if self.dry_run:
+            self._log("info", "download.dryrun", f"Would download {url} -> {dest}", url=url, dest=str(dest))
+            return DownloadResult(url=url, dest=str(dest or ""), ok=True, sha256=None, dry_run=True)
+
+        # if aiohttp is available and we are not inside an active event loop, run async
         try:
             loop = asyncio.get_running_loop()
-            # if running loop, run in executor
-            return asyncio.run(self.download(url, dest=dest, checksum=checksum, timeout=timeout))
+            in_running = True
         except RuntimeError:
-            return asyncio.run(self.download(url, dest=dest, checksum=checksum, timeout=timeout))
+            in_running = False
 
-    def batch_download(self, pkg_name: str, sources: List[Dict[str, Any]], parallel: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Convenience to download multiple sources (synchronous). Returns list of result dicts.
-        Each source dict: {url, filename?, checksum, mirrors?}
-        """
-        tasks = []
-        workdir = Path(self.cache_dir) / pkg_name
-        workdir.mkdir(parents=True, exist_ok=True)
-        for s in sources:
-            url = s.get('url')
-            fname = s.get('filename') or Path(url).name
-            dest = str(workdir / fname)
-            tasks.append({'url': url, 'dest': dest, 'checksum': s.get('sha256') or s.get('sha256sum'), 'mirrors': s.get('mirrors')})
-        # run async batch
-        res = asyncio.run(self.download_many(tasks, parallel=parallel))
-        # normalize
-        out = []
-        for r in res:
-            task = r.get('task')
-            result = r.get('result')
-            out.append({'url': task.get('url'), 'dest': task.get('dest'), 'rc': result.get('rc'), 'err': result.get('err'), 'out': result.get('out')})
-        return out
+        if _HAS_AIOHTTP and not in_running:
+            return asyncio.run(self.download_async(url, dest=dest, sha256=sha256, profile=profile))
 
-    # ---------------- VCS / rsync helpers ----------------
-    def clone_git(self, repo: str, dest: str, branch: Optional[str] = None, shallow: bool = True) -> Dict[str, Any]:
-        """Clone a git repository (best-effort)."""
-        destp = Path(dest)
-        if destp.exists() and any(destp.iterdir()):
-            return {'rc': 0, 'out': str(destp), 'err': 'exists'}
-        cmd = ['git', 'clone']
-        if shallow:
-            cmd += ['--depth', '1']
-        if branch:
-            cmd += ['--branch', branch]
-        cmd += [repo, str(destp)]
-        try:
-            proc = subprocess.run(cmd, capture_output=True)
-            ok = proc.returncode == 0
-            return {'rc': proc.returncode, 'out': proc.stdout.decode(errors='ignore'), 'err': proc.stderr.decode(errors='ignore')}
-        except Exception as e:
-            return {'rc': 1, 'out': '', 'err': str(e)}
+        # fallback synchronous implementation using requests or curl/wget
+        dest = Path(dest) if dest else self.cache_dir / Path(url).name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, **(self.cfg.as_env() if self.cfg else {})}
 
-    def rsync(self, source: str, dest: str, opts: Optional[List[str]] = None) -> Dict[str, Any]:
-        r = shutil.which('rsync')
-        if not r:
-            return {'rc': 1, 'err': 'rsync not available'}
-        cmd = [r] + (opts or ['-a', '--delete']) + [source, dest]
-        try:
-            proc = subprocess.run(cmd, capture_output=True)
-            return {'rc': proc.returncode, 'out': proc.stdout.decode(errors='ignore'), 'err': proc.stderr.decode(errors='ignore')}
-        except Exception as e:
-            return {'rc': 1, 'out': '', 'err': str(e)}
-
-    # ---------------- cache maintenance ----------------
-    def clear_cache(self, older_than_days: Optional[int] = None) -> Dict[str, Any]:
-        older_than_days = older_than_days if older_than_days is not None else max(1, int(self.cache_ttl // 86400))
-        cutoff = datetime.utcnow() - timedelta(days=older_than_days)
-        removed = 0
-        size_removed = 0
-        for p in self.cache_dir.rglob('*'):
+        # try requests
+        if _HAS_REQUESTS:
             try:
-                if p.is_file():
-                    mtime = datetime.utcfromtimestamp(p.stat().st_mtime)
-                    if mtime < cutoff:
-                        size_removed += p.stat().st_size
+                with requests.get(url, stream=True, timeout=self.timeout) as r:
+                    r.raise_for_status()
+                    with open(dest, "wb") as fh:
+                        for chunk in r.iter_content(chunk_size=1 << 20):
+                            if not chunk:
+                                continue
+                            fh.write(chunk)
+                if sha256:
+                    got = _sha256_of_path(dest)
+                    if got != sha256:
+                        raise RuntimeError(f"checksum mismatch for {url}: expected {sha256} got {got}")
+                self._log("info", "download.ok", f"Downloaded {url} -> {dest}", url=url, dest=str(dest))
+                # register to db if available
+                if self.db and hasattr(self.db, "record_download"):
+                    try:
+                        self.db.record_download(url=str(url), dest=str(dest), checksum=sha256)
+                    except Exception:
+                        pass
+                return DownloadResult(url=url, dest=str(dest), ok=True, sha256=sha256, used_mirror=None)
+            except Exception as e:
+                self._log("warning", "download.requests_fail", f"requests download failed for {url}: {e}", error=str(e))
+
+        # try aria2c
+        if self._aria2c_cmd:
+            cmd = [self._aria2c_cmd, "-x", "4", "-s", "4", "-o", str(dest), url]
+            return self._spawn_cmd_download(cmd, url, dest, sha256, env)
+
+        # try curl
+        if self._curl_cmd:
+            cmd = [self._curl_cmd, "-L", "-o", str(dest), url]
+            return self._spawn_cmd_download(cmd, url, dest, sha256, env)
+
+        # try wget
+        if self._wget_cmd:
+            cmd = [self._wget_cmd, "-O", str(dest), url]
+            return self._spawn_cmd_download(cmd, url, dest, sha256, env)
+
+        raise RuntimeError("No download method available (aiohttp/requests/curl/wget/aria2c)")
+
+    async def download_async(self, url: str, dest: Optional[Union[str, Path]] = None,
+                             sha256: Optional[str] = None, profile: Optional[str] = None) -> DownloadResult:
+        """
+        Async download using aiohttp. Returns DownloadResult.
+        """
+        if self.dry_run:
+            self._log("info", "download.dryrun", f"Would download {url} -> {dest}", url=url, dest=str(dest))
+            return DownloadResult(url=url, dest=str(dest or ""), ok=True, dry_run=True)
+
+        dest = Path(dest) if dest else self.cache_dir / Path(url).name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, **(self.cfg.as_env() if self.cfg else {})}
+        profile_conf = self.apply_profile(profile)
+        timeout = int(profile_conf.get("timeout", self.timeout))
+
+        if not _HAS_AIOHTTP:
+            # fallback to sync
+            return self.download_sync(url, dest=dest, sha256=sha256, profile=profile)
+
+        try:
+            timeout_obj = aiohttp.ClientTimeout(total=timeout)
+            headers = {"User-Agent": f"newpkg-downloader/1.0"}
+            async with aiohttp.ClientSession(timeout=timeout_obj) as sess:
+                async with sess.get(url, headers=headers) as resp:
+                    resp.raise_for_status()
+                    with open(dest, "wb") as fh:
+                        async for chunk in resp.content.iter_chunked(1 << 20):
+                            fh.write(chunk)
+            if sha256:
+                got = _sha256_of_path(dest)
+                if got != sha256:
+                    raise RuntimeError(f"checksum mismatch for {url}: expected {sha256} got {got}")
+            self._log("info", "download.ok", f"Downloaded {url} -> {dest}", url=url, dest=str(dest))
+            if self.db and hasattr(self.db, "record_download"):
+                try:
+                    self.db.record_download(url=str(url), dest=str(dest), checksum=sha256)
+                except Exception:
+                    pass
+            return DownloadResult(url=url, dest=str(dest), ok=True, sha256=sha256, used_mirror=None)
+        except Exception as e:
+            self._log("error", "download.fail", f"Async download failed for {url}: {e}", error=str(e))
+            return DownloadResult(url=url, dest=str(dest), ok=False, sha256=sha256, error=str(e))
+
+    def _spawn_cmd_download(self, cmd: List[str], url: str, dest: Union[str, Path], sha256: Optional[str], env: Dict[str, str]) -> DownloadResult:
+        """
+        Run external downloader command and perform checksum verification.
+        """
+        try:
+            self._log("info", "download.cmd", f"Running {' '.join(cmd)}")
+            proc = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+            if proc.returncode != 0:
+                self._log("warning", "download.cmd_fail", f"cmd failed: {proc.stderr.strip()}")
+                return DownloadResult(url=url, dest=str(dest), ok=False, error=proc.stderr.strip())
+            if sha256:
+                got = _sha256_of_path(dest)
+                if got != sha256:
+                    raise RuntimeError(f"checksum mismatch for {url}: expected {sha256} got {got}")
+            self._log("info", "download.ok", f"Downloaded {url} -> {dest}")
+            if self.db and hasattr(self.db, "record_download"):
+                try:
+                    self.db.record_download(url=str(url), dest=str(dest), checksum=sha256)
+                except Exception:
+                    pass
+            return DownloadResult(url=url, dest=str(dest), ok=True, sha256=sha256)
+        except Exception as e:
+            return DownloadResult(url=url, dest=str(dest), ok=False, error=str(e))
+
+    # ----------------- archive helpers -----------------
+    def extract_archive(self, archive_path: Union[str, Path], dest: Union[str, Path], strip_components: int = 0) -> Tuple[bool, Optional[str]]:
+        """
+        Extract an archive (tar.*). Protects against path traversal.
+        strip_components not fully implemented for all tar flavors; covered minimally.
+        """
+        archive_path = Path(archive_path)
+        dest = Path(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        try:
+            # safe extract
+            _safe_extract_tar(archive_path, dest)
+            # simple strip-components emulation: move contents if top-level folder exists
+            if strip_components > 0:
+                # attempt to flatten a single top dir (best-effort)
+                entries = list(dest.iterdir())
+                if len(entries) == 1 and entries[0].is_dir():
+                    top = entries[0]
+                    for item in top.iterdir():
+                        shutil.move(str(item), str(dest))
+                    shutil.rmtree(str(top))
+            self._log("info", "extract.ok", f"Extracted {archive_path} -> {dest}")
+            return True, None
+        except Exception as e:
+            self._log("error", "extract.fail", f"Extraction failed for {archive_path}: {e}", error=str(e))
+            return False, str(e)
+
+    # ----------------- git helpers -----------------
+    def clone_git(self, repo: str, dest: Union[str, Path], branch: Optional[str] = None,
+                  tag: Optional[str] = None, commit: Optional[str] = None, depth: Optional[int] = 1,
+                  submodules: bool = False, profile: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        """
+        Clone a git repository into dest. Respects cfg.as_env() environment and profiles.
+        Returns (ok, error).
+        """
+        dest = Path(dest)
+        if self.dry_run:
+            self._log("info", "git.dryrun", f"Would clone {repo} -> {dest}")
+            return True, None
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, **(self.cfg.as_env() if self.cfg else {})}
+        profile_conf = self.apply_profile(profile)
+        git_cmd = shutil.which("git") or "git"
+
+        cmd = [git_cmd, "clone"]
+        if depth:
+            cmd += ["--depth", str(depth)]
+        if branch:
+            cmd += ["--branch", branch]
+        if tag and not branch:
+            # tags can be treated as checkout after clone
+            pass
+        cmd += [repo, str(dest)]
+        try:
+            proc = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+            if proc.returncode != 0:
+                self._log("error", "git.clone_fail", f"git clone failed: {proc.stderr.strip()}")
+                return False, proc.stderr.strip()
+            # optionally checkout commit or tag
+            if commit or tag:
+                try:
+                    ref = commit or tag
+                    proc2 = subprocess.run([git_cmd, "checkout", ref], cwd=str(dest), env=env, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    if proc2.returncode != 0:
+                        self._log("warning", "git.checkout_fail", f"checkout {ref} failed: {proc2.stderr.strip()}")
+                except Exception:
+                    pass
+            if submodules:
+                subprocess.run([git_cmd, "submodule", "update", "--init", "--recursive"], cwd=str(dest), env=env)
+            self._log("info", "git.clone.ok", f"Cloned {repo} -> {dest}")
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    # ----------------- cache -----------------
+    def clear_cache(self, older_than_seconds: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Clear cached files in cache_dir optionally older than given seconds.
+        """
+        removed = []
+        now = None
+        if older_than_seconds:
+            now = int(os.path.getmtime(self.cache_dir))
+        for p in self.cache_dir.iterdir():
+            try:
+                if older_than_seconds:
+                    mtime = int(p.stat().st_mtime)
+                    if (int(now) - mtime) > older_than_seconds:
+                        if p.is_file():
+                            p.unlink()
+                            removed.append(str(p))
+                        else:
+                            shutil.rmtree(p)
+                            removed.append(str(p))
+                else:
+                    if p.is_file():
                         p.unlink()
-                        removed += 1
+                        removed.append(str(p))
+                    else:
+                        shutil.rmtree(p)
+                        removed.append(str(p))
             except Exception:
                 continue
-        self._log('info', 'download.cache_clean', f'Removed {removed} files totalling {size_removed} bytes', removed=removed, size=size_removed)
-        return {'removed': removed, 'size': size_removed}
+        self._log("info", "cache.clear", f"Cleared {len(removed)} items from cache")
+        return {"removed": removed}
 
+    # ----------------- helpers -----------------
+    def _resolve_mirrors(self, url: str, profile_conf: Dict[str, Any]) -> List[str]:
+        """
+        Given a base URL, try to produce mirror candidates using profile.conf mirrors.
+        """
+        mirrors = profile_conf.get("mirrors", []) or []
+        out = [url]
+        for m in mirrors:
+            # simple join: replace host with mirror host if path structure identical
+            try:
+                p = Path(url)
+                # naive: mirror + path name
+                out.append(str(Path(m) / p.name))
+            except Exception:
+                continue
+        return out
 
-# small CLI for testing
-if __name__ == '__main__':
+    # ----------------- convenience CLI-ish runner -----------------
+    def download_many(self, urls: Iterable[Union[str, Tuple[str, Optional[str]]]], destdir: Union[str, Path],
+                      profile: Optional[str] = None) -> List[DownloadResult]:
+        """
+        Download multiple urls. urls can be list of strings or (url, sha256) tuples.
+        """
+        destdir = Path(destdir)
+        destdir.mkdir(parents=True, exist_ok=True)
+        profile_conf = self.apply_profile(profile)
+        results: List[DownloadResult] = []
+
+        # run sequentially for simplicity; parallelism could be added
+        for item in urls:
+            if isinstance(item, (list, tuple)):
+                url, sha = item[0], item[1]
+            else:
+                url, sha = item, None
+            # try mirrors sequence
+            tried = False
+            for candidate in self._resolve_mirrors(url, profile_conf):
+                tried = True
+                res = self.download_sync(candidate, dest=destdir / Path(candidate).name, sha256=sha, profile=profile)
+                if res.ok:
+                    res.used_mirror = candidate if candidate != url else None
+                    results.append(res)
+                    break
+                else:
+                    results.append(res)
+            if not tried:
+                results.append(DownloadResult(url=url, dest=str(destdir), ok=False, error="no-mirrors"))
+        return results
+
+# ----------------- convenience top-level functions -----------------
+_default_downloader: Optional[NewpkgDownloader] = None
+
+def get_downloader(cfg: Any = None, logger: Any = None, db: Any = None) -> NewpkgDownloader:
+    global _default_downloader
+    if _default_downloader is None:
+        _default_downloader = NewpkgDownloader(cfg=cfg, logger=logger, db=db)
+    return _default_downloader
+
+# CLI/demo when run directly
+if __name__ == "__main__":
     import argparse
-    p = argparse.ArgumentParser(prog='newpkg-download')
-    p.add_argument('cmd', choices=['fetch', 'batch', 'clearcache', 'clone', 'rsync'])
-    p.add_argument('target', nargs='?', help='URL, pkg name or repo')
-    p.add_argument('--dest', help='destination path')
-    p.add_argument('--checksum', help='expected sha256')
-    p.add_argument('--parallel', type=int, help='parallel downloads')
+    p = argparse.ArgumentParser(prog="newpkg-download", description="Downloader for newpkg (demo)")
+    p.add_argument("url", nargs="?", help="URL to download")
+    p.add_argument("--dest", help="destination path")
+    p.add_argument("--profile", help="download profile")
+    p.add_argument("--clear-cache", action="store_true")
     args = p.parse_args()
 
-    cfg = None
-    if init_config:
-        try:
-            cfg = init_config()
-        except Exception:
-            cfg = None
-    db = NewpkgDB(cfg) if NewpkgDB and cfg is not None else None
-    logger = NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None
-    dl = NewpkgDownloader(cfg=cfg, logger=logger, db=db)
-
-    if args.cmd == 'fetch' and args.target:
-        res = dl.download_sync(args.target, dest=args.dest, checksum=args.checksum)
-        print(json.dumps(res, indent=2, ensure_ascii=False))
-    elif args.cmd == 'batch' and args.target:
-        # expect JSON file describing sources
-        srcf = Path(args.target)
-        if srcf.exists():
-            sources = json.loads(srcf.read_text(encoding='utf-8'))
-        else:
-            print('source file not found')
-            sys.exit(2)
-        out = dl.batch_download(srcf.stem, sources, parallel=args.parallel)
-        print(json.dumps(out, indent=2, ensure_ascii=False))
-    elif args.cmd == 'clearcache':
-        out = dl.clear_cache()
-        print(json.dumps(out, indent=2))
-    elif args.cmd == 'clone' and args.target:
-        out = dl.clone_git(args.target, args.dest or ('./' + Path(args.target).stem))
-        print(json.dumps(out, indent=2))
-    elif args.cmd == 'rsync' and args.target:
-        out = dl.rsync(args.target, args.dest or './')
-        print(json.dumps(out, indent=2))
+    cfg = init_config() if init_config else None
+    dl = NewpkgDownloader(cfg=cfg)
+    if args.clear_cache:
+        print(dl.clear_cache())
+    elif args.url:
+        r = dl.download_sync(args.url, dest=args.dest)
+        print(json.dumps(r.__dict__, indent=2))
     else:
         p.print_help()
