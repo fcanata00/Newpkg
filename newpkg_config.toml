@@ -1,108 +1,379 @@
-[general]
-root_dir = "/"                     # Prefixo padrão de instalação (/ ou /mnt/lfs)
-build_root = "/var/tmp/newpkg"     # Diretório de builds temporários
-sandbox_backend = "bwrap"          # "bwrap", "proot", ou "none"
-jobs = 4                           # Paralelismo padrão
-use_sandbox = true
-auto_confirm = false
-strip_binaries = true              # Aplica strip automático
-default_profile = "system"         # Perfil de build default
-destdir = "/tmp/pkg-destdir"       # Diretório para staging DESTDIR
+# /etc/newpkg/newpkg_config.toml
 
+# System-wide configuration for Newpkg
+
+# - Saved under /etc/newpkg/ for system-global defaults
+
+# - Values may be overridden by user config (~/.config/newpkg/config.toml)
+
+# - Variables like ${HOME}, ${LFS_ROOT}, ${BUILD_ROOT} are supported by init_config() and
+
+# will be expanded at runtime (if your init_config implementation supports expansion)
+
+########################################################################
+
+# GENERAL
+
+########################################################################
+[general]
+
+# Root where packages are intended to be installed by default. For LFS builds
+
+# you may set this to "/mnt/lfs" when bootstrapping.
+
+root_dir = "/"
+
+# Working directories for builds and temporary artifacts
+
+build_root = "/var/tmp/newpkg/builds"    # temporary work area for building packages
+work_root = "${BUILD_ROOT:-/var/tmp/newpkg/builds}"
+
+# Default number of parallel jobs (make -j, thread pools, etc.)
+
+jobs = 4
+
+# sandbox backend: "bwrap", "proot", "none" (none disables sandboxing)
+
+sandbox_backend = "bwrap"
+use_sandbox = true
+
+# When true, automatic prompts may be skipped according to auto_confirm
+
+auto_confirm = false
+
+# Apply strip on binaries by default before packaging
+
+strip_binaries = true
+
+# Default profile to use when not explicitly provided
+
+default_profile = "system"
+
+# Default DESTDIR for fakeroot installs (used for packaging and staging)
+
+destdir = "/var/tmp/newpkg/destdir"
+
+########################################################################
+
+# OUTPUT / LOGGING / UI
+
+########################################################################
 [output]
+
+# CLI/UI preferences
+
 color = true
 json = false
 quiet = false
-log_level = "info"
-log_file = "/var/log/newpkg.log"
 
+[logging]
+
+# logger backend: "rich" or "simple"
+
+backend = "rich"
+log_level = "info"                 # debug / info / warning / error
+log_file = "/var/log/newpkg/newpkg.log"
+
+# keep rotated logs (size MB)
+
+max_log_size_mb = 50
+max_log_backups = 5
+
+# If true, metrics (timings/cpu/mem) are captured where available
+
+metrics_enabled = true
+perf_timer = true
+
+########################################################################
+
+# DATABASE
+
+########################################################################
 [db]
+
+# path to persistent package DB (sqlite, json or custom backend depending on implementation)
+
 path = "/var/lib/newpkg/newpkg.db"
 auto_commit = true
 backup_before_update = true
 
+########################################################################
+
+# HOOKS
+
+########################################################################
 [hooks]
 enabled = true
+
+# directory where hook scripts (pre/post phases) are stored
+
 path = "/etc/newpkg/hooks"
 
-[downloads]
-cache_dir = "/var/cache/newpkg"
-verify_checksums = true
-gpg_verify = true
-parallel_downloads = 4
+# hook execution timeout in seconds
+
 timeout = 300
 
-# Repositórios principais de fontes e metafiles
+########################################################################
+
+# DOWNLOADS & METAFILES
+
+########################################################################
+[downloads]
+
+# general download options
+
+cache_dir = "/var/cache/newpkg"
+parallel_downloads = 6
+timeout = 300            # seconds
+verify_checksums = true
+gpg_verify = true
+
+# generic mirrors for source tarballs
+
 mirrors = [
-  "https://ftp.gnu.org/gnu",
-  "https://mirrors.kernel.org",
-  "https://sourceware.org/pub"
+"[https://ftp.gnu.org/gnu](https://ftp.gnu.org/gnu)",
+"[https://mirrors.kernel.org](https://mirrors.kernel.org)",
+"[https://sourceware.org/pub](https://sourceware.org/pub)"
 ]
 
-# Repositórios com os metafiles (.toml)
+# global set of metafile git repositories (simulated official repos)
+
 metafile_repos = [
-  "https://github.com/newpkg/newpkg-metafiles.git",
-  "https://gitlab.com/newpkg/blfs-metafiles.git"
+"[https://github.com/newpkg-org/metafiles-core.git](https://github.com/newpkg-org/metafiles-core.git)",
+"[https://github.com/newpkg-org/metafiles-blfs.git](https://github.com/newpkg-org/metafiles-blfs.git)",
+"[https://github.com/newpkg-org/metafiles-desktop.git](https://github.com/newpkg-org/metafiles-desktop.git)",
+"[https://github.com/newpkg-org/metafiles-minimal.git](https://github.com/newpkg-org/metafiles-minimal.git)"
 ]
 
-# Caminhos locais onde os metafiles são sincronizados
+# Local directories where synced metafiles will be stored/checked first
+
 metafile_local_dirs = [
-  "/var/lib/newpkg/metafiles",
-  "/etc/newpkg/metafiles"
+"/var/lib/newpkg/metafiles",
+"/etc/newpkg/metafiles"
 ]
 
-# Ordem de busca — prioridade decrescente
+# How metafiles are looked up: order of precedence
+
+# - local: check metafile_local_dirs
+
+# - git: check metafile_repos (via newpkg_sync/newpkg_metafile)
+
+# - cache: check download cache
+
 metafile_search_order = ["local", "git", "cache"]
 
+# Optional: mapping of named profiles to specific metafile repositories
+
+# These are the profile repositories you requested (simulated 'official' URLs)
+
+[downloads.profiles]
+
+# Core system packages and essential toolchain
+
+core = { metafile_repos = ["[https://github.com/newpkg-org/metafiles-core.git](https://github.com/newpkg-org/metafiles-core.git)"] }
+
+# BLFS (Beyond Linux From Scratch) metafiles
+
+blfs = { metafile_repos = ["[https://github.com/newpkg-org/metafiles-blfs.git](https://github.com/newpkg-org/metafiles-blfs.git)"] }
+
+# Desktop environments, Xorg, KDE, GNOME
+
+desktop = { metafile_repos = ["[https://github.com/newpkg-org/metafiles-desktop.git](https://github.com/newpkg-org/metafiles-desktop.git)"] }
+
+# Minimal / tiny set useful for bootstrap environments
+
+minimal = { metafile_repos = ["[https://github.com/newpkg-org/metafiles-minimal.git](https://github.com/newpkg-org/metafiles-minimal.git)"] }
+
+########################################################################
+
+# PATCHES
+
+########################################################################
 [patches]
+
+# directories to search for patch files (applied by newpkg_patcher)
+
 search_dirs = ["/etc/newpkg/patches", "./patches"]
 auto_apply = true
 
-[packages]
-manifest_dir = "/var/lib/newpkg/manifests"
-package_output_dir = "/var/cache/newpkg/packages"
+########################################################################
 
+# SANDBOX
+
+########################################################################
 [sandbox]
+
+# enable sandboxing by default (Bubblwrap recommended)
+
 enabled = true
 backend = "bwrap"
-default_bind_ro = ["/etc", "/usr", "/lib", "/bin"]
+
+# default read-only binds (host -> sandbox)
+
+default_bind_ro = ["/usr", "/lib", "/bin", "/etc"]
+
+# default writable binds
+
 default_bind_rw = ["/tmp", "/var/tmp"]
+
+# allow network access inside sandbox (true/false)
+
 network = false
+
+# allow fakeroot inside sandbox for installs
+
 fakeroot = true
 
+########################################################################
+
+# AUDIT (vulnerabilities / system checks)
+
+########################################################################
 [audit]
 enabled = true
 vuln_db_path = "/var/lib/newpkg/vuln_db.json"
-auto_update = true
-auto_fix = false
+auto_update_db = true
+auto_fix = false         # if true, attempt to auto-apply fixes (dangerous)
 parallel = true
 trust_level = "official"
 min_severity = 5.0
+backup_dir = "/var/tmp/newpkg_audit_backups"
 
+########################################################################
+
+# UPGRADE
+
+########################################################################
 [upgrade]
-backup_dir = "/var/tmp/newpkg_backups"
+backup_dir = "/var/tmp/newpkg_upgrades"
 verify_after = true
 auto_rebuild_deps = true
 parallel = true
 confirm = false
+allow_force = false
 
-[logging]
-backend = "rich"
-color_theme = "soft"
-max_log_size = 20
-max_backups = 5
-metrics = true
-perf_timer = true
+########################################################################
 
+# SYNC (git repositories)
+
+########################################################################
 [sync]
 repos_dir = "/var/lib/newpkg/repos"
 default_branch = "main"
 parallel = true
-git_timeout = 300
+retries = 2
+retry_delay = 3
+verify_gpg = true
+json_output = false
 
-[env]
+########################################################################
+
+# PACKAGE / OUTPUT
+
+########################################################################
+[packages]
+manifest_dir = "/var/lib/newpkg/manifests"
+package_output_dir = "/var/cache/newpkg/packages"
+package_format = "tar.xz"   # default packaging format
+
+########################################################################
+
+# PROFILES (ENV & FLAGS per-profile)
+
+# Each profile may override env, downloads, build flags, sandbox settings, etc.
+
+########################################################################
+[profiles]
+
+# default system profile — used for regular system builds
+
+[profiles.system]
+name = "system"
+CFLAGS = "-O2 -pipe -march=native"
+CXXFLAGS = "-O2 -pipe"
+MAKEFLAGS = "-j${jobs}"
+use_sandbox = true
+strip_binaries = true
+metafile_repos = ["[https://github.com/newpkg-org/metafiles-core.git](https://github.com/newpkg-org/metafiles-core.git)"]
+
+# blfs profile: for building BLFS packages (X, desktop stacks, extras)
+
+[profiles.blfs]
+name = "blfs"
 CFLAGS = "-O2 -pipe"
 CXXFLAGS = "-O2 -pipe"
-MAKEFLAGS = "-j4"
-LANG = "C.UTF-8"
+MAKEFLAGS = "-j${jobs}"
+use_sandbox = true
+strip_binaries = false
+metafile_repos = ["[https://github.com/newpkg-org/metafiles-blfs.git](https://github.com/newpkg-org/metafiles-blfs.git)"]
+
+# desktop profile: for KDE/Gnome/Xorg and related packages
+
+[profiles.desktop]
+name = "desktop"
+CFLAGS = "-O2 -pipe"
+CXXFLAGS = "-O2 -pipe"
+MAKEFLAGS = "-j${jobs}"
+use_sandbox = true
+strip_binaries = false
+metafile_repos = ["[https://github.com/newpkg-org/metafiles-desktop.git](https://github.com/newpkg-org/metafiles-desktop.git)"]
+
+# minimal profile: for bootstrap / small systems
+
+[profiles.minimal]
+name = "minimal"
+CFLAGS = "-O2 -pipe -static"  # example
+MAKEFLAGS = "-j1"
+use_sandbox = false
+strip_binaries = true
+metafile_repos = ["[https://github.com/newpkg-org/metafiles-minimal.git](https://github.com/newpkg-org/metafiles-minimal.git)"]
+
+########################################################################
+
+# ENVIRONMENT defaults (expanded into build environments)
+
+########################################################################
+[env]
+
+# example: respects ${HOME} expansion when used by init_config
+
+HOME = "${HOME}"
+LFS_ROOT = "/mnt/lfs"
+BUILD_ROOT = "${work_root}"
 PATH = "/usr/local/bin:/usr/bin:/bin"
+LANG = "C.UTF-8"
+
+########################################################################
+
+# ADVANCED / TUNING
+
+########################################################################
+[advanced]
+
+# timeout for external commands (seconds)
+
+cmd_timeout = 1200
+
+# strategy for packaging: incremental | full
+
+package_strategy = "full"
+
+# limit disk usage for caches (MB) — not enforced automatically unless supported
+
+cache_size_mb = 10240
+
+########################################################################
+
+# NOTES
+
+# - Edit /etc/newpkg/newpkg_config.toml to customize system behavior.
+
+# - Users may create ~/.config/newpkg/config.toml to override these settings.
+
+# - Metafile repositories listed above are placeholders simulating an official
+
+# organization: [https://github.com/newpkg-org/](https://github.com/newpkg-org/)...
+
+# - Be careful when enabling auto_fix or auto_deploy — these can change system files.
+
+########################################################################
