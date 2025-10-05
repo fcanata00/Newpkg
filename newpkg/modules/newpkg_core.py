@@ -1,40 +1,101 @@
+#!/usr/bin/env python3
+# newpkg_core.py
 """
 newpkg_core.py
 
-Core orchestration for newpkg builds: prepares sandboxed build environments,
-resolves deps, runs builds, installs via fakeroot into DESTDIR, packages artifacts
-(tar.xz / tar.gz / tar.zst placeholder), deploys to target (/, /mnt/lfs) with rollback,
-records metadata in NewpkgDB and emits structured logs via NewpkgLogger.
+Core build pipeline for Newpkg.
 
-This implementation is opinionated but modular: it relies on provided helper
-objects `cfg`, `db`, `logger`, `sandbox`, `deps` implementing the APIs
-described in the other modules created earlier.
-
-Notes:
-- It uses `sandbox.run()` to execute commands inside a bwrap environment.
-- It attempts to use `fakeroot` when available. If not present, it will run
-  install steps without fakeroot and log a warning.
-- Packaging supports 'tar.xz', 'tar.gz', and 'tar.bz2' via shutil.make_archive.
-  Zstd (tar.zst) is only supported if additional tooling is present (placeholder).
-
-This file is intended as a high-level orchestrator. Lower-level build logic
-(specific configure flags, complex packaging formats) should be implemented
-in package-specific modules and invoked through hooks.
+Features:
+ - Integrates with newpkg_config, newpkg_logger, newpkg_db, newpkg_hooks, newpkg_sandbox, newpkg_deps, newpkg_download, newpkg_patcher, newpkg_metafile
+ - Full pipeline methods:
+     prepare() -> build() -> install() -> strip_binaries() -> package() -> deploy()
+ - Supports fakeroot install in DESTDIR, option to install to / or /mnt/lfs
+ - Records phases to DB (record_phase) when available
+ - Logs progress via NewpkgLogger when available, fallback to stderr prints
+ - Safe sandboxed execution using Sandbox.run() when available
+ - Resource/time metrics collected (best-effort)
+ - Options for stripping binaries and controlling which files to strip
 """
+
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import subprocess
+import sys
 import tarfile
 import tempfile
-import subprocess
-import hashlib
-import json
-import stat
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime
-from contextlib import contextmanager
+
+# Try to import optional project modules
+try:
+    from newpkg_config import init_config
+except Exception:
+    init_config = None
+
+try:
+    from newpkg_logger import NewpkgLogger
+except Exception:
+    NewpkgLogger = None
+
+try:
+    from newpkg_db import NewpkgDB
+except Exception:
+    NewpkgDB = None
+
+try:
+    from newpkg_hooks import HooksManager
+except Exception:
+    HooksManager = None
+
+try:
+    from newpkg_sandbox import Sandbox
+except Exception:
+    Sandbox = None
+
+try:
+    from newpkg_deps import NewpkgDeps
+except Exception:
+    NewpkgDeps = None
+
+try:
+    from newpkg_download import NewpkgDownloader
+except Exception:
+    NewpkgDownloader = None
+
+try:
+    from newpkg_patcher import NewpkgPatcher
+except Exception:
+    NewpkgPatcher = None
+
+try:
+    from newpkg_metafile import Metafile
+except Exception:
+    Metafile = None
+
+# constants
+WORK_ROOT = Path(os.environ.get("NEWPKG_WORK_ROOT", "/var/tmp/newpkg_builds"))
+PACKAGE_OUTPUT = Path(os.environ.get("NEWPKG_PACKAGE_OUTPUT", "./packages"))
+ROLLBACK_DIR = Path(os.environ.get("NEWPKG_ROLLBACK_DIR", "/var/tmp/newpkg_rollbacks"))
+
+# ensure directories
+WORK_ROOT.mkdir(parents=True, exist_ok=True)
+PACKAGE_OUTPUT.mkdir(parents=True, exist_ok=True)
+ROLLBACK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass
+class BuildResult:
+    package: str
+    version: Optional[str] = None
+    status: str = "unknown"
+    phases: List[Dict[str, Any]] = field(default_factory=list)
+    metrics: Dict[str, Any] = field(default_factory=dict)
 
 
 class CoreError(Exception):
@@ -42,427 +103,568 @@ class CoreError(Exception):
 
 
 class NewpkgCore:
-    def __init__(self, cfg: Any, db: Any, logger: Any, sandbox: Any, deps: Any):
+    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, sandbox: Any = None):
         self.cfg = cfg
-        self.db = db
-        self.logger = logger
-        self.sandbox = sandbox
-        self.deps = deps
+        self.logger = logger or (NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None)
+        self.db = db or (NewpkgDB(cfg) if NewpkgDB and cfg is not None else None)
+        self.hooks = HooksManager(cfg, self.logger, self.db) if HooksManager and cfg is not None else None
+        self.sandbox = sandbox or (Sandbox(cfg, self.logger, self.db) if Sandbox and cfg is not None else None)
+        self.deps = NewpkgDeps(cfg, self.logger, self.db) if NewpkgDeps and cfg is not None else None
+        self.downloader = NewpkgDownloader(cfg, self.logger, self.db) if NewpkgDownloader and cfg is not None else None
+        self.patcher = NewpkgPatcher(cfg, self.logger, self.db) if NewpkgPatcher and cfg is not None else None
 
         # config defaults
-        self.build_root = Path(self.cfg.get("NEWPKG_BUILD_ROOT") if self.cfg else ("/var/tmp/newpkg"))
-        self.destdir_base = Path(self.cfg.get("NEWPKG_DESTDIR") if self.cfg else (self.build_root / "dest"))
-        self.package_root = Path(self.cfg.get("NEWPKG_PACKAGE_ROOT") if self.cfg else (self.build_root / "packages"))
-        self.compress_format = (self.cfg.get("NEWPKG_COMPRESS_FORMAT") if self.cfg else "tar.xz")
-        self.profiles = {}
+        self.work_root = Path(self._cfg_get("core.work_root", str(WORK_ROOT)))
+        self.package_output = Path(self._cfg_get("core.package_output", str(PACKAGE_OUTPUT)))
+        self.rollback_dir = Path(self._cfg_get("core.rollback_dir", str(ROLLBACK_DIR)))
+        self.use_sandbox = bool(self._cfg_get("core.use_sandbox", True))
+        self.fakeroot_cmd = self._cfg_get("core.fakeroot_cmd", "fakeroot")
+        # strip options
+        self.strip_binaries_enabled = bool(self._cfg_get("core.strip_binaries", True))
+        self.strip_paths = self._cfg_get("core.strip_paths", ["/usr/bin", "/usr/lib"])  # relative inside destdir
+        self.strip_exclude = self._cfg_get("core.strip_exclude", [])  # list of globs to skip
+        # build defaults
+        self.jobs = int(self._cfg_get("core.jobs", os.environ.get("MAKEFLAGS_JOBS", "1")))
+        self.work_root.mkdir(parents=True, exist_ok=True)
+        self.package_output.mkdir(parents=True, exist_ok=True)
+        self.rollback_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---------------- helpers ----------------
+    def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
-            self.profiles = self.cfg.get("profiles") or {}
-        except Exception:
-            self.profiles = {}
-
-        # ensure directories
-        for d in (self.build_root, self.destdir_base, self.package_root):
-            try:
-                Path(d).mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
-
-    # ---------------- utilities ----------------
-    def _log(self, event: str, level: str = "INFO", message: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
-        if self.logger:
-            self.logger.log_event(event, level=level, message=message or event, metadata=metadata or {})
-
-    def _now(self) -> str:
-        return datetime.utcnow().isoformat() + "Z"
-
-    def _pkg_build_dir(self, pkg_name: str, version: Optional[str] = None) -> Path:
-        if version:
-            name = f"{pkg_name}-{version}"
-        else:
-            name = pkg_name
-        return self.build_root / name
-
-    def _pkg_destdir(self, pkg_name: str, version: Optional[str] = None) -> Path:
-        return self.destdir_base / (f"{pkg_name}-{version}" if version else pkg_name)
-
-    def _pkg_package_dir(self, pkg_name: str, version: Optional[str] = None) -> Path:
-        return self.package_root / (f"{pkg_name}-{version}" if version else pkg_name)
-
-    def _safe_run_in_sandbox(self, cmd: List[str], cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None, timeout: Optional[int] = None) -> Tuple[int, str, str]:
-        # wrapper to call sandbox.run and normalize output
-        if not self.sandbox:
-            raise CoreError("Sandbox not configured for core operations")
-        res = self.sandbox.run(cmd, cwd=cwd, env=env, timeout=timeout)
-        return res.returncode, res.stdout, res.stderr
-
-    def _use_fakeroot(self) -> bool:
-        return shutil.which("fakeroot") is not None
-
-    def _fakeroot_wrap(self, inner_cmd: str) -> List[str]:
-        # returns a command list that runs inner_cmd under fakeroot
-        if self._use_fakeroot():
-            return ["fakeroot", "--", "/bin/sh", "-lc", inner_cmd]
-        # fallback: run with /bin/sh -c (no fakeroot)
-        self._log("core.fakeroot_missing", level="WARNING", message="fakeroot not found, install step will run without fakeroot")
-        return ["/bin/sh", "-lc", inner_cmd]
-
-    # ---------------- prepare ----------------
-    def prepare(self, pkg_name: str, version: Optional[str] = None, profile: str = "default", src_dir: Optional[Path] = None) -> Path:
-        """Prepare build workspace and copy sources into sandboxable build dir.
-
-        Returns the build_dir Path.
-        """
-        build_dir = self._pkg_build_dir(pkg_name, version)
-        destdir = self._pkg_destdir(pkg_name, version)
-        pkg_dir = self._pkg_package_dir(pkg_name, version)
-
-        # create dirs
-        for d in (build_dir, destdir, pkg_dir):
-            Path(d).mkdir(parents=True, exist_ok=True)
-
-        # copy sources if provided
-        if src_dir:
-            src_dir = Path(src_dir)
-            if not src_dir.exists():
-                raise CoreError(f"src_dir not found: {src_dir}")
-            # copy tree to build_dir/sources
-            target_src = build_dir / 'sources'
-            if target_src.exists():
-                shutil.rmtree(target_src)
-            shutil.copytree(src_dir, target_src)
-
-        # create build script placeholder if not exists
-        build_sh = build_dir / 'build.sh'
-        if not build_sh.exists():
-            build_sh.write_text("#!/bin/sh\necho 'No build script provided'\n", encoding='utf-8')
-            build_sh.chmod(build_sh.stat().st_mode | stat.S_IXUSR)
-
-        # log
-        self._log("build_prepare", level="INFO", message=f"Prepared build for {pkg_name}", metadata={"pkg": pkg_name, "build_dir": str(build_dir)})
-        return build_dir
-
-    # ---------------- hooks ----------------
-    def _run_hook(self, hook_path: Path, build_dir: Path, destdir: Path, profile_vars: Optional[Dict[str, str]] = None) -> Tuple[int, str, str]:
-        if not hook_path.exists():
-            return 0, "", ""
-        # ensure executable
-        try:
-            hook_path.chmod(hook_path.stat().st_mode | stat.S_IXUSR)
+            if self.cfg and hasattr(self.cfg, "get"):
+                v = self.cfg.get(key)
+                if v is not None:
+                    return v
         except Exception:
             pass
-        cmd = ["/bin/sh", str(hook_path)]
-        env = os.environ.copy()
-        if profile_vars:
-            env.update({k: str(v) for k, v in profile_vars.items()})
-        return self._safe_run_in_sandbox(cmd, cwd=build_dir, env=env)
+        return os.environ.get(key.upper().replace(".", "_"), default)
 
-    # ---------------- build ----------------
-    def build(self, pkg_name: str, version: Optional[str] = None, profile: str = "default", src_dir: Optional[Path] = None, timeout: Optional[int] = None) -> None:
-        build_dir = self.prepare(pkg_name, version, profile, src_dir=src_dir)
-        destdir = self._pkg_destdir(pkg_name, version)
-
-        # resolve build deps
-        try:
-            build_deps = self.deps.resolve(pkg_name, dep_type='build')
-            if build_deps:
-                self._log('deps_resolve', level='INFO', message='Resolved build deps', metadata={'pkg': pkg_name, 'deps': build_deps})
-        except Exception:
-            build_deps = []
-
-        profile_vars = {}
-        if profile and self.profiles and profile in self.profiles:
-            profile_vars = self.profiles[profile]
-
-        # run pre_build hook
-        pre_hook = build_dir / 'hooks' / 'pre_build.sh'
-        rc, out, err = self._run_hook(pre_hook, build_dir, destdir, profile_vars=profile_vars)
-        if rc != 0:
-            self._log('hook.pre_build.fail', level='ERROR', message='pre_build hook failed', metadata={'pkg': pkg_name, 'rc': rc, 'stderr': err})
-            raise CoreError(f'pre_build hook failed for {pkg_name}: {err}')
-
-        # execute build.sh inside sandbox
-        build_sh = build_dir / 'build.sh'
-        if not build_sh.exists():
-            raise CoreError(f'No build.sh found for {pkg_name} in {build_dir}')
-
-        self._log('build_start', level='INFO', message=f'Starting build {pkg_name}', metadata={'pkg': pkg_name, 'build_dir': str(build_dir)})
-        rc, out, err = self._safe_run_in_sandbox(['/bin/sh', str(build_sh)], cwd=build_dir, env=profile_vars, timeout=timeout)
-        if rc != 0:
-            self._log('build_fail', level='ERROR', message=f'Build failed for {pkg_name}', metadata={'pkg': pkg_name, 'rc': rc, 'stderr': err})
-            raise CoreError(f'Build failed for {pkg_name}: {err}')
-
-        self._log('build_end', level='INFO', message=f'Build finished for {pkg_name}', metadata={'pkg': pkg_name})
-
-    # ---------------- install ----------------
-    def install(self, pkg_name: str, version: Optional[str] = None, fakeroot: bool = True, make_install_cmd: Optional[str] = None, timeout: Optional[int] = None) -> None:
-        build_dir = self._pkg_build_dir(pkg_name, version)
-        destdir = self._pkg_destdir(pkg_name, version)
-        destdir.mkdir(parents=True, exist_ok=True)
-
-        # run pre_install hook
-        pre_hook = build_dir / 'hooks' / 'pre_install.sh'
-        rc, out, err = self._run_hook(pre_hook, build_dir, destdir)
-        if rc != 0:
-            raise CoreError(f'pre_install hook failed: {err}')
-
-        # determine install command
-        if make_install_cmd:
-            inner = make_install_cmd
-        else:
-            inner = f"make install DESTDIR={destdir}"
-
-        full_cmd = self._fakeroot_wrap(inner) if fakeroot else ["/bin/sh", "-lc", inner]
-
-        # run inside sandbox: we run fakeroot wrapper command under shell; sandbox.run accepts array
-        rc, out, err = self._safe_run_in_sandbox(full_cmd, cwd=build_dir, timeout=timeout)
-        if rc != 0:
-            self._log('install_fail', level='ERROR', message=f'Install failed for {pkg_name}', metadata={'pkg': pkg_name, 'stderr': err})
-            raise CoreError(f'Install failed for {pkg_name}: {err}')
-
-        # post_install hook
-        post_hook = build_dir / 'hooks' / 'post_install.sh'
-        rc2, out2, err2 = self._run_hook(post_hook, build_dir, destdir)
-        if rc2 != 0:
-            self._log('hook.post_install.fail', level='WARNING', message='post_install hook failed', metadata={'pkg': pkg_name, 'stderr': err2})
-
-        self._log('install_end', level='INFO', message=f'Installed {pkg_name} into destdir', metadata={'pkg': pkg_name, 'destdir': str(destdir)})
-
-    # ---------------- package ----------------
-    def package(self, pkg_name: str, version: Optional[str] = None, compress: Optional[str] = None) -> Path:
-        if compress is None:
-            compress = self.compress_format or 'tar.xz'
-        destdir = self._pkg_destdir(pkg_name, version)
-        pkgdir = self._pkg_package_dir(pkg_name, version)
-        pkgdir.mkdir(parents=True, exist_ok=True)
-
-        # generate files list and pkginfo
-        files_list = []
-        for p in sorted(destdir.rglob('*')):
-            if p.is_file():
-                rel = p.relative_to(destdir)
-                files_list.append(str(rel))
-        (pkgdir / 'files.list').write_text('\n'.join(files_list), encoding='utf-8')
-
-        pkginfo = {'name': pkg_name, 'version': version, 'build_time': self._now(), 'profile': None}
-        (pkgdir / 'pkginfo.json').write_text(json.dumps(pkginfo, indent=2), encoding='utf-8')
-
-        # produce an archive of destdir
-        base_name = str(pkgdir / f"{pkg_name}-{version}" if version else pkgdir / pkg_name)
-        fmt = None
-        if compress in ('tar.xz', 'xztar'):
-            fmt = 'xztar'
-        elif compress in ('tar.gz', 'gztar'):
-            fmt = 'gztar'
-        elif compress in ('tar.bz2', 'bztar'):
-            fmt = 'bztar'
-        else:
-            # fallback to xz
-            fmt = 'xztar'
-
-        try:
-            archive_path = shutil.make_archive(base_name=base_name, format=fmt, root_dir=destdir)
-        except Exception as e:
-            raise CoreError(f'Failed to create package archive: {e}')
-
-        # compute hash
-        h = hashlib.sha256()
-        with open(archive_path, 'rb') as fh:
-            for chunk in iter(lambda: fh.read(65536), b''):
-                h.update(chunk)
-        digest = h.hexdigest()
-
-        # write pkginfo with hash
-        pkginfo['hash'] = f'sha256:{digest}'
-        (pkgdir / 'pkginfo.json').write_text(json.dumps(pkginfo, indent=2), encoding='utf-8')
-
-        self._log('package_created', level='INFO', message='Package created', metadata={'pkg': pkg_name, 'archive': archive_path, 'hash': digest})
-        return Path(archive_path)
-
-    # ---------------- deploy with rollback ----------------
-    def deploy(self, pkg_name: str, version: Optional[str] = None, archive: Optional[Path] = None, target: str = '/', rollback: bool = True) -> None:
-        # ensure archive
-        if archive is None:
-            pkgdir = self._pkg_package_dir(pkg_name, version)
-            archive_glob = list(pkgdir.glob(f"{pkg_name}-{version}*"))
-            if not archive_glob:
-                raise CoreError('No package archive found to deploy')
-            archive = archive_glob[0]
-
-        target_path = Path(target)
-        if not target_path.exists():
-            raise CoreError(f'Target path not found: {target}')
-
-        snapshot = None
-        if rollback:
-            # create a lightweight snapshot by copying tree to temp dir
-            snapshot = tempfile.mkdtemp(prefix='newpkg-snap-')
+    def _log(self, level: str, event: str, message: str = "", **meta):
+        if self.logger:
             try:
-                # careful: copying entire / can be huge; user must ensure target is appropriate (/ or /mnt/lfs)
-                shutil.copytree(target_path, snapshot, dirs_exist_ok=True)
-            except Exception as e:
-                # if snapshot fails, we continue but mark that rollback may not work
-                self._log('deploy_snapshot_fail', level='WARNING', message='Snapshot failed', metadata={'error': str(e)})
-                snapshot = None
+                fn = getattr(self.logger, level.lower(), None)
+                if fn:
+                    fn(event, message, **meta)
+                    return
+            except Exception:
+                pass
+        print(f"[{level}] {event}: {message}", file=sys.stderr)
 
-        # extract archive into target (use tar via system to preserve permissions) inside sandbox
-        # using sandbox.run to restrict scope
-        extract_cmd = ["/bin/sh", "-lc", f"tar -C {str(target_path)} -xf {str(archive)}"]
-        rc, out, err = self._safe_run_in_sandbox(extract_cmd, cwd=None)
-        if rc != 0:
-            self._log('deploy_fail', level='ERROR', message='Deploy failed', metadata={'pkg': pkg_name, 'err': err})
-            # attempt rollback
-            if snapshot:
-                try:
-                    # restore snapshot
-                    shutil.rmtree(target_path)
-                    shutil.copytree(snapshot, target_path)
-                    self._log('deploy_rollback', level='INFO', message='Rollback applied', metadata={'pkg': pkg_name})
-                except Exception as e:
-                    self._log('deploy_rollback_fail', level='ERROR', message='Rollback failed', metadata={'pkg': pkg_name, 'error': str(e)})
-            raise CoreError(f'Deploy failed: {err}')
-
-        self._log('deploy_success', level='INFO', message='Deploy finished', metadata={'pkg': pkg_name, 'target': target})
-
-        # cleanup snapshot
-        if snapshot:
+    def _record(self, pkg: str, phase: str, status: str, meta: Optional[Dict[str, Any]] = None):
+        if self.db and hasattr(self.db, "record_phase"):
             try:
-                shutil.rmtree(snapshot)
+                self.db.record_phase(pkg, phase, status, meta or {})
             except Exception:
                 pass
 
-    # ---------------- record ----------------
-    def record(self, pkg_name: str, version: Optional[str] = None) -> None:
-        destdir = self._pkg_destdir(pkg_name, version)
-        if not destdir.exists():
-            raise CoreError('Destdir missing for record')
-
-        # register package
+    def _run(self, cmd: List[str], cwd: Optional[str] = None, env: Optional[Dict[str, str]] = None, timeout: Optional[int] = None, use_sandbox: Optional[bool] = None) -> Tuple[int, str, str]:
+        """
+        Run a command in sandbox if available and configured. Returns (rc, stdout, stderr).
+        """
+        use_sandbox = self.use_sandbox if use_sandbox is None else bool(use_sandbox)
+        if use_sandbox and self.sandbox:
+            try:
+                res = self.sandbox.run(cmd, cwd=cwd, env=env, timeout=timeout)
+                return int(res.rc), res.out or "", res.err or ""
+            except Exception as e:
+                # fallback to local
+                self._log("warning", "core.run.sandbox_fail", f"sandbox.run failed, falling back: {e}", cmd=cmd)
+        # fallback local subprocess
         try:
-            pkg_id = self.db.add_package(pkg_name, version, 1, origin='newpkg', status='built', build_dir=str(self._pkg_build_dir(pkg_name, version)), install_dir=str(destdir))
-        except Exception:
-            pkg_id = None
+            proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+            return proc.returncode, proc.stdout or "", proc.stderr or ""
+        except subprocess.TimeoutExpired as e:
+            return 124, "", f"timeout: {e}"
+        except Exception as e:
+            return 1, "", str(e)
 
-        # walk files and register
-        for p in sorted(destdir.rglob('*')):
-            if p.is_file():
+    # ---------------- prepare ----------------
+    def prepare(self, package_name: str, metafile_path: Optional[str] = None, profile: Optional[str] = None, workdir: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Prepare working directories, fetch sources (via Metafile or downloader), apply patches.
+        Returns dict with keys: workdir, srcdir, builddir, destdir
+        """
+        start = time.time()
+        wd = Path(workdir) if workdir else (self.work_root / f"{package_name}-{int(time.time())}")
+        srcdir = wd / "sources"
+        builddir = wd / "build"
+        destdir = wd / "destdir"
+        wd.mkdir(parents=True, exist_ok=True)
+        srcdir.mkdir(parents=True, exist_ok=True)
+        builddir.mkdir(parents=True, exist_ok=True)
+        destdir.mkdir(parents=True, exist_ok=True)
+
+        self._log("info", "core.prepare.start", f"Preparing build for {package_name}", package=package_name, workdir=str(wd))
+        self._record(package_name, "prepare", "start", {"workdir": str(wd)})
+
+        # load metafile if provided
+        metafile = None
+        sources_res = []
+        if metafile_path and Metafile:
+            try:
+                mf = Metafile(cfg=self.cfg, logger=self.logger, db=self.db)
+                mf.load(metafile_path)
+                metafile = mf
+                # expand env from profile if present
+                if profile:
+                    mf.expand_env({"PROFILE": profile})
+                # resolve sources into srcdir
                 try:
-                    st = p.stat()
-                    size = st.st_size
-                    h = hashlib.sha256()
-                    with p.open('rb') as fh:
-                        for chunk in iter(lambda: fh.read(65536), b''):
-                            h.update(chunk)
-                    digest = h.hexdigest()
-                    owner = None
-                    group = None
-                    try:
-                        owner = str(st.st_uid)
-                        group = str(st.st_gid)
-                    except Exception:
-                        pass
-                    if pkg_id:
-                        try:
-                            self.db.record_file(pkg_name, str(p), size=size, hash=digest, mode=st.st_mode, owner=owner, groupname=group)
-                        except Exception:
-                            pass
-                except Exception:
-                    continue
+                    sources_res = mf.resolve_sources(download_dir=str(srcdir))
+                except Exception as e:
+                    self._log("warning", "core.prepare.download_fail", f"Metafile resolve_sources failed: {e}", error=str(e))
+                    sources_res = []
+                # apply patches if any
+                try:
+                    if self.patcher:
+                        mf.apply_patches(workdir=str(builddir))
+                except Exception as e:
+                    self._log("warning", "core.prepare.patch_fail", f"Patcher failed: {e}", error=str(e))
+            except Exception as e:
+                self._log("warning", "core.prepare.metafile_fail", f"Failed to load metafile {metafile_path}: {e}", error=str(e))
+        else:
+            # no metafile: nothing to download
+            self._log("info", "core.prepare.nometa", f"No metafile provided for {package_name}")
 
-        self._log('record_done', level='INFO', message='Recorded package files in DB', metadata={'pkg': pkg_name})
+        duration = time.time() - start
+        self._record(package_name, "prepare", "ok", {"duration": duration})
+        self._log("info", "core.prepare.done", f"Prepared {package_name}", duration=duration, workdir=str(wd))
+        return {"workdir": str(wd), "srcdir": str(srcdir), "builddir": str(builddir), "destdir": str(destdir), "metafile": metafile, "sources": sources_res}
 
-    # ---------------- clean ----------------
-    def clean(self, pkg_name: str, version: Optional[str] = None, keep_logs: bool = True) -> None:
-        build_dir = self._pkg_build_dir(pkg_name, version)
-        pkgdir = self._pkg_package_dir(pkg_name, version)
-        if build_dir.exists():
-            shutil.rmtree(build_dir, ignore_errors=True)
-        if not keep_logs and pkgdir.exists():
-            shutil.rmtree(pkgdir, ignore_errors=True)
-        self._log('clean', level='INFO', message=f'Cleaned build artifacts for {pkg_name}', metadata={'pkg': pkg_name})
+    # ---------------- resolve deps ----------------
+    def resolve_build_deps(self, package_name: str, operate_on_metafile: Optional[Metafile] = None) -> Dict[str, Any]:
+        """
+        Resolve build and runtime dependencies as needed.
+        """
+        self._log("info", "core.deps.start", f"Resolving build deps for {package_name}", package=package_name)
+        self._record(package_name, "deps.resolve", "start")
+        deps_list = []
+        try:
+            if operate_on_metafile and hasattr(operate_on_metafile, "raw"):
+                # try to resolve using metafile or db
+                # metafile may contain explicit build deps under 'build-deps' or similar
+                raw = operate_on_metafile.raw
+                explicit = raw.get("build-deps") or raw.get("build_deps") or raw.get("build_deps", [])
+                if explicit:
+                    for d in explicit:
+                        deps_list.append(d if isinstance(d, str) else d.get("name"))
+                # fallback to deps module
+            if self.deps:
+                resolved = self.deps.resolve(package_name, dep_type='build', include_optional=False)
+                deps_list.extend(resolved)
+        except Exception as e:
+            self._log("warning", "core.deps.fail", f"Failed to resolve build deps: {e}", error=str(e))
+        # uniq preserve order
+        seen = set()
+        uniq = []
+        for d in deps_list:
+            if d and d not in seen:
+                seen.add(d)
+                uniq.append(d)
+        self._record(package_name, "deps.resolve", "ok", {"count": len(uniq)})
+        self._log("info", "core.deps.done", f"Resolved {len(uniq)} build deps for {package_name}", deps=uniq)
+        return {"deps": uniq}
 
-    # ---------------- integrity ----------------
-    def verify_integrity(self, pkg_name: str, version: Optional[str] = None) -> Dict[str, Any]:
-        pkgdir = self._pkg_package_dir(pkg_name, version)
-        files_list_file = pkgdir / 'files.list'
-        result = {'pkg': pkg_name, 'ok': True, 'missing': [], 'mismatched': []}
-        if not files_list_file.exists():
-            result['ok'] = False
-            return result
-        destdir = self._pkg_destdir(pkg_name, version)
-        for line in files_list_file.read_text(encoding='utf-8').splitlines():
-            p = destdir / line
-            if not p.exists():
-                result['missing'].append(str(p))
-                result['ok'] = False
+    # ---------------- build ----------------
+    def build(self, package_name: str, workdir: str, build_cmds: Optional[List[List[str]]] = None, env: Optional[Dict[str, str]] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Run build commands inside the builddir. build_cmds is list of argv lists.
+        If omitted, attempt to run './configure && make' if present.
+        """
+        builddir = Path(workdir) / "build"
+        start = time.time()
+        phases = []
+        self._log("info", "core.build.start", f"Building {package_name}", package=package_name, builddir=str(builddir))
+        self._record(package_name, "build", "start")
+
+        if not build_cmds:
+            # auto-detect common build commands
+            # prefer configure script
+            cfg_script = Path(workdir) / "sources"
+            # naive: detect top-level configure in builddir/sources unpacked
+            # user should supply explicit build_cmds for complex packages
+            if (cfg_script / "configure").exists():
+                build_cmds = [["/bin/sh", "./configure", f"--prefix=/usr"], ["make", f"-j{self.jobs}"]]
             else:
-                # optionally verify hashes if stored in pkginfo
+                # try running 'make'
+                build_cmds = [["make", f"-j{self.jobs}"]]
+
+        for cmd in build_cmds:
+            t0 = time.time()
+            rc, out, err = self._run(cmd, cwd=str(builddir), env=env, timeout=timeout)
+            dur = time.time() - t0
+            phases.append({"cmd": cmd, "rc": rc, "duration": dur})
+            if rc != 0:
+                self._log("error", "core.build.fail", f"Build command failed: {cmd}", cmd=cmd, rc=rc, stderr=err)
+                self._record(package_name, "build", "error", {"cmd": cmd, "rc": rc, "stderr": err})
+                return {"status": "error", "failed_cmd": cmd, "stderr": err, "phases": phases}
+            else:
+                self._log("info", "core.build.step", f"Build command succeeded: {cmd}", cmd=cmd, rc=rc, duration=dur)
+        total = time.time() - start
+        self._record(package_name, "build", "ok", {"duration": total})
+        self._log("info", "core.build.done", f"Build finished for {package_name}", duration=total)
+        return {"status": "ok", "phases": phases, "duration": total}
+
+    # ---------------- install (fakeroot & destdir) ----------------
+    def install(self, package_name: str, workdir: str, destdir: Optional[str] = None, install_cmds: Optional[List[List[str]]] = None, use_fakeroot: bool = True, fakeroot_install_prefix: Optional[str] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Install built files into destdir (fakeroot supported).
+        install_cmds: list of argv lists to run to perform install; if None, runs 'make install DESTDIR=<destdir>'
+        fakeroot_install_prefix: if provided, allows changing the root where package intended to be installed (e.g. / or /mnt/lfs)
+        """
+        destdir = destdir or str(Path(workdir) / "destdir")
+        destdir_path = Path(destdir)
+        destdir_path.mkdir(parents=True, exist_ok=True)
+
+        self._log("info", "core.install.start", f"Installing {package_name} into {destdir}", package=package_name, destdir=destdir)
+        self._record(package_name, "install", "start", {"destdir": destdir})
+
+        if not install_cmds:
+            install_cmds = [["make", f"DESTDIR={destdir}", "install"]]
+
+        # Build wrapper to execute install commands. If use_fakeroot, wrap via fakeroot if available.
+        results = []
+        for cmd in install_cmds:
+            if use_fakeroot and shutil.which(self.fakeroot_cmd):
+                full_cmd = [self.fakeroot_cmd] + cmd
+            else:
+                full_cmd = cmd
+            rc, out, err = self._run(full_cmd, cwd=str(Path(workdir) / "build"), timeout=timeout)
+            results.append({"cmd": full_cmd, "rc": rc, "stderr": err})
+            if rc != 0:
+                self._log("error", "core.install.fail", f"Install command failed: {full_cmd}", cmd=full_cmd, rc=rc, stderr=err)
+                self._record(package_name, "install", "error", {"cmd": full_cmd, "rc": rc})
+                return {"status": "error", "failed_cmd": full_cmd, "stderr": err}
+            else:
+                self._log("info", "core.install.step", f"Install step ok: {full_cmd}", cmd=full_cmd)
+
+        # optionally, if fakeroot_install_prefix provided, we'll move contents to the prefix when deploying
+        self._record(package_name, "install", "ok", {"destdir": destdir})
+        return {"status": "ok", "destdir": destdir, "results": results}
+
+    # ---------------- strip binaries ----------------
+    def strip_binaries(self, package_name: str, destdir: str, strip_paths: Optional[List[str]] = None, exclude: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Walk destdir and run 'strip' on executable object files under strip_paths.
+        exclude: list of glob patterns to skip.
+        """
+        if not self.strip_binaries_enabled:
+            return {"status": "skipped", "reason": "strip_disabled"}
+
+        strip_paths = strip_paths or self.strip_paths
+        exclude = exclude or self.strip_exclude
+
+        dest = Path(destdir)
+        if not dest.exists():
+            return {"status": "error", "reason": "destdir_missing"}
+
+        stripped = []
+        errors = []
+
+        # helper to decide file is a candidate: ELF and executable or .so
+        def is_candidate(p: Path) -> bool:
+            try:
+                if not p.is_file():
+                    return False
+                # skip by exclude globs
+                for pat in exclude:
+                    if p.match(pat):
+                        return False
+                # quick heuristic: check suffix or 'file' output
+                if p.suffix in (".so", ".so.*"):
+                    return True
+                # executable bit or ELF header
+                if os.access(str(p), os.X_OK):
+                    # check ELF magic
+                    with p.open("rb") as fh:
+                        hdr = fh.read(4)
+                        return hdr == b"\x7fELF"
+                return False
+            except Exception:
+                return False
+
+        for rel in strip_paths:
+            base = dest / rel.lstrip("/")
+            if not base.exists():
+                continue
+            for p in base.rglob("*"):
+                try:
+                    if is_candidate(p):
+                        # run strip in sandbox if available
+                        cmd = ["strip", "--strip-unneeded", str(p)]
+                        rc, out, err = self._run(cmd, cwd=str(dest))
+                        if rc == 0:
+                            stripped.append(str(p))
+                        else:
+                            errors.append({"file": str(p), "err": err})
+                except Exception as e:
+                    errors.append({"file": str(p), "err": str(e)})
+
+        self._log("info", "core.strip.done", f"Stripped {len(stripped)} files for {package_name}", stripped=len(stripped), errors=len(errors))
+        self._record(package_name, "strip", "ok" if not errors else "partial", {"stripped": len(stripped), "errors": len(errors)})
+        return {"status": "ok" if not errors else "partial", "stripped": stripped, "errors": errors}
+
+    # ---------------- package ----------------
+    def package(self, package_name: str, version: Optional[str], destdir: str, pkg_format: str = "tar.xz", strip_before: bool = True) -> Dict[str, Any]:
+        """
+        Create an archive from destdir. Optionally run strip_binaries before packaging.
+        Returns path to created package.
+        """
+        if strip_before:
+            try:
+                self.strip_binaries(package_name, destdir)
+            except Exception as e:
+                self._log("warning", "core.package.strip_fail", f"Strip failed: {e}", error=str(e))
+
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        name = f"{package_name}-{version or '0'}-{ts}"
+        out_path = self.package_output / f"{name}.{pkg_format}"
+        try:
+            # support tar.xz only for now
+            if pkg_format in ("tar.xz", "tar.gz", "tar.bz2"):
+                mode = "w:xz" if pkg_format == "tar.xz" else ("w:gz" if pkg_format == "tar.gz" else "w:bz2")
+                with tarfile.open(out_path, mode) as tar:
+                    tar.add(destdir, arcname=f"{package_name}-{version or '0'}")
+            else:
+                # fallback to plain tar.xz
+                with tarfile.open(out_path, "w:xz") as tar:
+                    tar.add(destdir, arcname=f"{package_name}-{version or '0'}")
+            self._log("info", "core.package.ok", f"Packaged {package_name} -> {out_path}", package=package_name, path=str(out_path))
+            self._record(package_name, "package", "ok", {"out": str(out_path)})
+            return {"status": "ok", "package": str(out_path)}
+        except Exception as e:
+            self._log("error", "core.package.fail", f"Packaging failed: {e}", error=str(e))
+            self._record(package_name, "package", "error", {"error": str(e)})
+            return {"status": "error", "error": str(e)}
+
+    # ---------------- deploy ----------------
+    def deploy(self, package_name: str, package_archive: str, install_prefix: str = "/", use_fakeroot: bool = True, rollback_on_fail: bool = True) -> Dict[str, Any]:
+        """
+        Deploy package archive to target root (e.g. / or /mnt/lfs).
+        Creates a rollback snapshot before applying changes.
+        """
+        target_root = Path(install_prefix)
+        if not target_root.exists():
+            raise CoreError(f"Target root {install_prefix} does not exist")
+
+        # backup current layout (simple: backup target if non-empty)
+        backup_path = None
+        try:
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            backup_name = f"{package_name}-predeploy-{ts}.tar.xz"
+            backup_path = self.rollback_dir / backup_name
+            # tar-add only files under target root that will be affected: for simplicity, backup entire root copy under prefix path if small
+            # WARNING: user must configure this responsibly (not recommended to backup '/')
+            with tarfile.open(backup_path, "w:xz") as tar:
+                # Add top-level paths from the archive: read archive members to determine top-level dirs
+                with tarfile.open(package_archive, "r:*") as pa:
+                    top_dirs = set()
+                    for m in pa.getmembers():
+                        parts = Path(m.name).parts
+                        if parts:
+                            top_dirs.add(parts[0])
+                    # backup these from target_root if exist
+                    for td in top_dirs:
+                        p = target_root / td
+                        if p.exists():
+                            tar.add(str(p), arcname=str(td))
+            self._log("info", "core.deploy.backup", f"Backup created: {backup_path}", backup=str(backup_path))
+        except Exception as e:
+            self._log("warning", "core.deploy.backup_fail", f"Backup failed: {e}", error=str(e))
+            backup_path = None
+
+        # extract archive into target (use fakeroot if needed)
+        try:
+            # prefer using sandbox.run to extract safely
+            if self.sandbox:
+                # copy archive into temp under sandbox root and run tar -xf
+                tmp = Path(tempfile.mkdtemp(prefix="newpkg_deploy_"))
+                local_archive = tmp / Path(package_archive).name
+                shutil.copyfile(package_archive, str(local_archive))
+                cmd = ["tar", "-C", str(target_root), "-xpf", str(local_archive)]
+                if use_fakeroot and shutil.which(self.fakeroot_cmd):
+                    cmd = [self.fakeroot_cmd] + cmd
+                rc, out, err = self._run(cmd, cwd=str(target_root))
+                shutil.rmtree(tmp)
+            else:
+                # direct extraction
+                with tarfile.open(package_archive, "r:*") as tar:
+                    tar.extractall(path=str(target_root))
+                rc, out, err = 0, "", ""
+            if rc == 0:
+                self._log("info", "core.deploy.ok", f"Deployed {package_name} to {install_prefix}", package=package_name, prefix=install_prefix)
+                self._record(package_name, "deploy", "ok", {"target": install_prefix, "backup": str(backup_path) if backup_path else None})
+                return {"status": "ok", "backup": str(backup_path) if backup_path else None}
+            else:
+                raise CoreError(f"deploy command failed: {err}")
+        except Exception as e:
+            self._log("error", "core.deploy.fail", f"Deploy failed: {e}", error=str(e))
+            self._record(package_name, "deploy", "error", {"error": str(e)})
+            # rollback if requested and backup available
+            if rollback_on_fail and backup_path and backup_path.exists():
+                try:
+                    self._log("info", "core.deploy.rollback", f"Attempting rollback using {backup_path}", backup=str(backup_path))
+                    with tarfile.open(backup_path, "r:*") as tar:
+                        tar.extractall(path=str(target_root))
+                    self._log("info", "core.deploy.rollback_ok", "Rollback successful")
+                except Exception as re:
+                    self._log("error", "core.deploy.rollback_fail", f"Rollback failed: {re}", error=str(re))
+            return {"status": "error", "error": str(e)}
+
+    # ---------------- full pipeline ----------------
+    def full_build_cycle(self, package_name: str, version: Optional[str] = None, metafile_path: Optional[str] = None, profile: Optional[str] = None, install_prefix: str = "/", do_package: bool = True, do_deploy: bool = False, strip_before_package: bool = True, dry_run: bool = False) -> BuildResult:
+        """
+        Orchestrates the full build: prepare -> resolve_deps -> build -> install -> strip -> package -> deploy
+        """
+        result = BuildResult(package=package_name, version=version)
+        try:
+            # prepare
+            prep = self.prepare(package_name, metafile_path=metafile_path, profile=profile)
+            workdir = prep["workdir"]
+            destdir = prep["destdir"]
+            builddir = prep["builddir"]
+
+            result.phases.append({"phase": "prepare", "ok": True, "meta": prep})
+
+            # resolve deps
+            deps_res = self.resolve_build_deps(package_name, operate_on_metafile=prep.get("metafile"))
+            result.phases.append({"phase": "deps", "deps": deps_res.get("deps", [])})
+
+            if dry_run:
+                result.status = "dry-run"
+                return result
+
+            # pre-build hook
+            try:
+                if self.hooks and hasattr(self.hooks, "execute_safe"):
+                    self.hooks.execute_safe("pre_build", pkg_dir=workdir)
+            except Exception:
                 pass
-        return result
 
-    # ---------------- run arbitrary stage ----------------
-    def run_stage(self, pkg_name: str, stage: str, version: Optional[str] = None) -> None:
-        build_dir = self._pkg_build_dir(pkg_name, version)
-        script = build_dir / 'hooks' / f"{stage}.sh"
-        if not script.exists():
-            raise CoreError(f'Stage script not found: {script}')
-        rc, out, err = self._safe_run_in_sandbox(['/bin/sh', str(script)], cwd=build_dir)
-        if rc != 0:
-            raise CoreError(f'Stage {stage} failed: {err}')
+            # build
+            build_res = self.build(package_name, workdir, build_cmds=None)
+            result.phases.append({"phase": "build", "result": build_res})
+            if build_res.get("status") != "ok":
+                result.status = "build-fail"
+                return result
 
-    # ---------------- auto rebuild on dependency change ----------------
-    def rebuild_if_changed(self, pkg_name: str) -> None:
-        # trivial hook: if any build deps have updated version in DB, rebuild
-        # (domain specific; here we simply log the check)
-        self._log('rebuild_check', level='INFO', message=f'Checking rebuild need for {pkg_name}', metadata={'pkg': pkg_name})
-        # could implement version comparisons using db.get_package
-        return
+            # post-build hook
+            try:
+                if self.hooks and hasattr(self.hooks, "execute_safe"):
+                    self.hooks.execute_safe("post_build", pkg_dir=workdir)
+            except Exception:
+                pass
 
+            # install (fakeroot into destdir)
+            install_res = self.install(package_name, workdir, destdir=destdir, use_fakeroot=True)
+            result.phases.append({"phase": "install", "result": install_res})
+            if install_res.get("status") != "ok":
+                result.status = "install-fail"
+                return result
 
-# ---------------- CLI demo ----------------
-if __name__ == '__main__':
-    import argparse
+            # strip
+            if self.strip_binaries_enabled and strip_before_package:
+                strip_res = self.strip_binaries(package_name, destdir)
+                result.phases.append({"phase": "strip", "result": strip_res})
 
-    ap = argparse.ArgumentParser(prog='newpkg-core')
-    ap.add_argument('--pkg', '-p', required=True)
-    ap.add_argument('--build', action='store_true')
-    ap.add_argument('--install', action='store_true')
-    ap.add_argument('--package', action='store_true')
-    ap.add_argument('--deploy', action='store_true')
-    ap.add_argument('--record', action='store_true')
-    ap.add_argument('--clean', action='store_true')
-    args = ap.parse_args()
+            # package
+            pkg_res = {"status": "skipped"}
+            if do_package:
+                pkg_res = self.package(package_name, version, destdir, strip_before=False)
+                result.phases.append({"phase": "package", "result": pkg_res})
+                if pkg_res.get("status") != "ok":
+                    result.status = "package-fail"
+                    return result
 
-    # minimal bootstrap for demo
-    try:
-        from newpkg_db import NewpkgDB
-    except Exception:
-        NewpkgDB = None
-    cfg = None
-    try:
-        class CfgShim:
-            def get(self, k):
-                return None
-        cfg = CfgShim()
-    except Exception:
+            # deploy
+            if do_deploy and pkg_res.get("status") == "ok":
+                deploy_res = self.deploy(package_name, pkg_res["package"], install_prefix, use_fakeroot=True)
+                result.phases.append({"phase": "deploy", "result": deploy_res})
+                if deploy_res.get("status") != "ok":
+                    result.status = "deploy-fail"
+                    return result
+
+            # success
+            result.status = "ok"
+            self._record(package_name, "full_build", "ok", {"pkg": str(pkg_res.get("package")) if isinstance(pkg_res, dict) else None})
+            return result
+        except Exception as e:
+            self._log("error", "core.full.fail", f"Full build failed: {e}", error=str(e))
+            self._record(package_name, "full_build", "error", {"error": str(e)})
+            result.status = "error"
+            return result
+
+    # ---------------- CLI convenience ----------------
+    @classmethod
+    def cli_main(cls, argv: Optional[List[str]] = None):
+        import argparse
+
+        p = argparse.ArgumentParser(prog="newpkg-core", description="Newpkg core build pipeline")
+        p.add_argument("cmd", choices=["prepare", "build", "install", "strip", "package", "deploy", "full"], help="command")
+        p.add_argument("--pkg", required=True, help="package name")
+        p.add_argument("--meta", help="metafile path")
+        p.add_argument("--workdir", help="workdir override")
+        p.add_argument("--version", help="package version")
+        p.add_argument("--profile", help="build profile")
+        p.add_argument("--destdir", help="destdir for install")
+        p.add_argument("--prefix", default="/", help="install prefix for deploy (default: / )")
+        p.add_argument("--no-sandbox", action="store_true", help="do not use sandbox")
+        p.add_argument("--dry-run", action="store_true", help="dry run")
+        p.add_argument("--json", action="store_true", help="output JSON")
+        args = p.parse_args(argv)
+
         cfg = None
+        if init_config:
+            try:
+                cfg = init_config()
+            except Exception:
+                cfg = None
 
-    db = None
-    if NewpkgDB is not None:
-        dbp = os.environ.get('NEWPKG_DB_PATH')
-        if dbp:
-            db = NewpkgDB(db_path=dbp)
-            db.init_db()
+        db = NewpkgDB(cfg) if NewpkgDB and cfg is not None else None
+        logger = NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None
+        sandbox = Sandbox(cfg, logger, db) if Sandbox and cfg is not None else None
 
-    core = NewpkgCore(cfg, db, logger=None, sandbox=None, deps=None)
-    if args.build:
-        core.build(args.pkg)
-    if args.install:
-        core.install(args.pkg)
-    if args.package:
-        core.package(args.pkg)
-    if args.deploy:
-        core.deploy(args.pkg)
-    if args.record:
-        core.record(args.pkg)
-    if args.clean:
-        core.clean(args.pkg)
+        core = cls(cfg=cfg, logger=logger, db=db, sandbox=sandbox)
+        if args.no_sandbox:
+            core.use_sandbox = False
+
+        if args.cmd == "prepare":
+            res = core.prepare(args.pkg, metafile_path=args.meta, profile=args.profile, workdir=args.workdir)
+            print(json.dumps(res, indent=2) if args.json else res)
+            return 0
+        if args.cmd == "build":
+            res = core.build(args.pkg, args.workdir or str(core.work_root / args.pkg))
+            print(json.dumps(res, indent=2) if args.json else res)
+            return 0
+        if args.cmd == "install":
+            res = core.install(args.pkg, args.workdir or str(core.work_root / args.pkg), destdir=args.destdir)
+            print(json.dumps(res, indent=2) if args.json else res)
+            return 0
+        if args.cmd == "strip":
+            res = core.strip_binaries(args.pkg, args.destdir or str(core.work_root / args.pkg / "destdir"))
+            print(json.dumps(res, indent=2) if args.json else res)
+            return 0
+        if args.cmd == "package":
+            res = core.package(args.pkg, args.version, args.destdir or str(core.work_root / args.pkg / "destdir"))
+            print(json.dumps(res, indent=2) if args.json else res)
+            return 0
+        if args.cmd == "deploy":
+            # expect an archive path
+            if not args.meta:
+                print("deploy requires --meta to point to package archive path (or use --meta=archive_path)")
+                return 2
+            res = core.deploy(args.pkg, args.meta, install_prefix=args.prefix)
+            print(json.dumps(res, indent=2) if args.json else res)
+            return 0
+        if args.cmd == "full":
+            res = core.full_build_cycle(args.pkg, version=args.version, metafile_path=args.meta, profile=args.profile, install_prefix=args.prefix, do_package=True, do_deploy=False, dry_run=args.dry_run)
+            # BuildResult is dataclass; convert
+            out = {"package": res.package, "version": res.version, "status": res.status, "phases": res.phases, "metrics": res.metrics}
+            print(json.dumps(out, indent=2) if args.json else out)
+            return 0
+        return 1
+
+
+if __name__ == "__main__":
+    NewpkgCore.cli_main()
