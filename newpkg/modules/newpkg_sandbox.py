@@ -1,38 +1,31 @@
+#!/usr/bin/env python3
+# newpkg_sandbox.py
 """
-newpkg_sandbox.py
+newpkg_sandbox.py — sandbox runner for newpkg
 
-Sandbox abstraction for newpkg builds and operations.
-- Supports backends: bubblewrap (bwrap), proot (fallback), and a "none" (no sandbox) mode.
-- Integrates with newpkg_config (cfg.get), newpkg_logger (NewpkgLogger) and newpkg_db (NewpkgDB) when provided.
-- Provides convenient API:
-    - Sandbox(cfg, logger=None, db=None, name=None)
-    - sandbox.run(cmd, cwd=None, env=None, timeout=None) -> SandboxResult
-    - sandbox.run_in_sandbox(cmd, pkg=None, ...) -> same as run but creates ephemeral workspace
-    - sandbox.bind(src, dest, ro=True) to add binds
-    - sandbox.sandbox_for_package(pkg_name, layout_dirs=None) -> prepares layout and returns path
-    - sandbox.cleanup() to cleanup temporary sandboxes
-
-Security notes:
-- By default destructive binds are prevented; configuration controls allowlisting.
-- Removes dangerous env vars by default when entering sandbox.
-
-This module is defensive: if backends are missing it falls back gracefully and logs warnings.
+Responsibilities:
+ - Provide secure sandboxed execution using bubblewrap (bwrap), proot or 'none' (no sandbox)
+ - Respect configuration from newpkg_config (sandbox.* and sandbox.layout.*)
+ - Propagate cfg.as_env() into subprocess environments
+ - Respect general.dry_run, output.quiet, output.json
+ - Register runs and metrics into newpkg_db via record_phase when available
+ - Return structured SandboxResult for programmatic use (and JSON serializable)
 """
+
 from __future__ import annotations
 
+import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
 import time
-import uuid
-from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-# Try imports from project; fallbacks if not available
+# optional project imports
 try:
     from newpkg_config import init_config
 except Exception:
@@ -48,313 +41,380 @@ try:
 except Exception:
     NewpkgDB = None
 
+# fallback stdlib logger for internal fallback messages (not main structured logger)
+import logging
+_logger = logging.getLogger("newpkg.sandbox")
+if not _logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("[%(levelname)s] newpkg.sandbox: %(message)s"))
+    _logger.addHandler(h)
+_logger.setLevel(logging.INFO)
+
 
 @dataclass
 class SandboxResult:
-    rc: int
-    out: str
-    err: str
-    duration: float
     backend: str
-    created_tmp: Optional[str] = None
+    command: Union[str, List[str]]
+    cwd: Optional[str]
+    rc: int
+    stdout: Optional[str]
+    stderr: Optional[str]
+    duration: float
+    dry_run: bool = False
+    meta: Dict[str, Any] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        # ensure meta is JSON-serializable
+        d["meta"] = d.get("meta") or {}
+        return d
 
 
-class SandboxError(Exception):
-    pass
+class NewpkgSandbox:
+    SUPPORTED_BACKENDS = ("bwrap", "proot", "none")
 
+    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None):
+        # load config / logger / db (best-effort)
+        self.cfg = cfg or (init_config() if init_config else None)
+        # instantiate logger if provided or available
+        if logger:
+            self.logger = logger
+        else:
+            try:
+                self.logger = NewpkgLogger.from_config(self.cfg, db) if NewpkgLogger and self.cfg else None
+            except Exception:
+                self.logger = None
+        # db instance
+        self.db = db or (NewpkgDB(self.cfg) if NewpkgDB and self.cfg else None)
 
-class Sandbox:
-    """Sandbox wrapper supporting bwrap and proot with safe defaults."""
+        # config defaults
+        self.backend = (self._cfg_get("sandbox.backend") or "bwrap").lower()
+        if self.backend not in self.SUPPORTED_BACKENDS:
+            self.backend = "none"
+        self.enabled = bool(self._cfg_get("sandbox.enabled", True))
+        self.bind_ro = list(self._cfg_get("sandbox.default_bind_ro", ["/usr", "/lib", "/bin", "/etc"]) or [])
+        self.bind_rw = list(self._cfg_get("sandbox.default_bind_rw", ["/tmp", "/var/tmp"]) or [])
+        self.fakeroot = bool(self._cfg_get("sandbox.fakeroot", True))
+        self.network = bool(self._cfg_get("sandbox.network", False))
+        self.preserve_tmp = bool(self._cfg_get("sandbox.preserve_tmp", False))
+        self.quiet = bool(self._cfg_get("output.quiet", False))
+        self.json_out = bool(self._cfg_get("output.json", False))
+        self.dry_run = bool(self._cfg_get("general.dry_run", False))
 
-    DEFAULT_ALLOWED_BINDS = ['/tmp', '/var/tmp', '/usr', '/bin', '/lib', '/lib64', '/etc', '/home']
+        # resource-limits config (optional)
+        self.max_mem_mb = self._cfg_get("sandbox.max_mem_mb", None)
+        self.max_cpu_time = self._cfg_get("sandbox.max_cpu_seconds", None)
 
-    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, name: Optional[str] = None):
-        self.cfg = cfg
-        self.logger = logger or (NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None)
-        self.db = db
-        self.name = name or f'newpkg-sandbox-{uuid.uuid4().hex[:8]}'
+        # layouts per profile (optional)
+        self.layouts = self._cfg_get("sandbox.layout") or {}
 
-        # backend selection
-        self._preferred_backend = (self._cfg_get('sandbox.backend') or os.environ.get('NEWPKG_SANDBOX_BACKEND') or 'bwrap').lower()
-        self._backend = self._detect_backend()
+        # find binaries
+        self._bwrap_bin = shutil.which("bwrap")
+        self._proot_bin = shutil.which("proot") or shutil.which("proot-static")
 
-        # sandbox root (for ephemeral sandboxes)
-        self._tmp_roots: List[Path] = []
+        # prepare logger wrapper
+        self._log = self._make_logger()
 
-        # binds list (tuples of src,dest,ro)
-        self._binds: List[Tuple[str, str, bool]] = []
-
-        # security options
-        self.rootless = bool(self._cfg_get('sandbox.rootless', True))
-        self.max_mem = self._cfg_get('sandbox.max_mem', None)  # e.g. '512M'
-        self.max_cpu = int(self._cfg_get('sandbox.max_cpu', 0) or 0)
-
-        # allowlist for binds - absolute paths only
-        self.allowed_binds = list(self._cfg_get('sandbox.allowed_binds', self.DEFAULT_ALLOWED_BINDS))
-
-        # cleanup on exit
-        self.preserve_tmp = bool(self._cfg_get('sandbox.preserve_tmp', False))
-
-        # sanitize env list to remove dangerous variables
-        self._blacklist_env = set(self._cfg_get('sandbox.blacklist_env', ['LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH']))
-
-        self._log_info('init', f'Initialized sandbox (backend={self._backend})', backend=self._backend, name=self.name)
-
-    # ---------------- config helper ----------------
     def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
-            if self.cfg and hasattr(self.cfg, 'get'):
+            if self.cfg and hasattr(self.cfg, "get"):
                 v = self.cfg.get(key)
                 if v is not None:
                     return v
         except Exception:
             pass
-        # try env fallback
-        ev = key.upper().replace('.', '_')
-        return os.environ.get(ev, default)
+        # fall back to environment variables
+        env_key = key.upper().replace(".", "_")
+        return os.environ.get(env_key, default)
 
-    # ---------------- logging helpers ----------------
-    def _log_info(self, event: str, message: str, **meta):
-        if self.logger and hasattr(self.logger, 'info'):
+    def _make_logger(self):
+        def _fn(level: str, event: str, msg: str = "", **meta):
             try:
-                self.logger.info(f'sandbox:{event}', message, sandbox=self.name, **meta)
-                return
+                if self.logger:
+                    fn = getattr(self.logger, level.lower(), None)
+                    if fn:
+                        fn(event, msg, **meta)
+                        return
             except Exception:
                 pass
-        print(f'[INFO] sandbox:{event} - {message}')
+            # fallback to module logger
+            getattr(_logger, level.lower(), _logger.info)(f"{event}: {msg} - {meta}")
+        return _fn
 
-    def _log_error(self, event: str, message: str, **meta):
-        if self.logger and hasattr(self.logger, 'error'):
-            try:
-                self.logger.error(f'sandbox:{event}', message, sandbox=self.name, **meta)
-                return
-            except Exception:
-                pass
-        print(f'[ERROR] sandbox:{event} - {message}')
+    # ----------------- helpers -----------------
+    def _build_env(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        """Combine host env, cfg.as_env() and extra overrides. Blacklist critical envs."""
+        env = dict(os.environ)
+        try:
+            if self.cfg and hasattr(self.cfg, "as_env"):
+                env.update(self.cfg.as_env())
+        except Exception:
+            pass
+        if extra:
+            env.update({k: str(v) for k, v in (extra.items())})
+        # remove dangerous envs that may bypass sandbox (best-effort)
+        for k in ("LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+            if k in env:
+                env.pop(k, None)
+        return env
 
-    # ---------------- backend detection ----------------
-    def _detect_backend(self) -> str:
-        # try to honor preferred backend
-        pref = self._preferred_backend
-        if pref == 'bwrap' and shutil.which('bwrap'):
-            return 'bwrap'
-        if pref == 'proot' and shutil.which('proot'):
-            return 'proot'
-        # fallback order
-        if shutil.which('bwrap'):
-            return 'bwrap'
-        if shutil.which('proot'):
-            return 'proot'
-        # no sandbox available
-        return 'none'
-
-    # ---------------- bind management ----------------
-    def bind(self, src: str, dest: Optional[str] = None, ro: bool = True) -> None:
-        """Add a bind mount for the sandbox. dest defaults to same path inside sandbox root."""
-        srcp = str(Path(src).expanduser().resolve())
-        # simple allowlist check
-        allowed = any(srcp.startswith(str(Path(a).resolve())) for a in self.allowed_binds)
-        if not allowed:
-            raise SandboxError(f'Bind path {srcp} not allowed by sandbox.allowed_binds')
-        destp = dest or srcp
-        self._binds.append((srcp, destp, bool(ro)))
-        self._log_info('bind.add', f'Bind added {srcp} -> {destp} (ro={ro})', src=srcp, dest=destp, ro=ro)
-
-    # ---------------- environment sanitization ----------------
-    def _sanitize_env(self, env: Optional[Dict[str, str]]) -> Dict[str, str]:
-        base = dict(os.environ)
-        # remove blacklisted
-        for k in list(base.keys()):
-            if k in self._blacklist_env:
-                base.pop(k, None)
-        # apply overrides
-        if env:
-            base.update(env)
-        # ensure NEWPKG_* helpful paths
-        # provide defaults if not present
-        base.setdefault('NEWPKG_SOURCES', os.environ.get('NEWPKG_SOURCES', '/sources'))
-        base.setdefault('NEWPKG_BUILD', os.environ.get('NEWPKG_BUILD', '/build'))
-        base.setdefault('NEWPKG_DEST', os.environ.get('NEWPKG_DEST', '/'))
+    def _layout_for_profile(self, profile: Optional[str]) -> Dict[str, Any]:
+        """Return layout settings merged with defaults for the requested profile."""
+        base = {
+            "bind_ro": list(self.bind_ro),
+            "bind_rw": list(self.bind_rw),
+            "network": self.network,
+            "fakeroot": self.fakeroot,
+        }
+        if profile and isinstance(self.layouts, dict):
+            prof = self.layouts.get(profile) or {}
+            # merge arrays carefully
+            if "bind_ro" in prof:
+                base["bind_ro"] = list(prof.get("bind_ro", [])) + base["bind_ro"]
+            if "bind_rw" in prof:
+                base["bind_rw"] = list(prof.get("bind_rw", [])) + base["bind_rw"]
+            for k, v in prof.items():
+                if k not in ("bind_ro", "bind_rw"):
+                    base[k] = v
         return base
 
-    # ---------------- helpers to build command wrappers ----------------
-    def _build_bwrap_cmd(self, inner_cmd: List[str], cwd: Optional[str] = None) -> List[str]:
-        args: List[str] = ['bwrap', '--unshare-all', '--share-net', '--proc', '/proc', '--dev', '/dev']
-        # set tmp and home inside
-        args += ['--tmpfs', '/tmp', '--tmpfs', '/var/tmp']
-        # add binds
-        for src, dest, ro in self._binds:
-            if ro:
-                args += ['--ro-bind', src, dest]
-            else:
-                args += ['--bind', src, dest]
-        # working dir
-        if cwd:
-            args += ['--chdir', cwd]
-        args += ['--'] + inner_cmd
-        return args
+    def _backend_available(self, backend: str) -> bool:
+        if backend == "bwrap":
+            return bool(self._bwrap_bin)
+        if backend == "proot":
+            return bool(self._proot_bin)
+        if backend == "none":
+            return True
+        return False
 
-    def _build_proot_cmd(self, inner_cmd: List[str], cwd: Optional[str] = None) -> List[str]:
-        # proot basic wrapper: proot -b src:dest -- /bin/sh -c 'cd cwd && exec ...'
-        args = ['proot']
-        for src, dest, ro in self._binds:
-            args += ['-b', f'{src}:{dest}']
-        if cwd:
-            inner = ['sh', '-c', f'cd {shlex_quote(cwd)} && exec {shlex_join(inner_cmd)}']
-        else:
-            inner = inner_cmd
-        args += ['--'] + inner
-        return args
-
-    # ---------------- run command ----------------
-    def run(self, cmd: List[str], cwd: Optional[str] = None, env: Optional[Dict[str, str]] = None, timeout: Optional[int] = None) -> SandboxResult:
-        """Run a command in the chosen sandbox backend and return SandboxResult.
-
-        cmd: list of argv (no shell). cwd is path inside host (we bind it into sandbox if needed).
+    # ----------------- core API -----------------
+    def run_in_sandbox(self,
+                       command: Union[str, Sequence[str]],
+                       cwd: Optional[Union[str, Path]] = None,
+                       profile: Optional[str] = None,
+                       captures: bool = True,
+                       env: Optional[Dict[str, str]] = None,
+                       timeout: Optional[int] = None) -> SandboxResult:
         """
-        start = time.time()
-        backend_used = self._backend
-        sanitized_env = self._sanitize_env(env)
+        Run a command inside the configured sandbox.
+        - command: str or list.
+        - cwd: working directory inside sandbox (host path bound or path inside sysroot).
+        - profile: sandbox layout profile to apply (reads sandbox.layout.<profile>).
+        - captures: if True capture stdout/stderr and include in result.
+        - env: extra environment variables (merged with cfg.as_env()).
+        - timeout: seconds to wait before kill (best-effort).
+        """
+        # normalize command
+        if isinstance(command, (list, tuple)):
+            cmd_list = [str(x) for x in command]
+            cmd_str = " ".join(shlex.quote(x) for x in cmd_list)
+        else:
+            cmd_str = str(command)
+            cmd_list = None  # will be used only when no sandboxing wrapper needed
 
-        # ensure cwd exists
-        cwdp = Path(cwd) if cwd else None
-        if cwdp and not cwdp.exists():
-            raise SandboxError(f'cwd {cwd} does not exist')
+        # early dry-run behavior
+        if self.dry_run:
+            self._log("info", "sandbox.dryrun", f"DRY-RUN sandbox {self.backend}: {cmd_str}", command=cmd_str, backend=self.backend)
+            return SandboxResult(
+                backend=self.backend,
+                command=command,
+                cwd=str(cwd) if cwd else None,
+                rc=0,
+                stdout="",
+                stderr="",
+                duration=0.0,
+                dry_run=True,
+                meta={"simulated": True},
+            )
 
-        # always add cwd to binds so that inner command can access it at same path
-        if cwdp:
+        # choose backend (respect enabled + availability)
+        backend = self.backend if self.enabled else "none"
+        if not self._backend_available(backend):
+            self._log("warning", "sandbox.backend_missing", f"Backend {backend} not available, falling back to none", backend=backend)
+            backend = "none"
+
+        # prepare layout and env
+        layout = self._layout_for_profile(profile)
+        exec_env = self._build_env(env)
+
+        # make temporary working directory for sandbox (host path)
+        tmpdir = Path(tempfile.mkdtemp(prefix="newpkg-sbox-"))
+        workdir = tmpdir if cwd is None else Path(cwd)
+        # if cwd provided and not absolute, consider inside tmpdir
+        if cwd and not Path(cwd).is_absolute():
+            workdir = tmpdir.joinpath(cwd)
+            workdir.mkdir(parents=True, exist_ok=True)
+        # else if absolute ensure directory exists (best-effort)
+        if workdir.is_absolute():
             try:
-                self.bind(str(cwdp), str(cwdp), ro=False)
-            except SandboxError:
-                # bind may already exist or be disallowed
+                workdir.mkdir(parents=True, exist_ok=True)
+            except Exception:
                 pass
 
-        if backend_used == 'bwrap':
-            wrapper = self._build_bwrap_cmd(cmd, cwd)
-        elif backend_used == 'proot':
-            # proot may not be ideal; fallback to running directly
-            wrapper = self._build_proot_cmd(cmd, cwd)
-        else:
-            # no sandbox: run directly
-            wrapper = cmd
+        # build command wrapper for backends
+        cmd_wrapper: List[str] = []
+        if backend == "bwrap":
+            # compose bwrap command
+            bwrap = self._bwrap_bin
+            cmd_wrapper = [bwrap, "--unshare-all", "--share-net"] if not layout.get("network", False) else [bwrap, "--unshare-all"]
+            # add readonly binds
+            for d in layout.get("bind_ro", []):
+                cmd_wrapper += ["--ro-bind", d, d]
+            # add writable binds
+            for d in layout.get("bind_rw", []):
+                cmd_wrapper += ["--bind", d, d]
+            # mount /tmp inside sandbox to tmpdir
+            cmd_wrapper += ["--tmpfs", "/tmp"]
+            # optionally set working directory inside sandbox to same host path
+            if workdir:
+                cmd_wrapper += ["--chdir", str(workdir)]
+            # fakeroot support: if enabled and installed, prefix with fakeroot (best-effort)
+            if layout.get("fakeroot", False):
+                # some systems have fakeroot binary; prefer fakeroot -s
+                fakeroot_bin = shutil.which("fakeroot")
+                if fakeroot_bin:
+                    cmd_wrapper = [fakeroot_bin, "--"] + cmd_wrapper
+            # resource limits: bubblewrap does not directly enforce mem limits; we leave to ulimit via shell if desired
+            # append command
+            if cmd_list:
+                cmd_wrapper += cmd_list
+            else:
+                cmd_wrapper += ["sh", "-lc", cmd_str]
+        elif backend == "proot":
+            proot = self._proot_bin
+            cmd_wrapper = [proot]
+            # map binds
+            for d in layout.get("bind_ro", []):
+                cmd_wrapper += ["-b", f"{d}:{d}"]
+            for d in layout.get("bind_rw", []):
+                cmd_wrapper += ["-b", f"{d}:{d}"]
+            # set cwd
+            if workdir:
+                cmd_wrapper += ["-w", str(workdir)]
+            if cmd_list:
+                cmd_wrapper += cmd_list
+            else:
+                cmd_wrapper += ["sh", "-lc", cmd_str]
+        else:  # none
+            if cmd_list:
+                cmd_wrapper = cmd_list
+            else:
+                cmd_wrapper = ["sh", "-lc", cmd_str]
 
-        # run
+        # run and measure
+        start = time.perf_counter()
         try:
-            proc = subprocess.run(wrapper, cwd=str(cwdp) if cwdp else None, env=sanitized_env, capture_output=True, text=True, timeout=timeout)
+            self._log("info", "sandbox.exec.start", f"Running sandbox command with backend={backend}", backend=backend, command=cmd_str, cwd=str(workdir))
+            proc = subprocess.run(
+                cmd_wrapper,
+                cwd=str(workdir) if workdir else None,
+                env=exec_env,
+                stdout=subprocess.PIPE if captures else None,
+                stderr=subprocess.PIPE if captures else None,
+                text=True,
+                timeout=timeout,
+            )
+            duration = time.perf_counter() - start
+            stdout = proc.stdout if captures else None
+            stderr = proc.stderr if captures else None
             rc = proc.returncode
-            out = proc.stdout or ''
-            err = proc.stderr or ''
-        except subprocess.TimeoutExpired as e:
-            rc = 124
-            out = ''
-            err = f'timeout: {e}'
-        except Exception as e:
-            rc = 1
-            out = ''
-            err = str(e)
-
-        dur = time.time() - start
-        # record to DB if available
-        try:
-            if self.db and hasattr(self.db, 'record_phase'):
-                pkg = os.environ.get('NEWPKG_CURRENT_PKG') or self.name
-                self.db.record_phase(pkg, 'sandbox.run', 'ok' if rc == 0 else 'error', log_path=None)
-        except Exception:
-            pass
-
-        # log
-        if rc == 0:
-            self._log_info('run.ok', f'Cmd succeeded: {cmd}', cmd=cmd, rc=rc, duration=dur)
-        else:
-            self._log_error('run.fail', f'Cmd failed: {cmd} rc={rc}', cmd=cmd, rc=rc, duration=dur, stderr=err)
-
-        return SandboxResult(rc=rc, out=out, err=err, duration=dur, backend=backend_used)
-
-    # ---------------- ephemeral sandbox helpers ----------------
-    def sandbox_for_package(self, pkg_name: str, layout_dirs: Optional[Dict[str, str]] = None) -> Path:
-        """Create a sandbox workspace root for a package and return its path.
-
-        layout_dirs can map names like 'sources','build','dest' to relative paths inside the sandbox root.
-        """
-        tmp = Path(tempfile.mkdtemp(prefix=f'newpkg_sandbox_{pkg_name}_'))
-        self._tmp_roots.append(tmp)
-        # default layout
-        layout = layout_dirs or {'sources': 'sources', 'build': 'build', 'dest': 'dest', 'tmp': 'tmp'}
-        for k, v in layout.items():
-            (tmp / v).mkdir(parents=True, exist_ok=True)
-        self._log_info('sandbox.create', f'Created sandbox workspace at {tmp}', pkg=pkg_name, path=str(tmp))
-        return tmp
-
-    def run_in_sandbox(self, cmd: List[str], pkg_name: Optional[str] = None, timeout: Optional[int] = None) -> SandboxResult:
-        """Create an ephemeral sandbox, run cmd inside, and clean up (unless preserve_tmp True)."""
-        root = self.sandbox_for_package(pkg_name or 'ephemeral')
-        # bind root into sandbox
-        try:
-            self.bind(str(root), str(root), ro=False)
-        except Exception:
-            pass
-        # run with cwd=root
-        try:
-            res = self.run(cmd, cwd=str(root), timeout=timeout)
-            return res
-        finally:
-            if not self.preserve_tmp:
-                try:
-                    shutil.rmtree(root)
-                    self._tmp_roots.remove(root)
-                    self._log_info('sandbox.cleanup', f'Removed sandbox {root}')
-                except Exception:
-                    pass
-
-    def cleanup(self) -> None:
-        """Cleanup any temporary roots created by this Sandbox instance."""
-        for p in list(self._tmp_roots):
+            result = SandboxResult(
+                backend=backend,
+                command=cmd_str,
+                cwd=str(workdir),
+                rc=rc,
+                stdout=stdout,
+                stderr=stderr,
+                duration=duration,
+                dry_run=False,
+                meta={"backend_bin": (self._bwrap_bin if backend == "bwrap" else self._proot_bin if backend == "proot" else "none")}
+            )
+            # logging
+            if rc == 0:
+                self._log("info", "sandbox.exec.ok", f"Sandbox command finished rc=0 in {duration:.3f}s", backend=backend, duration=duration, rc=rc)
+            else:
+                self._log("error", "sandbox.exec.fail", f"Sandbox command rc={rc} (took {duration:.3f}s)", backend=backend, duration=duration, rc=rc, stderr=stderr)
+            # record to DB phases when available
             try:
-                if p.exists():
-                    if not self.preserve_tmp:
-                        shutil.rmtree(p)
-                        self._log_info('sandbox.cleanup', f'Removed {p}')
-                self._tmp_roots.remove(p)
-            except Exception as e:
-                self._log_error('sandbox.cleanup.fail', f'Failed to cleanup {p}: {e}')
+                if self.db and hasattr(self.db, "record_phase"):
+                    self.db.record_phase(package=self._context_package(), phase="sandbox.exec", status="ok" if rc == 0 else "error", meta={"backend": backend, "rc": rc, "duration": duration})
+            except Exception:
+                pass
+            return result
+        except subprocess.TimeoutExpired as e:
+            duration = time.perf_counter() - start
+            self._log("error", "sandbox.exec.timeout", f"Sandbox command timed out after {duration:.1f}s", timeout=timeout)
+            try:
+                if self.db and hasattr(self.db, "record_phase"):
+                    self.db.record_phase(package=self._context_package(), phase="sandbox.exec", status="timeout", meta={"backend": backend, "timeout": timeout})
+            except Exception:
+                pass
+            return SandboxResult(
+                backend=backend,
+                command=cmd_str,
+                cwd=str(workdir),
+                rc=124,
+                stdout=None,
+                stderr=f"timeout after {timeout}s",
+                duration=duration,
+                dry_run=False,
+                meta={"timeout": timeout}
+            )
+        except Exception as e:
+            duration = time.perf_counter() - start
+            self._log("error", "sandbox.exec.error", f"Sandbox command raised exception: {e}", error=str(e))
+            try:
+                if self.db and hasattr(self.db, "record_phase"):
+                    self.db.record_phase(package=self._context_package(), phase="sandbox.exec", status="error", meta={"backend": backend, "exception": str(e)})
+            except Exception:
+                pass
+            return SandboxResult(
+                backend=backend,
+                command=cmd_str,
+                cwd=str(workdir),
+                rc=255,
+                stdout=None,
+                stderr=str(e),
+                duration=duration,
+                dry_run=False,
+                meta={"exception": str(e)}
+            )
+        finally:
+            # cleanup unless preserve_tmp requested
+            try:
+                if not self.preserve_tmp:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                    self._log("debug", "sandbox.cleanup", f"Removed temporary sandbox dir {tmpdir}")
+                else:
+                    self._log("debug", "sandbox.preserve", f"Preserving temporary sandbox dir {tmpdir}")
+            except Exception:
+                pass
 
-
-# small helpers for safe shell building
-def shlex_quote(s: str) -> str:
-    return '"' + s.replace('"', '\\"') + '"'
-
-
-def shlex_join(args: List[str]) -> str:
-    return ' '.join(shlex_quote(a) for a in args)
-
-
-# CLI for quick tests
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(prog='newpkg-sandbox')
-    parser.add_argument('cmd', nargs=argparse.REMAINDER, help='command to run in sandbox')
-    parser.add_argument('--backend', choices=['bwrap', 'proot', 'none'], help='force backend')
-    parser.add_argument('--preserve', action='store_true', help='preserve temporary sandbox')
-    args = parser.parse_args()
-
-    cfg = None
-    if init_config:
+    # ----------------- convenience / helpers -----------------
+    def _context_package(self) -> str:
+        """Try to extract package context from logger context or cfg, fallback to 'global'."""
         try:
-            cfg = init_config()
+            if self.logger and hasattr(self.logger, "_context"):
+                pkg = getattr(self.logger, "_context", {}).get("package")
+                if pkg:
+                    return pkg
         except Exception:
-            cfg = None
-    db = NewpkgDB(cfg) if NewpkgDB and cfg is not None else None
-    logger = NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None
+            pass
+        # fallback
+        try:
+            return str(self._cfg_get("general.default_package") or "global")
+        except Exception:
+            return "global"
 
-    sb = Sandbox(cfg=cfg, logger=logger, db=db)
-    if args.backend:
-        sb._preferred_backend = args.backend
-        sb._backend = sb._detect_backend()
-    sb.preserve_tmp = bool(args.preserve)
-    if not args.cmd:
-        print('no command provided; use -- to pass a command')
-    else:
-        res = sb.run(args.cmd)
-        print('rc=', res.rc)
-        print('out=', res.out)
-        print('err=', res.err)
+    # sugar for JSON-friendly call
+    def run_in_sandbox_json(self, *args, **kwargs) -> str:
+        res = self.run_in_sandbox(*args, **kwargs)
+        return json.dumps(res.to_dict(), indent=2)
+
+# Example usage when run directly
+if __name__ == "__main__":
+    cfg = init_config() if init_config else None
+    sbox = NewpkgSandbox(cfg=cfg)
+    # demo: run a simple command
+    r = sbox.run_in_sandbox(["/bin/echo", "hello sandbox"], captures=True, timeout=10)
+    print(json.dumps(r.to_dict(), indent=2))
