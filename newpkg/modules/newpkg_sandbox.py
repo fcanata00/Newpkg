@@ -1,20 +1,22 @@
 """
 newpkg_sandbox.py
 
-Módulo de sandbox para newpkg — backend baseado em bubblewrap (bwrap) com suporte rootless,
-integração com NewpkgLogger e NewpkgDB, e helpers para montar ambientes de build por pacote.
+Sandbox abstraction for newpkg builds and operations.
+- Supports backends: bubblewrap (bwrap), proot (fallback), and a "none" (no sandbox) mode.
+- Integrates with newpkg_config (cfg.get), newpkg_logger (NewpkgLogger) and newpkg_db (NewpkgDB) when provided.
+- Provides convenient API:
+    - Sandbox(cfg, logger=None, db=None, name=None)
+    - sandbox.run(cmd, cwd=None, env=None, timeout=None) -> SandboxResult
+    - sandbox.run_in_sandbox(cmd, pkg=None, ...) -> same as run but creates ephemeral workspace
+    - sandbox.bind(src, dest, ro=True) to add binds
+    - sandbox.sandbox_for_package(pkg_name, layout_dirs=None) -> prepares layout and returns path
+    - sandbox.cleanup() to cleanup temporary sandboxes
 
-Funcionalidades principais:
-- criar sandbox temporário persistente ou efêmero
-- executar comandos (captura stdout/stderr)
-- bind mounts controlados (apenas paths permitidos)
-- método sandbox_for_package(pkg_name) que prepara /sources, /build, /dest
-- registro de execuções no NewpkgDB (opcional)
+Security notes:
+- By default destructive binds are prevented; configuration controls allowlisting.
+- Removes dangerous env vars by default when entering sandbox.
 
-Observações de segurança:
-- exige bwrap disponível no PATH quando backend == 'bwrap'
-- tenta executar em modo rootless (user namespaces) sem sudo
-
+This module is defensive: if backends are missing it falls back gracefully and logs warnings.
 """
 from __future__ import annotations
 
@@ -22,234 +24,337 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-from contextlib import contextmanager
+from typing import Any, Dict, List, Optional, Tuple
+
+# Try imports from project; fallbacks if not available
+try:
+    from newpkg_config import init_config
+except Exception:
+    init_config = None
+
+try:
+    from newpkg_logger import NewpkgLogger
+except Exception:
+    NewpkgLogger = None
+
+try:
+    from newpkg_db import NewpkgDB
+except Exception:
+    NewpkgDB = None
+
+
+@dataclass
+class SandboxResult:
+    rc: int
+    out: str
+    err: str
+    duration: float
+    backend: str
+    created_tmp: Optional[str] = None
 
 
 class SandboxError(Exception):
     pass
 
 
-@dataclass
-class SandboxResult:
-    returncode: int
-    stdout: str
-    stderr: str
-    duration: float
-    started_at: str
-    finished_at: str
+class Sandbox:
+    """Sandbox wrapper supporting bwrap and proot with safe defaults."""
 
+    DEFAULT_ALLOWED_BINDS = ['/tmp', '/var/tmp', '/usr', '/bin', '/lib', '/lib64', '/etc', '/home']
 
-@dataclass
-class NewpkgSandbox:
-    cfg: Any = None
-    logger: Any = None
-    db: Any = None
-    name: str = field(default_factory=lambda: f"sandbox-{uuid.uuid4().hex[:8]}")
-    base_dir: Path = field(init=False)
-    work_dir: Path = field(init=False)
-    binds: List[Tuple[Path, Path, bool]] = field(default_factory=list)  # (src, dest, ro)
-    backend: str = field(init=False)
-    allowed_binds: List[Path] = field(default_factory=list)
-    persistent: bool = field(init=False)
+    def __init__(self, cfg: Any = None, logger: Any = None, db: Any = None, name: Optional[str] = None):
+        self.cfg = cfg
+        self.logger = logger or (NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None)
+        self.db = db
+        self.name = name or f'newpkg-sandbox-{uuid.uuid4().hex[:8]}'
 
-    def __post_init__(self):
-        # defaults
-        tmp = None
+        # backend selection
+        self._preferred_backend = (self._cfg_get('sandbox.backend') or os.environ.get('NEWPKG_SANDBOX_BACKEND') or 'bwrap').lower()
+        self._backend = self._detect_backend()
+
+        # sandbox root (for ephemeral sandboxes)
+        self._tmp_roots: List[Path] = []
+
+        # binds list (tuples of src,dest,ro)
+        self._binds: List[Tuple[str, str, bool]] = []
+
+        # security options
+        self.rootless = bool(self._cfg_get('sandbox.rootless', True))
+        self.max_mem = self._cfg_get('sandbox.max_mem', None)  # e.g. '512M'
+        self.max_cpu = int(self._cfg_get('sandbox.max_cpu', 0) or 0)
+
+        # allowlist for binds - absolute paths only
+        self.allowed_binds = list(self._cfg_get('sandbox.allowed_binds', self.DEFAULT_ALLOWED_BINDS))
+
+        # cleanup on exit
+        self.preserve_tmp = bool(self._cfg_get('sandbox.preserve_tmp', False))
+
+        # sanitize env list to remove dangerous variables
+        self._blacklist_env = set(self._cfg_get('sandbox.blacklist_env', ['LD_PRELOAD', 'LD_LIBRARY_PATH', 'PYTHONPATH']))
+
+        self._log_info('init', f'Initialized sandbox (backend={self._backend})', backend=self._backend, name=self.name)
+
+    # ---------------- config helper ----------------
+    def _cfg_get(self, key: str, default: Any = None) -> Any:
         try:
-            tmp = self.cfg.get("SANDBOX_TMPDIR")
+            if self.cfg and hasattr(self.cfg, 'get'):
+                v = self.cfg.get(key)
+                if v is not None:
+                    return v
         except Exception:
-            tmp = None
-        base_tmp = Path(tmp) if tmp else Path(tempfile.gettempdir())
+            pass
+        # try env fallback
+        ev = key.upper().replace('.', '_')
+        return os.environ.get(ev, default)
 
-        # ensure base dir
-        base_tmp.mkdir(parents=True, exist_ok=True)
-
-        self.base_dir = base_tmp / self.name
-        self.work_dir = self.base_dir / "work"
-        self.backend = (self.cfg.get("SANDBOX_BACKEND") if self.cfg else None) or "bwrap"
-        self.persistent = self._to_bool(self.cfg.get("SANDBOX_PERSIST") if self.cfg else False)
-        self.allowed_binds = [Path(x) for x in (self.cfg.get("SANDBOX_DEFAULT_BIND") or "/dev,/proc,/sys").split(",")]
-
-        # prepare dirs (but do not populate heavy mounts)
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-
-        # default binds (maps host paths to same inside sandbox)
-        for p in self.allowed_binds:
-            p = p if isinstance(p, Path) else Path(str(p))
-            if p.exists():
-                self.binds.append((p.resolve(), p.resolve(), True))
-
-        # provide a build-friendly layout
-        self._prepare_layout()
-
-        if self.logger:
-            self.logger.log_event("sandbox_create", level="INFO", message=f"Created sandbox {self.name}", metadata={"sandbox": str(self.base_dir)})
-
-    # ----------------- helpers -----------------
-    def _to_bool(self, v: Any) -> bool:
-        if isinstance(v, bool):
-            return v
-        if v is None:
-            return False
-        return str(v).lower() in ("1", "true", "yes", "on")
-
-    def _prepare_layout(self):
-        # common dirs inside sandbox: sources, build, dest, tmp, home
-        for d in ("sources", "build", "dest", "tmp", "home"):
-            p = self.work_dir / d
-            p.mkdir(parents=True, exist_ok=True)
-
-    def sandbox_for_package(self, pkg_name: str, create_sources: bool = True) -> Path:
-        """Prepare a package-structured sandbox workdir and return its path.
-
-        Creates directories: work/sources/<pkg_name>, work/build/<pkg_name>, work/dest/<pkg_name>
-        """
-        src = self.work_dir / "sources" / pkg_name
-        build = self.work_dir / "build" / pkg_name
-        dest = self.work_dir / "dest" / pkg_name
-        src.mkdir(parents=True, exist_ok=True)
-        build.mkdir(parents=True, exist_ok=True)
-        dest.mkdir(parents=True, exist_ok=True)
-        return build
-
-    # ----------------- bind management -----------------
-    def bind(self, src: Path, dest: Optional[Path] = None, ro: bool = True) -> None:
-        """Register a bind mount for the sandbox. dest is the path inside the sandbox root. If None, use same as src."""
-        src = Path(src).resolve()
-        if dest is None:
-            dest = src
-        else:
-            dest = Path(dest)
-        # only allow binds that are within allowed_binds or explicitly allowed by absolute path
-        if not any(str(src).startswith(str(a)) for a in self.allowed_binds):
-            # allow explicit bind if it is under /tmp or under base_dir
-            if not (str(src).startswith('/tmp') or str(src).startswith(str(self.base_dir))):
-                raise SandboxError(f"Bind source {src} is not allowed by SANDBOX_DEFAULT_BIND")
-        self.binds.append((src, dest, ro))
-
-    # ----------------- command construction -----------------
-    def _bwrap_prefix(self, chdir: Optional[Path] = None) -> List[str]:
-        # Basic bwrap invocation
-        b = ["bwrap", "--unshare-all", "--new-session"]
-        # ensure /dev and /proc are present
-        for src, dest, ro in self.binds:
-            flag = "--ro-bind" if ro else "--bind"
-            b.extend([flag, str(src), str(dest)])
-        # set working dir
-        if chdir:
-            b.extend(["--chdir", str(chdir)])
-        # minimal environment
-        b.extend(["--setenv", "HOME", str(self.work_dir / "home")])
-        b.extend(["--setenv", "TMPDIR", str(self.work_dir / "tmp")])
-        b.extend(["--setenv", "PATH", "/usr/bin:/bin"])
-        # drop to nobody-like user if possible (rootless bwrap uses new userns)
-        # note: do not set --uid/--gid to avoid requiring root
-        return b
-
-    def _ensure_bwrap_available(self) -> None:
-        if shutil.which("bwrap") is None:
-            raise SandboxError("bubblewrap (bwrap) is not available on PATH")
-
-    # ----------------- run logic -----------------
-    def run(self, cmd: Iterable[str], cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None, timeout: Optional[int] = None, capture: bool = True) -> SandboxResult:
-        """Execute a command inside the sandbox. Returns SandboxResult."""
-        if self.backend != "bwrap":
-            raise SandboxError("Only bwrap backend is supported currently")
-        self._ensure_bwrap_available()
-        chdir = cwd if cwd else (self.work_dir)
-        bprefix = self._bwrap_prefix(chdir=chdir)
-        full_cmd = bprefix + list(map(str, cmd))
-
-        start = datetime.utcnow()
-        started_at = start.isoformat() + "Z"
-        try:
-            cp = subprocess.run(full_cmd, capture_output=capture, text=True, env=env or os.environ.copy(), timeout=timeout)
-            rc = cp.returncode
-            stdout = cp.stdout or ""
-            stderr = cp.stderr or ""
-        except subprocess.TimeoutExpired as e:
-            rc = -1
-            stdout = e.stdout or ""
-            stderr = (e.stderr or "") + f"\nTimeoutExpired after {timeout}s"
-        except FileNotFoundError as e:
-            raise SandboxError(f"Execution failed: {e}") from e
-        end = datetime.utcnow()
-        duration = (end - start).total_seconds()
-        finished_at = end.isoformat() + "Z"
-
-        # log
-        if self.logger:
-            self.logger.log_event("sandbox_run", level=("INFO" if rc == 0 else "ERROR"), message=f"cmd {' '.join(map(str, cmd))}", metadata={"sandbox": self.name, "cmd": list(cmd), "rc": rc, "duration": duration})
-
-        # record in DB optionally
-        if self.db:
+    # ---------------- logging helpers ----------------
+    def _log_info(self, event: str, message: str, **meta):
+        if self.logger and hasattr(self.logger, 'info'):
             try:
-                # store as a build_log-like record
-                pkg = None
-                # try to infer package from cwd path components
-                try:
-                    pkg = (cwd.name if cwd else None)
-                except Exception:
-                    pkg = None
-                phase = "sandbox_run"
-                status = "ok" if rc == 0 else "fail"
-                self.db.add_log(pkg or self.name, phase, status, log_path=None)
+                self.logger.info(f'sandbox:{event}', message, sandbox=self.name, **meta)
+                return
             except Exception:
                 pass
+        print(f'[INFO] sandbox:{event} - {message}')
 
-        return SandboxResult(returncode=rc, stdout=stdout, stderr=stderr, duration=duration, started_at=started_at, finished_at=finished_at)
+    def _log_error(self, event: str, message: str, **meta):
+        if self.logger and hasattr(self.logger, 'error'):
+            try:
+                self.logger.error(f'sandbox:{event}', message, sandbox=self.name, **meta)
+                return
+            except Exception:
+                pass
+        print(f'[ERROR] sandbox:{event} - {message}')
 
-    # ----------------- interactive shell -----------------
-    def enter_interactive(self, shell: str = "/bin/bash") -> None:
-        """Spawn an interactive shell inside the sandbox (attaches to current tty)."""
-        self._ensure_bwrap_available()
-        chdir = self.work_dir
-        bprefix = self._bwrap_prefix(chdir=chdir)
-        full_cmd = bprefix + [shell]
-        if self.logger:
-            self.logger.log_event("sandbox_interactive", level="INFO", message=f"Entering interactive shell: {shell}", metadata={"sandbox": self.name})
-        # replace current process with bwrap shell
-        os.execvp(full_cmd[0], full_cmd)
+    # ---------------- backend detection ----------------
+    def _detect_backend(self) -> str:
+        # try to honor preferred backend
+        pref = self._preferred_backend
+        if pref == 'bwrap' and shutil.which('bwrap'):
+            return 'bwrap'
+        if pref == 'proot' and shutil.which('proot'):
+            return 'proot'
+        # fallback order
+        if shutil.which('bwrap'):
+            return 'bwrap'
+        if shutil.which('proot'):
+            return 'proot'
+        # no sandbox available
+        return 'none'
 
-    # ----------------- cleanup -----------------
-    def cleanup(self) -> None:
-        if self.persistent:
-            if self.logger:
-                self.logger.log_event("sandbox_cleanup", level="INFO", message=f"Leaving sandbox persistent: {self.base_dir}", metadata={"sandbox": str(self.base_dir)})
-            return
+    # ---------------- bind management ----------------
+    def bind(self, src: str, dest: Optional[str] = None, ro: bool = True) -> None:
+        """Add a bind mount for the sandbox. dest defaults to same path inside sandbox root."""
+        srcp = str(Path(src).expanduser().resolve())
+        # simple allowlist check
+        allowed = any(srcp.startswith(str(Path(a).resolve())) for a in self.allowed_binds)
+        if not allowed:
+            raise SandboxError(f'Bind path {srcp} not allowed by sandbox.allowed_binds')
+        destp = dest or srcp
+        self._binds.append((srcp, destp, bool(ro)))
+        self._log_info('bind.add', f'Bind added {srcp} -> {destp} (ro={ro})', src=srcp, dest=destp, ro=ro)
+
+    # ---------------- environment sanitization ----------------
+    def _sanitize_env(self, env: Optional[Dict[str, str]]) -> Dict[str, str]:
+        base = dict(os.environ)
+        # remove blacklisted
+        for k in list(base.keys()):
+            if k in self._blacklist_env:
+                base.pop(k, None)
+        # apply overrides
+        if env:
+            base.update(env)
+        # ensure NEWPKG_* helpful paths
+        # provide defaults if not present
+        base.setdefault('NEWPKG_SOURCES', os.environ.get('NEWPKG_SOURCES', '/sources'))
+        base.setdefault('NEWPKG_BUILD', os.environ.get('NEWPKG_BUILD', '/build'))
+        base.setdefault('NEWPKG_DEST', os.environ.get('NEWPKG_DEST', '/'))
+        return base
+
+    # ---------------- helpers to build command wrappers ----------------
+    def _build_bwrap_cmd(self, inner_cmd: List[str], cwd: Optional[str] = None) -> List[str]:
+        args: List[str] = ['bwrap', '--unshare-all', '--share-net', '--proc', '/proc', '--dev', '/dev']
+        # set tmp and home inside
+        args += ['--tmpfs', '/tmp', '--tmpfs', '/var/tmp']
+        # add binds
+        for src, dest, ro in self._binds:
+            if ro:
+                args += ['--ro-bind', src, dest]
+            else:
+                args += ['--bind', src, dest]
+        # working dir
+        if cwd:
+            args += ['--chdir', cwd]
+        args += ['--'] + inner_cmd
+        return args
+
+    def _build_proot_cmd(self, inner_cmd: List[str], cwd: Optional[str] = None) -> List[str]:
+        # proot basic wrapper: proot -b src:dest -- /bin/sh -c 'cd cwd && exec ...'
+        args = ['proot']
+        for src, dest, ro in self._binds:
+            args += ['-b', f'{src}:{dest}']
+        if cwd:
+            inner = ['sh', '-c', f'cd {shlex_quote(cwd)} && exec {shlex_join(inner_cmd)}']
+        else:
+            inner = inner_cmd
+        args += ['--'] + inner
+        return args
+
+    # ---------------- run command ----------------
+    def run(self, cmd: List[str], cwd: Optional[str] = None, env: Optional[Dict[str, str]] = None, timeout: Optional[int] = None) -> SandboxResult:
+        """Run a command in the chosen sandbox backend and return SandboxResult.
+
+        cmd: list of argv (no shell). cwd is path inside host (we bind it into sandbox if needed).
+        """
+        start = time.time()
+        backend_used = self._backend
+        sanitized_env = self._sanitize_env(env)
+
+        # ensure cwd exists
+        cwdp = Path(cwd) if cwd else None
+        if cwdp and not cwdp.exists():
+            raise SandboxError(f'cwd {cwd} does not exist')
+
+        # always add cwd to binds so that inner command can access it at same path
+        if cwdp:
+            try:
+                self.bind(str(cwdp), str(cwdp), ro=False)
+            except SandboxError:
+                # bind may already exist or be disallowed
+                pass
+
+        if backend_used == 'bwrap':
+            wrapper = self._build_bwrap_cmd(cmd, cwd)
+        elif backend_used == 'proot':
+            # proot may not be ideal; fallback to running directly
+            wrapper = self._build_proot_cmd(cmd, cwd)
+        else:
+            # no sandbox: run directly
+            wrapper = cmd
+
+        # run
         try:
-            shutil.rmtree(self.base_dir)
-            if self.logger:
-                self.logger.log_event("sandbox_cleanup", level="INFO", message=f"Removed sandbox {self.name}", metadata={"sandbox": str(self.base_dir)})
+            proc = subprocess.run(wrapper, cwd=str(cwdp) if cwdp else None, env=sanitized_env, capture_output=True, text=True, timeout=timeout)
+            rc = proc.returncode
+            out = proc.stdout or ''
+            err = proc.stderr or ''
+        except subprocess.TimeoutExpired as e:
+            rc = 124
+            out = ''
+            err = f'timeout: {e}'
         except Exception as e:
-            if self.logger:
-                self.logger.log_event("sandbox_cleanup", level="ERROR", message=f"Failed to remove sandbox {self.name}: {e}", metadata={"sandbox": str(self.base_dir), "error": str(e)})
+            rc = 1
+            out = ''
+            err = str(e)
 
-    def exists(self) -> bool:
-        return self.base_dir.exists()
+        dur = time.time() - start
+        # record to DB if available
+        try:
+            if self.db and hasattr(self.db, 'record_phase'):
+                pkg = os.environ.get('NEWPKG_CURRENT_PKG') or self.name
+                self.db.record_phase(pkg, 'sandbox.run', 'ok' if rc == 0 else 'error', log_path=None)
+        except Exception:
+            pass
 
-    # ----------------- context manager support -----------------
-    def __enter__(self) -> "NewpkgSandbox":
-        return self
+        # log
+        if rc == 0:
+            self._log_info('run.ok', f'Cmd succeeded: {cmd}', cmd=cmd, rc=rc, duration=dur)
+        else:
+            self._log_error('run.fail', f'Cmd failed: {cmd} rc={rc}', cmd=cmd, rc=rc, duration=dur, stderr=err)
 
-    def __exit__(self, exc_type, exc, tb) -> None:
-        # always cleanup unless persistent
-        self.cleanup()
+        return SandboxResult(rc=rc, out=out, err=err, duration=dur, backend=backend_used)
+
+    # ---------------- ephemeral sandbox helpers ----------------
+    def sandbox_for_package(self, pkg_name: str, layout_dirs: Optional[Dict[str, str]] = None) -> Path:
+        """Create a sandbox workspace root for a package and return its path.
+
+        layout_dirs can map names like 'sources','build','dest' to relative paths inside the sandbox root.
+        """
+        tmp = Path(tempfile.mkdtemp(prefix=f'newpkg_sandbox_{pkg_name}_'))
+        self._tmp_roots.append(tmp)
+        # default layout
+        layout = layout_dirs or {'sources': 'sources', 'build': 'build', 'dest': 'dest', 'tmp': 'tmp'}
+        for k, v in layout.items():
+            (tmp / v).mkdir(parents=True, exist_ok=True)
+        self._log_info('sandbox.create', f'Created sandbox workspace at {tmp}', pkg=pkg_name, path=str(tmp))
+        return tmp
+
+    def run_in_sandbox(self, cmd: List[str], pkg_name: Optional[str] = None, timeout: Optional[int] = None) -> SandboxResult:
+        """Create an ephemeral sandbox, run cmd inside, and clean up (unless preserve_tmp True)."""
+        root = self.sandbox_for_package(pkg_name or 'ephemeral')
+        # bind root into sandbox
+        try:
+            self.bind(str(root), str(root), ro=False)
+        except Exception:
+            pass
+        # run with cwd=root
+        try:
+            res = self.run(cmd, cwd=str(root), timeout=timeout)
+            return res
+        finally:
+            if not self.preserve_tmp:
+                try:
+                    shutil.rmtree(root)
+                    self._tmp_roots.remove(root)
+                    self._log_info('sandbox.cleanup', f'Removed sandbox {root}')
+                except Exception:
+                    pass
+
+    def cleanup(self) -> None:
+        """Cleanup any temporary roots created by this Sandbox instance."""
+        for p in list(self._tmp_roots):
+            try:
+                if p.exists():
+                    if not self.preserve_tmp:
+                        shutil.rmtree(p)
+                        self._log_info('sandbox.cleanup', f'Removed {p}')
+                self._tmp_roots.remove(p)
+            except Exception as e:
+                self._log_error('sandbox.cleanup.fail', f'Failed to cleanup {p}: {e}')
 
 
-# ----------------- small demo if executed -----------------
-if __name__ == "__main__":
-    # demo: create sandbox and run echo
-    s = NewpkgSandbox()
-    try:
-        res = s.run(["/bin/echo", "hello from sandbox"])
-        print("RC:", res.returncode)
-        print("OUT:", res.stdout)
-    finally:
-        s.cleanup()
+# small helpers for safe shell building
+def shlex_quote(s: str) -> str:
+    return '"' + s.replace('"', '\\"') + '"'
+
+
+def shlex_join(args: List[str]) -> str:
+    return ' '.join(shlex_quote(a) for a in args)
+
+
+# CLI for quick tests
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(prog='newpkg-sandbox')
+    parser.add_argument('cmd', nargs=argparse.REMAINDER, help='command to run in sandbox')
+    parser.add_argument('--backend', choices=['bwrap', 'proot', 'none'], help='force backend')
+    parser.add_argument('--preserve', action='store_true', help='preserve temporary sandbox')
+    args = parser.parse_args()
+
+    cfg = None
+    if init_config:
+        try:
+            cfg = init_config()
+        except Exception:
+            cfg = None
+    db = NewpkgDB(cfg) if NewpkgDB and cfg is not None else None
+    logger = NewpkgLogger.from_config(cfg, db) if NewpkgLogger and cfg is not None else None
+
+    sb = Sandbox(cfg=cfg, logger=logger, db=db)
+    if args.backend:
+        sb._preferred_backend = args.backend
+        sb._backend = sb._detect_backend()
+    sb.preserve_tmp = bool(args.preserve)
+    if not args.cmd:
+        print('no command provided; use -- to pass a command')
+    else:
+        res = sb.run(args.cmd)
+        print('rc=', res.rc)
+        print('out=', res.out)
+        print('err=', res.err)
